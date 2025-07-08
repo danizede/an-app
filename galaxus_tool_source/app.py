@@ -1,177 +1,189 @@
-# ───────────────────────── app.py ─────────────────────────
-# Galaxus Sell-out Aggregator  •  Streamlit App
-# - Passwortschutz (Nofava22caro!)
-# - Matching nach Artikelnummer ➊  →  EAN/GTIN ➋  →  erste 2 Wörter ➌
-# - Bezeichnung kommt immer aus Spalte C der PL
-# - Berechnet Einkaufs-, Verkaufs-, Lagerwerte (CHF)
-# Benötigte Pakete stehen in requirements.txt:
-#   streamlit>=1.35
-#   pandas>=2.2
-#   openpyxl
-# ───────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+#  Galaxus Sell-out Aggregator – Streamlit App
+#
+#  Features
+#  ──────────────────────────────────────────────────────────────────────────────
+#  • Passworthschutz  (PW = Nofava22caro!)
+#  • Merken der zuletzt hochgeladenen Dateien (werden serverseitig gespeichert)
+#  • Matching-Logik
+#      1. Artikelnummer → exakter Join
+#      2. GTIN/EAN       → exakter Join
+#      3. Fallback:      → erste 2 Wörter aus Produktname vs. Bezeichnung
+#  • Spalten aus PL:
+#        C = Bezeichnung   → Bez
+#        D = Zusatz        → Kategorie
+#        F = NETTO NETTO   → Preis
+#  • Berechnet Ein­kaufs-, Verkaufs- und Lagermengen/-werte (CHF)
+# ──────────────────────────────────────────────────────────────────────────────
+#  requirements.txt
+#  ──────────────────────────────────────────────────────────────────────────────
+#  streamlit>=1.35
+#  pandas>=2.3
+#  openpyxl
+#  python-dateutil
+# ──────────────────────────────────────────────────────────────────────────────
 
-import streamlit as st
-import pandas as pd
-import re
 from pathlib import Path
 from datetime import datetime
+import re
 
-# ───────── PASSWORTSCHUTZ ────────────────────────────────
-CORRECT_PW = {"Nofava22caro!"}
+import pandas as pd
+import streamlit as st
 
-pw = st.text_input("🔒 Passwort eingeben", type="password")
-if pw not in CORRECT_PW:
-    st.warning("Bitte gültiges Passwort eingeben.")
-    st.stop()
-
-# ───────── Pfade & Ordner (persistente Uploads) ──────────
-DATA_DIR   = Path("data")
+# ──────────────── Konfiguration ───────────────────────────────────────────────
+DATA_DIR = Path("data")
 DATA_DIR.mkdir(exist_ok=True)
-SELL_PATH  = DATA_DIR / "last_sellout.xlsx"
-PRICE_PATH = DATA_DIR / "last_price.xlsx"
 
-# ───────── Helper: erste 2 Wörter normalisieren ─────────
+SELL_FILE  = DATA_DIR / "last_sellout.xlsx"
+PRICE_FILE = DATA_DIR / "last_prices.xlsx"
+
+CORRECT_PW = {"Nofava22caro!"}   #  ← gewünschte Passwörter hier eintragen
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@st.cache_data(show_spinner=False)
+def _read_excel(path: Path) -> pd.DataFrame:
+    """Read an Excel file with openpyxl engine."""
+    return pd.read_excel(path)
+
+
 def first_two(text: str) -> str:
     if pd.isna(text):
         return ""
-    tokens = re.findall(r"[A-Za-zÄÖÜäöüß0-9]+", str(text).lower())
+    tokens = re.findall(r"[A-Za-z0-9äöüÄÖÜß]+", str(text).lower())
     return " ".join(tokens[:2])
 
-# ───────── UI: Überschrift ───────────────────────────────
+
+# ──────────────── PASSWORTSCHUTZ ──────────────────────────────────────────────
+pw = st.text_input("🔐 Passwort eingeben", type="password")
+if pw not in CORRECT_PW:
+    st.stop()
+
+# ──────────────── Layout ──────────────────────────────────────────────────────
 st.title("📦 Galaxus Sell-out Aggregator")
 
-# ------------------------------------------------------------------
-# 1) SELL-OUT UPLOAD  (gespeichert als last_sellout.xlsx)
-# ------------------------------------------------------------------
-st.subheader("Sell-out-Report (.xlsx)")
-up_sell = st.file_uploader(
-    "Drag and drop file here", type="xlsx", key="sell"
-)
-if up_sell:                     # neues Upload ⇒ überschreiben
-    SELL_PATH.write_bytes(up_sell.getbuffer())
-    st.success("Sell-out gespeichert ✅")
+# --- Upload widgets -----------------------------------------------------------
+sell_file = st.file_uploader("Sell-out-Report (.xlsx)", type="xlsx")
+price_file = st.file_uploader("Preisliste (.xlsx)", type="xlsx")
 
-if SELL_PATH.exists():
-    sell_df = pd.read_excel(SELL_PATH)
-else:
-    st.info("Bitte Sell-out-Report hochladen, um fortzufahren.")
+# --- Fallback auf gespeicherte Dateien ---------------------------------------
+if sell_file is None and SELL_FILE.exists():
+    with open(SELL_FILE, "rb") as f:
+        sell_file = f
+        st.info("▶ Verwende zuletzt gespeicherten Sell-out-Report.")
+
+if price_file is None and PRICE_FILE.exists():
+    with open(PRICE_FILE, "rb") as f:
+        price_file = f
+        st.info("▶ Verwende zuletzt gespeicherte Preisliste.")
+
+if (sell_file is None) or (price_file is None):
+    st.warning("Bitte Sell-out-Report **und** Preisliste hochladen, um die "
+               "Auswertung zu starten.")
     st.stop()
 
-# ------------------------------------------------------------------
-# 2) PREISLISTE UPLOAD  (gespeichert als last_price.xlsx)
-# ------------------------------------------------------------------
-st.subheader("Preisliste (.xlsx)")
-up_price = st.file_uploader(
-    "Drag and drop file here", type="xlsx", key="price"
-)
-if up_price:
-    PRICE_PATH.write_bytes(up_price.getbuffer())
-    st.success("Preisliste gespeichert ✅")
+# --- Dateien auf Disk zwischenspeichern --------------------------------------
+if isinstance(sell_file, st.runtime.uploaded_file_manager.UploadedFile):
+    SELL_FILE.write_bytes(sell_file.getvalue())
+if isinstance(price_file, st.runtime.uploaded_file_manager.UploadedFile):
+    PRICE_FILE.write_bytes(price_file.getvalue())
 
-if PRICE_PATH.exists():
-    price_df = pd.read_excel(PRICE_PATH)
-else:
-    st.info("Bitte Preisliste hochladen, um die Auswertung zu starten.")
-    st.stop()
+# --- Daten einlesen -----------------------------------------------------------
+sell_df  = _read_excel(SELL_FILE)
+price_df = _read_excel(PRICE_FILE)
 
-# ───────── Preisliste aufbereiten ─────────────────────────
-pl = price_df.rename(
-    columns={
-        "Artikelnummer": "ArtNr",
-        "GTIN": "EAN",
-        "Bezeichnung": "Bez",
-        "NETTO NETTO": "Preis",
-        "Zusatz": "Kategorie",
-    }
-)[["ArtNr", "EAN", "Bez", "Kategorie", "Preis"]].copy()
+# Umbenennen / Spalten normalisieren
+sell_df = sell_df.rename(columns={
+    "Hersteller-Nr.": "Artikelnummer",
+    "Verfügbar":      "Lager",
+    "Verkauf":        "Verkauf",
+    "Einkauf":        "Einkauf",
+    "EAN":            "GTIN",
+})
 
-pl["tkn"] = pl["Bez"].apply(first_two)
+price_df = price_df.rename(columns={
+    "Artikelnummer": "Artikelnummer",
+    "GTIN":          "GTIN",
+    price_df.columns[2]: "Bez",          # Spalte C
+    price_df.columns[3]: "Kategorie",    # Spalte D
+    price_df.columns[5]: "Preis",        # Spalte F
+})
 
-# ───────── Sell-out aufbereiten ────────────────────────────
-so = sell_df.rename(
-    columns={
-        "Hersteller-Nr.": "ArtNr",
-        "EAN": "EAN",
-        "Einkauf": "Einkauf",
-        "Verfügbar": "Lager",
-        "Verkauf": "Verkauf",
-        "Sell-Out bis": "Datum",
-    }
-)[["ArtNr", "EAN", "Einkauf", "Lager", "Verkauf", "Datum"]].copy()
-
-# Datum (US- oder ISO-Format) -> datetime
-so["Datum"] = pd.to_datetime(so["Datum"], errors="coerce")
-
-# ───────── Matching ➊ ArtNr ───────────────────────────────
-merged = so.merge(
-    pl[["ArtNr", "Bez", "Kategorie", "Preis"]],
-    on="ArtNr",
+# --- Matching 1: Artikelnummer -----------------------------------------------
+merged = sell_df.merge(
+    price_df[["Artikelnummer", "Bez", "Kategorie", "Preis"]],
+    on="Artikelnummer",
     how="left",
     suffixes=("", "_pl"),
 )
 
-# ───────── Matching ➋ EAN für fehlende Preise ─────────────
-mask_missing = merged["Preis"].isna() & merged["EAN"].notna()
+# --- Matching 2: GTIN ---------------------------------------------------------
+mask_missing = merged["Preis"].isna() & merged["GTIN"].notna()
 if mask_missing.any():
     merged.loc[mask_missing, ["Bez", "Kategorie", "Preis"]] = (
         merged[mask_missing]
         .merge(
-            pl[["EAN", "Bez", "Kategorie", "Preis"]],
-            on="EAN",
+            price_df[["GTIN", "Bez", "Kategorie", "Preis"]],
+            on="GTIN",
             how="left",
+            suffixes=("", "_pl"),
         )[["Bez", "Kategorie", "Preis"]]
         .values
     )
 
-# ───────── Matching ➌ erste 2 Wörter ──────────────────────
-merged["tkn"] = merged["Bez"].apply(first_two)
-price_by_tkn = pl.drop_duplicates("tkn").set_index("tkn")[["Bez", "Kategorie", "Preis"]]
+# --- Matching 3: erste 2 Wörter ----------------------------------------------
+price_df["tok"] = price_df["Bez"].apply(first_two)
+merged["tok"]   = merged["Produktname"].apply(first_two)
 
-mask_missing2 = merged["Preis"].isna() & merged["tkn"].notna()
-if mask_missing2.any():
-    merged.loc[mask_missing2, ["Bez", "Kategorie", "Preis"]] = (
-        merged.loc[mask_missing2, "tkn"].map(price_by_tkn).apply(pd.Series).values
+tok_map = price_df.drop_duplicates("tok").set_index("tok")[["Bez", "Kategorie", "Preis"]]
+mask_missing = merged["Preis"].isna() & merged["tok"].notna()
+if mask_missing.any():
+    merged.loc[mask_missing, ["Bez", "Kategorie", "Preis"]] = (
+        merged.loc[mask_missing, "tok"].map(tok_map).apply(pd.Series).values
     )
 
-# Fallback: Bez aus Sell-out, falls leer
-merged["Bez"] = merged["Bez"].fillna(merged["ArtNr"])
+merged["Bez"] = merged["Bez"].fillna(merged["Produktname"])
 
-# ───────── Aggregation (gesamter Zeitraum) ─────────────────
+# --- Aggregation --------------------------------------------------------------
 agg = (
-    merged.groupby(["ArtNr", "Bez"], as_index=False)
+    merged.groupby(["Artikelnummer", "Bez"], as_index=False)
     .agg(
         Einkaufsmenge=("Einkauf", "sum"),
         Verkaufsmenge=("Verkauf", "sum"),
         Lagermenge=("Lager", "last"),
+        Kategorie=("Kategorie", "first"),
         Preis=("Preis", "first"),
     )
 )
 
 agg["Einkaufswert"] = agg["Einkaufsmenge"] * agg["Preis"]
 agg["Verkaufswert"] = agg["Verkaufsmenge"] * agg["Preis"]
-agg["Lagerwert"]    = agg["Lagermenge"]   * agg["Preis"]
+agg["Lagerwert"]    = agg["Lagermenge"]    * agg["Preis"]
 
-tot_verk  = int(agg["Verkaufswert"].sum())
-tot_eink  = int(agg["Einkaufswert"].sum())
-tot_lager = int(agg["Lagerwert"].sum())
+tot_verkauf = agg["Verkaufswert"].sum()
+tot_einkauf = agg["Einkaufswert"].sum()
+tot_lager   = agg["Lagerwert"].sum()
 
-# ───────── KPI-Kacheln ─────────────────────────────────────
-st.markdown("### Gesamtwerte")
-k1, k2, k3 = st.columns(3)
-k1.metric("Verkaufswert (CHF)", f"{tot_verk:,.0f}")
-k2.metric("Einkaufswert (CHF)", f"{tot_eink:,.0f}")
-k3.metric("Lagerwert (CHF)",    f"{tot_lager:,.0f}")
+# --- Ausgabe ------------------------------------------------------------------
+c1, c2, c3 = st.columns(3)
+c1.metric("Verkaufswert (CHF)", f"{tot_verkauf:,.0f}")
+c2.metric("Einkaufswert (CHF)", f"{tot_einkauf:,.0f}")
+c3.metric("Lagerwert (CHF)",    f"{tot_lager:,.0f}")
 
-st.markdown("---")
-
-# ───────── Detailtabelle ───────────────────────────────────
 st.dataframe(
-    agg[[
-        "ArtNr", "Bez",
-        "Einkaufsmenge", "Einkaufswert",
-        "Verkaufsmenge", "Verkaufswert",
-        "Lagermenge", "Lagerwert",
-    ]],
+    agg[
+        [
+            "Artikelnummer", "Bez", "Kategorie",
+            "Einkaufsmenge", "Einkaufswert",
+            "Verkaufsmenge", "Verkaufswert",
+            "Lagermenge",    "Lagerwert",
+        ]
+    ],
     hide_index=True,
+    height=600,
 )
-# ───────────────────────────────────────────────────────────
+
+st.caption(
+    f"Letzter Upload Sell-out: **{datetime.fromtimestamp(SELL_FILE.stat().st_mtime).strftime('%d.%m.%Y %H:%M')}** &nbsp;•&nbsp; "
+    f"Preisliste: **{datetime.fromtimestamp(PRICE_FILE.stat().st_mtime).strftime('%d.%m.%Y %H:%M')}**"
+)
