@@ -27,7 +27,8 @@ if not st.session_state.auth:
     pw = st.text_input("🔐 Passwort eingeben", type="password")
     if pw == CORRECT_PW:
         st.session_state.auth = True
-        st.experimental_rerun()
+        st.rerun()
+
     st.stop()                     # blockt alles, bis PW korrekt eingegeben
 
 # ---------- Hilfsfunktionen ---------------------------------------------------
