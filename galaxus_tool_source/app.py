@@ -64,13 +64,18 @@ def enrich(sell_bin, price_bin):
                         how="left", suffixes=("", "_p"))
 
     # --- 2) EAN ---------------------------------------------------------------
-    m2 = merged["Preis"].isna() & merged[s_ean].notna()
-    if m2.any():
-        df2 = (merged[m2]
-               .merge(price.drop_duplicates("ean"),
-                      left_on=s_ean, right_on="ean", how="left")
-               [["Bez","Kategorie","Preis"]])
-        merged.loc[m2, ["Bez","Kategorie","Preis"]] = df2.values
+m2 = merged["Preis"].isna() & merged[s_ean].notna()
+if m2.any():
+    df2 = (merged[m2]
+           .merge(
+               price.drop_duplicates("ean"),
+               left_on=s_ean, right_on="ean",
+               how="left",
+               suffixes=("", "__ean")     
+           )[["Bez__ean", "Kategorie__ean", "Preis__ean"]]
+           .rename(columns=lambda c: c.replace("__ean", ""))   
+          )
+    merged.loc[m2, ["Bez", "Kategorie", "Preis"]] = df2.values
 
     # --- 3) Fuzzy (erste 2 Wörter) -------------------------------------------
     def tkn(x): return " ".join(str(x).lower().split()[:2])
