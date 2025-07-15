@@ -6,35 +6,32 @@ import pandas as pd
 # ────── 1) Passwortschutz ──────
 PW = "Nofava22caro!"
 
-# Session-State-Flag initialisieren
 if "authed" not in st.session_state:
     st.session_state.authed = False
 
-# Passwort-Input
 if not st.session_state.authed:
     pw = st.text_input("🔐 Passwort eingeben", type="password")
     if pw != PW:
         st.warning("Bitte gültiges Passwort eingeben.")
         st.stop()
-    # ab hier korrekt
     st.session_state.authed = True
 
 # ────── 2) Excel-Loader ──────
 @st.cache_data(show_spinner="📥 Dateien laden …")
-def load_xlsx(uploader) -> pd.DataFrame:
-    return pd.read_excel(uploader, engine="openpyxl")
+def load_xlsx(uploaded_file: bytes) -> pd.DataFrame:
+    return pd.read_excel(uploaded_file, engine="openpyxl")
 
-# ────── 3) Matching & Enreicherung ──────
+# ────── 3) Matching & Anreicherung ──────
 @st.cache_data(show_spinner="🔗 Matching & Anreicherung …")
 def enrich(sell: pd.DataFrame, price: pd.DataFrame) -> pd.DataFrame:
-    # Merge auf Hersteller-Nr. ↔ Artikelnr
-    df = sell.merge(
+    # Merge Sell-Out ↔ Preisliste
+    merged = sell.merge(
         price[["Artikelnr", "Bezeichnung", "Zusatz", "Preis"]],
         left_on="Hersteller-Nr.",
         right_on="Artikelnr",
         how="left"
     )
-    return df
+    return merged
 
 # ────── 4) Aggregation ──────
 @st.cache_data(show_spinner="🔢 Aggregation …")
@@ -54,42 +51,32 @@ def aggregate(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
             Lagerwert     = ("Lagerwert", "sum"),
         )
     )
-
     totals = {
         "VK": tbl["Verkaufswert"].sum(),
         "EK": tbl["Einkaufswert"].sum(),
         "LG": tbl["Lagerwert"].sum(),
     }
-
     return tbl, totals
 
 # ────── 5) UI ──────
 st.set_page_config(page_title="Galaxus Sell-out Aggregator", layout="wide")
 st.title("📦 Galaxus Sell-out Aggregator")
 
-sell_upl  = st.file_uploader("Sell-out-Report (.xlsx)", type="xlsx")
-price_upl = st.file_uploader("Preisliste (.xlsx)",   type="xlsx")
+sell_upl  = st.file_uploader("Sell-out Report (.xlsx)", type="xlsx")
+price_upl = st.file_uploader("Preisliste (.xlsx)",    type="xlsx")
 
 if sell_upl and price_upl:
     sell_df  = load_xlsx(sell_upl)
     price_df = load_xlsx(price_upl)
 
-    enriched, = ()  # Dummy, um Flake8 ruhig zu stellen
-
-    # Matching + Enrichment
     enriched = enrich(sell_df, price_df)
-
-    # Aggregation
     data, tot = aggregate(enriched)
 
-    # Metriken
     c1, c2, c3 = st.columns(3)
     c1.metric("Verkaufswert (CHF)", f"{tot['VK']:,.0f}")
     c2.metric("Einkaufswert (CHF)",  f"{tot['EK']:,.0f}")
     c3.metric("Lagerwert (CHF)",     f"{tot['LG']:,.0f}")
 
-    # Tabelle
     st.dataframe(data, use_container_width=True)
-
 else:
-    st.info("Bitte beide Dateien hochladen, um die Auswertung zu starten.")
+    st.info("Bitte Sell-out-Report und Preisliste hochladen, um die Auswertung zu starten.")
