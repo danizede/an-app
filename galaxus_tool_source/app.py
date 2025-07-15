@@ -3,9 +3,8 @@
 import streamlit as st
 import pandas as pd
 
-# ────── 1) Passwortschutz ──────
+# ─────── 1) Passwortschutz ───────
 PW = "Nofava22caro!"
-
 if "authed" not in st.session_state:
     st.session_state.authed = False
 
@@ -16,15 +15,35 @@ if not st.session_state.authed:
         st.stop()
     st.session_state.authed = True
 
-# ────── 2) Excel-Loader ──────
+# ─────── 2) Excel-Loader ───────
 @st.cache_data(show_spinner="📥 Dateien laden …")
-def load_xlsx(uploaded_file: bytes) -> pd.DataFrame:
-    return pd.read_excel(uploaded_file, engine="openpyxl")
+def load_xlsx(bin_data: bytes) -> pd.DataFrame:
+    return pd.read_excel(bin_data, engine="openpyxl")
 
-# ────── 3) Matching & Anreicherung ──────
+# ─────── 3) Spalten-Finder ───────
+def find_col(df: pd.DataFrame, candidates: list[str], label: str) -> str:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    raise KeyError(f"Spalte «{label}» fehlt – gesucht: {candidates}")
+
+# ─────── 4) Matching & Enreicherung ───────
 @st.cache_data(show_spinner="🔗 Matching & Anreicherung …")
 def enrich(sell: pd.DataFrame, price: pd.DataFrame) -> pd.DataFrame:
-    # Merge Sell-Out ↔ Preisliste
+    # PL-Spalten finden und auf Standardnamen umbenennen
+    nr_col    = find_col(price, ["Artikelnr", "Art.-Nr.", "Artikelnummer"], "Artikelnr")
+    name_col  = find_col(price, ["Bezeichnung", "Name", "Artikelbezeichnung"], "Bezeichnung")
+    cat_col   = find_col(price, ["Zusatz", "Kategorie", "Warengruppe"],      "Zusatz/Kategorie")
+    price_col = find_col(price, ["Preis", "Verkaufspreis", "VK"],            "Preis")
+
+    price = price.rename(columns={
+        nr_col:    "Artikelnr",
+        name_col:  "Bezeichnung",
+        cat_col:   "Zusatz",
+        price_col: "Preis",
+    })
+
+    # Jetzt mergen
     merged = sell.merge(
         price[["Artikelnr", "Bezeichnung", "Zusatz", "Preis"]],
         left_on="Hersteller-Nr.",
@@ -33,7 +52,7 @@ def enrich(sell: pd.DataFrame, price: pd.DataFrame) -> pd.DataFrame:
     )
     return merged
 
-# ────── 4) Aggregation ──────
+# ─────── 5) Aggregation ───────
 @st.cache_data(show_spinner="🔢 Aggregation …")
 def aggregate(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     tbl = (
@@ -43,12 +62,12 @@ def aggregate(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
             as_index=False
         )
         .agg(
-            Einkaufsmenge = ("Einkauf", "sum"),
+            Einkaufsmenge = ("Einkauf",      "sum"),
             Einkaufswert  = ("Einkaufswert", "sum"),
-            Verkaufsmenge = ("Verkauf", "sum"),
+            Verkaufsmenge = ("Verkauf",      "sum"),
             Verkaufswert  = ("Verkaufswert", "sum"),
-            Lagermenge    = ("Verfügbar", "sum"),
-            Lagerwert     = ("Lagerwert", "sum"),
+            Lagermenge    = ("Verfügbar",    "sum"),
+            Lagerwert     = ("Lagerwert",    "sum"),
         )
     )
     totals = {
@@ -58,7 +77,7 @@ def aggregate(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     }
     return tbl, totals
 
-# ────── 5) UI ──────
+# ─────── 6) UI ───────
 st.set_page_config(page_title="Galaxus Sell-out Aggregator", layout="wide")
 st.title("📦 Galaxus Sell-out Aggregator")
 
