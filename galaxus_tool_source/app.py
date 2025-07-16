@@ -1,132 +1,136 @@
 import streamlit as st
 import pandas as pd
-import difflib
 
-# 1) Fuzzy-Matching-Helfer
+# ---------------- Spaltenerkennung ----------------
 def find_column(df: pd.DataFrame, candidates: list[str], purpose: str) -> str:
-    cols = list(df.columns)
-    low2orig = {c.lower(): c for c in cols}
-    # a) exakte (case-insensitive)
-    for cand in candidates:
-        key = cand.lower()
-        if key in low2orig:
-            return low2orig[key]
-    # b) fuzzy
-    for cand in candidates:
-        m = difflib.get_close_matches(cand, cols, n=1, cutoff=0.6)
-        if m:
-            return m[0]
-    # c) nichts gefunden
-    raise KeyError(
-        f"Spalte für «{purpose}» fehlt – gesucht unter {candidates}.\n"
-        f"Verfügbare Spalten: {cols}"
-    )
+    """
+    Durchsuche df.columns nach einer der candidates.
+    Liefert den ersten Treffer, sonst KeyError mit Hinweis.
+    """
+    for c in candidates:
+        if c in df.columns:
+            return c
+    raise KeyError(f"Spalte für «{purpose}» fehlt – gesucht unter {candidates}.\nVerfügbare Spalten: {list(df.columns)}")
 
-# 2) Excel einlesen
-def load_xlsx(uploader) -> pd.DataFrame:
-    return pd.read_excel(uploader, engine="openpyxl")
+# ---------------- Anreicherung ----------------
+@st.cache_data(show_spinner="🔗 Matching & Enrichment …", max_entries=5)
+def enrich(sell: pd.DataFrame, price: pd.DataFrame) -> pd.DataFrame:
+    # Sell-Out-Report Spalten
+    c_id        = find_column(sell,  ["Hersteller-Nr.","Produkt ID"],           "Artikelnr")
+    c_ean       = find_column(sell,  ["EAN"],                                     "EAN")
+    c_name_s    = find_column(sell,  ["Produktname","Name"],                      "Bezeichnung (Sell-Out)")
+    c_buy_qty   = find_column(sell,  ["Einkauf"],                                 "Einkauf")
+    c_avail_qty = find_column(sell,  ["Verfügbar","Bestand"],                     "Verfügbar")
+    c_sold_qty  = find_column(sell,  ["Verkauf","Sell-Out"],                      "Verkauf")
 
-# 3) Daten anreichern
-@st.cache_data(show_spinner="🔗 Matching & Enrichment …")
-def enrich(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> pd.DataFrame:
-    # --- Sell-Out-Report: nur Verkaufsmenge + Schlüsselspalten ---
-    c_s_nr   = find_column(sell_df, ["Artikelnummer","Hersteller-Nr.","ArtNr"], "Artikel-Nr.")
-    c_s_ean  = find_column(sell_df, ["EAN","GTIN"],                      "EAN")
-    c_s_bez  = find_column(sell_df, ["Produktname","Bezeichnung","Bez"],  "Bezeichnung")
-    c_s_sell = find_column(sell_df, ["Verkauf","Sell-Out von","Sold"],    "Verkaufs-Menge")
+    # Preisliste Spalten
+    p_id        = find_column(price, ["Artikelnummer","Hersteller-Nr."],          "Artikelnr")
+    p_ean       = find_column(price, ["GTIN","EAN"],                              "EAN")
+    p_name_p    = find_column(price, ["Bezeichnung","Produktname"],               "Bezeichnung")
+    p_cat       = find_column(price, ["Zusatz","Warengruppe"],                    "Kategorie")
+    p_price     = find_column(price, ["NETTO NETTO","VK","Preis","Einkauf"],      "Preis")
 
-    sell = sell_df.rename(columns={
-        c_s_nr:   "HerstellerNr",
-        c_s_ean:  "EAN",
-        c_s_bez:  "Bezeichnung",
-        c_s_sell: "Verkauf"
-    })[["HerstellerNr","EAN","Bezeichnung","Verkauf"]]
+    # 1) Merge über Hersteller-Nr. / Artikelnummer
+    merged = sell.merge(
+        price[[p_id, p_name_p, p_cat, p_price]],
+        left_on  = c_id,
+        right_on = p_id,
+        how      = "left",
+    ).rename(columns={p_name_p: "Bezeichnung", p_cat: "Kategorie", p_price: "Preis"})
 
-    # --- Preisliste: Einkaufspreis, Verkaufspreis, Bestand, Kategorie ---
-    c_p_nr    = find_column(price_df, ["Artikelnummer","Hersteller-Nr.","ArtNr"], "Artikel-Nr.")
-    c_p_ean   = find_column(price_df, ["EAN","GTIN"],                           "EAN")
-    c_p_bez   = find_column(price_df, ["Produktname","Bezeichnung","Bez"],       "Bezeichnung")
-    c_p_cat   = find_column(price_df, ["Zusatz","Kategorie","Warengruppe"],      "Kategorie")
-    c_p_stock = find_column(price_df, ["Bestand","Verfügbar"],                  "Lagerbestand")
-    c_p_price = find_column(price_df, ["Preis","VK","Netto"],                   "Verkaufspreis")
-    c_p_cost  = find_column(price_df, ["Einkauf","EK","Cost"],                  "Einkaufspreis")
+    # 2) Fehlende Preise via EAN füllen
+    mask = merged["Preis"].isna() & merged[c_ean].notna()
+    if mask.any():
+        fill = (
+            merged[mask]
+            .merge(
+                price.drop_duplicates(p_ean)[[p_ean, p_name_p, p_cat, p_price]],
+                left_on  = c_ean,
+                right_on = p_ean,
+                how      = "left",
+            )
+            .rename(columns={p_name_p: "Bezeichnung", p_cat: "Kategorie", p_price: "Preis"})
+        )
+        for col in ["Bezeichnung", "Kategorie", "Preis"]:
+            merged.loc[mask, col] = fill[col].values
 
-    price = price_df.rename(columns={
-        c_p_nr:    "HerstellerNr",
-        c_p_ean:   "EAN",
-        c_p_bez:   "Bezeichnung",
-        c_p_cat:   "Kategorie",
-        c_p_stock: "Bestand",
-        c_p_price: "Preis",
-        c_p_cost:  "Einkauf"
-    })[["HerstellerNr","EAN","Bezeichnung","Kategorie","Bestand","Preis","Einkauf"]]
+    # 3) Werte berechnen
+    merged["Einkaufswert"]  = merged[c_buy_qty].fillna(0) * merged["Preis"].fillna(0)
+    merged["Verkaufswert"]  = merged[c_sold_qty].fillna(0) * merged["Preis"].fillna(0)
+    merged["Lagerwert"]     = merged[c_avail_qty].fillna(0) * merged["Preis"].fillna(0)
 
-    # --- Zusammenführen auf EAN ---
-    merged = pd.merge(
-        sell,
-        price,
-        on="EAN",
-        how="left",
-        suffixes=("","_price")
-    )
-
-    # falls Kategorie fehlt, aus Preis-Bezeichnung nachziehen
-    merged["Kategorie"] = merged["Kategorie"].fillna(merged["Bezeichnung_price"])
-
-    # --- Werte berechnen ---
-    merged["Verkaufswert"]  = merged["Verkauf"] * merged["Preis"]
-    merged["Einkaufswert"]  = merged["Verkauf"] * merged["Einkauf"]
-    merged["Lagerwert"]     = merged["Bestand"] * merged["Preis"]
+    # Spalten sauber umbenennen
+    merged = merged.rename(columns={
+        c_id:        "Artikelnr",
+        c_ean:       "EAN",
+        c_name_s:    "Produktname",
+        c_buy_qty:   "Einkauf",
+        c_avail_qty: "Verfügbar",
+        c_sold_qty:  "Verkauf"
+    })
 
     return merged
 
-# 4) Aggregation und Totals
-@st.cache_data(show_spinner="⚖️ Aggregation …")
-def compute_agg(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str,float]]:
-    agg = (
-        df
-        .groupby(
-            ["HerstellerNr","Bezeichnung","EAN","Kategorie"],
-            as_index=False
-        )
-        .agg(
-            Verkauf      = ("Verkauf",      "sum"),
-            Verkaufswert = ("Verkaufswert", "sum"),
-            Einkaufswert = ("Einkaufswert", "sum"),
-            Lagerwert    = ("Lagerwert",    "first")
-        )
-    )
+# ---------------- Aggregation ----------------
+@st.cache_data(show_spinner="📊 Aggregating …", max_entries=5)
+def compute_agg(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    # Gruppieren nach Artikel, Bezeichnung, Kategorie
+    agg = df.groupby(["Artikelnr", "Produktname", "Kategorie"], dropna=False).agg(
+        Einkauf      = ("Einkauf",      "sum"),
+        Verfügbar    = ("Verfügbar",    "sum"),
+        Verkauf      = ("Verkauf",      "sum"),
+        Einkaufswert = ("Einkaufswert", "sum"),
+        Verkaufswert = ("Verkaufswert", "sum"),
+        Lagerwert    = ("Lagerwert",    "sum")
+    ).reset_index()
+
     totals = {
-        "VK": agg["Verkaufswert"].sum(),
         "EK": agg["Einkaufswert"].sum(),
-        "LG": agg["Lagerwert"].sum(),
+        "VK": agg["Verkaufswert"].sum(),
+        "LG": agg["Lagerwert"].sum()
     }
     return agg, totals
 
-# 5) Streamlit-UI
+# ---------------- Hauptprogramm ----------------
 def main():
+    st.set_page_config("Galaxus Sell-out Aggregator", "📦")
     st.title("📦 Galaxus Sell-out Aggregator")
-    st.subheader("1) Sell-Out-Report hochladen")
-    sell_file  = st.file_uploader("Drag & drop hier den Sell-Out-Report", type="xlsx", key="sell")
-    st.subheader("2) Preisliste hochladen")
-    price_file = st.file_uploader("Drag & drop hier die Preisliste",   type="xlsx", key="price")
 
-    if sell_file and price_file:
-        with st.spinner("⏳ Lese Dateien …"):
-            sell_df  = load_xlsx(sell_file)
-            price_df = load_xlsx(price_file)
-        with st.spinner("🔗 Anreichern …"):
-            enriched = enrich(sell_df, price_df)
-        with st.spinner("⚖️ Aggregieren …"):
-            table, totals = compute_agg(enriched)
+    col1, col2 = st.columns(2)
+    with col1:
+        sell_file  = st.file_uploader("Sell-out-Report (.xlsx)", type="xlsx", key="sell")
+    with col2:
+        price_file = st.file_uploader("Preisliste (.xlsx)",      type="xlsx", key="price")
 
-        # Top-Metriken
-        c1,c2,c3 = st.columns(3)
-        c1.metric("Verkaufswert (CHF)", f"{totals['VK']:,.0f}")
-        c2.metric("Einkaufswert (CHF)", f"{totals['EK']:,.0f}")
-        c3.metric("Lagerwert (CHF)",    f"{totals['LG']:,.0f}")
+    if not sell_file or not price_file:
+        st.info("Bitte beideseite eine Datei hochladen, um die Auswertung zu starten.")
+        st.stop()
 
-        st.dataframe(table, use_container_width=True, hide_index=True)
+    # Daten laden
+    sell_df  = pd.read_excel(sell_file,  engine="openpyxl")
+    price_df = pd.read_excel(price_file, engine="openpyxl")
+
+    # Enrich & Aggregate
+    try:
+        enriched, totals = compute_agg(enrich(sell_df, price_df))
+    except KeyError as e:
+        st.error(e)
+        st.stop()
+
+    # Dashboard
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Verkaufswert (CHF)", f"{totals['VK']:,.0f}")
+    c2.metric("Einkaufswert (CHF)", f"{totals['EK']:,.0f}")
+    c3.metric("Lagerwert (CHF)",   f"{totals['LG']:,.0f}")
+
+    st.dataframe(
+        enriched.style.format({
+            "Einkaufswert": "€{:,.2f}",
+            "Verkaufswert": "€{:,.2f}",
+            "Lagerwert":    "€{:,.2f}"
+        }),
+        use_container_width=True
+    )
 
 if __name__ == "__main__":
     main()
