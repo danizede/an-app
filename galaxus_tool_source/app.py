@@ -1,165 +1,116 @@
 import streamlit as st
 import pandas as pd
 
-# ------------------------------ Alias-Definitionen ------------------------------
-
-ALIAS_NR    = ["Artikelnr", "Artikelnummer", "Hersteller-Nr.", "Produkt ID"]
-ALIAS_EAN   = ["EAN", "GTIN"]
-ALIAS_NAME  = ["Bezeichnung", "Bez", "Produktname", "Name"]
-ALIAS_CAT   = ["Kategorie", "Warengruppe", "Zusatz"]
-ALIAS_AVAIL = ["Verfügbar", "Bestand", "Startbestand"]
-ALIAS_SOLD  = ["Verkauf", "Verkauft", "Sell-Out von"]
-ALIAS_PRICE = ["Einkauf", "Preis", "Netto", "VK", "Verkaufspreis", "Einkaufspreis"]
-
-# ------------------------------ Hilfsfunktionen ------------------------------
-
+# Hilfsfunktion: findet eine Spalte anhand von Kandidaten (case-insensitive, substring-match)
 def find_column(df: pd.DataFrame, candidates: list[str], purpose: str) -> str:
-    """Findet in df.columns das erste Element aus candidates, sonst stoppt mit Fehlermeldung."""
-    for c in candidates:
-        if c in df.columns:
-            return c
-    st.error(
-        f'Spalte für "{purpose}" fehlt – gesucht unter {candidates}.\n'
-        f'Verfügbare Spalten: {list(df.columns)}'
+    cols = list(df.columns)
+    for col in cols:
+        low = col.lower()
+        for cand in candidates:
+            c = cand.lower()
+            if c == low or c in low or low in c:
+                return col
+    raise KeyError(
+        f"Spalte für «{purpose}» fehlt – gesucht unter {candidates}.\n"
+        f"Verfügbare Spalten: {cols}"
     )
-    st.stop()
 
-@st.cache_data
-def load_data(sell_file: bytes, price_file: bytes) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Lädt die Excel-Dateien in DataFrames."""
-    sell  = pd.read_excel(sell_file)
-    price = pd.read_excel(price_file)
-    return sell, price
+@st.cache_data(show_spinner="🔗 Matching & Anreicherung …")
+def enrich(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> pd.DataFrame:
+    # --- Sell-Out-Report Spalten ---
+    col_buy_qty = find_column(sell_df, ["Einkauf"],       "Einkaufsmenge im Sell-Out-Report")
+    col_sell_qty= find_column(sell_df, ["Verkauf"],       "Verkaufsmenge im Sell-Out-Report")
+    col_stock   = find_column(sell_df, ["Verfügbar","Bestand"], "Lagermenge im Sell-Out-Report")
+    col_nr_s    = find_column(sell_df, ["Hersteller-Nr.","Produkt ID","Artikelnummer"], "Artikelnummer im Sell-Out-Report")
+    col_ean_s   = find_column(sell_df, ["EAN"],           "EAN im Sell-Out-Report")
+    col_name_s  = find_column(sell_df, ["Produktname","Bezeichnung"], "Bezeichnung im Sell-Out-Report")
 
-@st.cache_data
-def enrich(sell: pd.DataFrame, price: pd.DataFrame) -> pd.DataFrame:
-    """Matcht Preise in die Sell-Out-Daten und rechnet Werte aus."""
-    # 1) Spalten erkennen
-    c_nr    = find_column(price, ALIAS_NR,    "Artikelnr in PL")
-    c_ean   = find_column(price, ALIAS_EAN,   "EAN in PL")
-    c_name  = find_column(price, ALIAS_NAME,  "Bezeichnung in PL")
-    c_cat   = find_column(price, ALIAS_CAT,   "Kategorie in PL")
-    c_price = find_column(price, ALIAS_PRICE, "Preis in PL")
+    sell = sell_df.rename(columns={
+        col_buy_qty : "Einkaufsmenge",
+        col_sell_qty: "Verkaufsmenge",
+        col_stock   : "Lagermenge",
+        col_nr_s    : "ArtNr",
+        col_ean_s   : "GTIN",
+        col_name_s  : "Bezeichnung"
+    })[["ArtNr","GTIN","Bezeichnung","Einkaufsmenge","Verkaufsmenge","Lagermenge"]]
 
-    s_nr    = find_column(sell,  ALIAS_NR,    "Artikelnr im Sell-Report")
-    s_ean   = find_column(sell,  ALIAS_EAN,   "EAN im Sell-Report")
-    s_name  = find_column(sell,  ALIAS_NAME,  "Bezeichnung im Sell-Report")
-    s_cat   = find_column(sell,  ALIAS_CAT,   "Kategorie im Sell-Report")
-    s_avail = find_column(sell,  ALIAS_AVAIL, "Lagerbestand im Sell-Report")
-    s_sold  = find_column(sell,  ALIAS_SOLD,  "Verkaufsmenge im Sell-Report")
+    # --- Preisliste Spalten ---
+    col_nr_p    = find_column(price_df, ["Artikelnummer","Hersteller-Nr."], "Artikelnummer in Preisliste")
+    col_ean_p   = find_column(price_df, ["EAN"],           "EAN in Preisliste")
+    col_name_p  = find_column(price_df, ["Bezeichnung","Produktname"], "Bezeichnung in Preisliste")
+    col_cat     = find_column(price_df, ["Zusatz","Warengruppe","Kategorie"], "Kategorie in Preisliste")
+    col_price   = find_column(price_df, ["Netto","Einkauf","Preis","VK","Verkaufspreis"], "Preis in Preisliste")
 
-    # 2) Numerische Felder parsen (Apostrophe/Leerzeichen entfernen, Komma→Punkt)
-    def to_num(s):
-        return pd.to_numeric(
-            s
-            .astype(str)
-            .str.replace("'",    "", regex=False)
-            .str.replace(" ",    "", regex=False)
-            .str.replace(",",    ".", regex=False),
-            errors="coerce"
-        ).fillna(0)
+    price = price_df.rename(columns={
+        col_nr_p  : "ArtNr",
+        col_ean_p : "GTIN",
+        col_name_p: "Bezeichnung_PL",
+        col_cat   : "Kategorie",
+        col_price : "Preis"
+    })[["ArtNr","GTIN","Bezeichnung_PL","Kategorie","Preis"]]
 
-    sell[s_avail] = to_num(sell[s_avail])
-    sell[s_sold]  = to_num(sell[s_sold])
-    price[c_price] = to_num(price[c_price])
-
-    # 3) PL-Daten auf Mindestspalten reduzieren & dupl. EAN entfernen
-    price = price[[c_nr, c_ean, c_name, c_cat, c_price]] \
-                .drop_duplicates(subset=[c_ean])
-
-    # 4) 1. Match über Artikelnr
-    merged = sell.merge(
+    # Zusammenführen via ArtNr + EAN (falls beides vorhanden)
+    merged = pd.merge(
+        sell,
         price,
-        left_on = s_nr,
-        right_on= c_nr,
-        how     = "left",
-        suffixes=("", "_pr")
+        on=["ArtNr","GTIN"],
+        how="left",
+        validate="m:1"  # viele Sell-Out-Zeilen auf genau einen Preis
     )
-
-    # 5) 2. Match über EAN für die, die noch keinen Preis haben
-    mask = merged[c_price].isna() & merged[s_ean].notna()
-    if mask.any():
-        tmp = (
-            merged[mask]
-            .merge(price, left_on=s_ean, right_on=c_ean, how="left")
-        )
-        for col in (c_name, c_cat, c_price):
-            merged.loc[mask, col] = tmp[col].values
-
-    # 6) 3. Fuzzy auf ersten zwei Wörtern der Bezeichnung
-    def first_two(w: str) -> str:
-        return " ".join(str(w).split()[:2])
-
-    price["tkn"]  = price[c_name].apply(first_two)
-    merged["tkn"] = merged[s_name].apply(first_two)
-
-    mask = merged[c_price].isna() & merged["tkn"].notna()
-    if mask.any():
-        tmp = merged[mask].merge(price, on="tkn", how="left")
-        for col in (c_name, c_cat, c_price):
-            merged.loc[mask, col] = tmp[col].values
-
-    # 7) Umbenennen in konsistente Spaltennamen
-    merged = merged.rename(columns={
-        s_nr    : "Artikelnr",
-        s_ean   : "EAN",
-        s_name  : "Bezeichnung",
-        s_cat   : "Kategorie",
-        s_avail : "Lagermenge",
-        s_sold  : "Verkaufsmenge",
-        c_price : "Stückpreis"
-    })
-
-    # 8) Werte berechnen
-    merged["Einkaufswert"]  = merged["Lagermenge"]    * merged["Stückpreis"]
-    merged["Verkaufswert"]  = merged["Verkaufsmenge"] * merged["Stückpreis"]
-    merged["Lagerwert"]     = merged["Lagermenge"]    * merged["Stückpreis"]
-
     return merged
 
-@st.cache_data
-def compute_agg(df: pd.DataFrame) -> pd.DataFrame:
-    """Gruppiert nach Artikel und berechnet alle Kennzahlen."""
-    return (
-        df
-        .groupby(["Artikelnr","Bezeichnung","Kategorie"], as_index=False)
-        .agg(
-            Einkaufsmenge = pd.NamedAgg("Lagermenge",    "sum"),
-            Einkaufswert  = pd.NamedAgg("Einkaufswert",  "sum"),
-            Verkaufsmenge = pd.NamedAgg("Verkaufsmenge", "sum"),
-            Verkaufswert  = pd.NamedAgg("Verkaufswert",  "sum"),
-            Lagermenge    = pd.NamedAgg("Lagermenge",    "sum"),
-            Lagerwert     = pd.NamedAgg("Lagerwert",     "sum"),
-        )
-    )
+@st.cache_data(show_spinner="📊 Auswertung …")
+def compute(enriched: pd.DataFrame) -> pd.DataFrame:
+    df = enriched.copy()
+    # Fehlende Preise auffüllen mit 0, um Rechenfehler zu vermeiden
+    df["Preis"] = df["Preis"].fillna(0.0)
 
-# ------------------------------ Hauptprogramm ------------------------------
+    # Wertspalten berechnen
+    df["Einkaufswert"]  = df["Einkaufsmenge"]  * df["Preis"]
+    df["Verkaufswert"]  = df["Verkaufsmenge"]  * df["Preis"]
+    df["Lagerwert"]     = df["Lagermenge"]     * df["Preis"]
+
+    # Endergebnis
+    return df[[
+        "ArtNr","Bezeichnung","Kategorie",
+        "Einkaufsmenge","Einkaufswert",
+        "Verkaufsmenge","Verkaufswert",
+        "Lagermenge","Lagerwert"
+    ]]
 
 def main():
-    st.set_page_config(layout="wide")  # volle Breite ausnutzen
+    st.set_page_config(page_title="Galaxus Sell-out Aggregator", layout="wide")
     st.title("📦 Galaxus Sell-out Aggregator")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        sell_file  = st.file_uploader("Sell-out-Report (.xlsx)", key="sell", type="xlsx")
-    with col2:
-        price_file = st.file_uploader("Preisliste (.xlsx)",  key="price", type="xlsx")
+    # Uploads
+    sell_file  = st.file_uploader("Sell-out-Report (.xlsx)", type="xlsx")
+    price_file = st.file_uploader("Preisliste (.xlsx)",      type="xlsx")
 
     if not sell_file or not price_file:
-        st.info("Bitte beide Dateien hochladen, um fortzufahren.")
-        return
+        st.info("Bitte zuerst beide Dateien hochladen: Sell-out-Report und Preisliste.")
+        st.stop()
 
-    sell_df, price_df = load_data(sell_file, price_file)
+    # Daten laden
+    sell_df  = pd.read_excel(sell_file)
+    price_df = pd.read_excel(price_file)
 
     # Matching & Anreicherung
-    enriched = enrich(sell_df, price_df)
+    with st.spinner("🔗 Matching & Anreicherung …"):
+        enriched = enrich(sell_df, price_df)
 
-    # Aggregation
-    agg = compute_agg(enriched)
+    # Berechnungen
+    with st.spinner("📊 Auswertung …"):
+        result = compute(enriched)
 
-    # Ergebnis anzeigen
-    st.markdown("### Ergebnis-Tabelle")
-    st.dataframe(agg, use_container_width=True)
+    # Anzeige
+    st.dataframe(result, use_container_width=True)
+    # Optional: als Excel zum Download anbieten
+    st.download_button(
+        "📥 Als Excel herunterladen",
+        data=result.to_excel(index=False).encode("utf-8"),
+        file_name="aggregat.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
 
 if __name__ == "__main__":
     main()
