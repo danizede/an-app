@@ -9,46 +9,53 @@ st.set_page_config(
     layout="wide",
 )
 
-# --- Hilfsfunktionen -------------------------------------------------------
-
+# --- Hilfsfunktion ---------------------------------------------------------
 def find_column(df: pd.DataFrame, candidates: list[str], label: str) -> str:
     """
     Sucht in df.columns nach einer Spalte, die case-insensitive mit einem Eintrag aus candidates
-    übereinstimmt. Gibt den exakten Spaltennamen zurück oder wirft einen KeyError mit Info.
+    exakt übereinstimmt oder einen Kandidaten als Substring enthält.
+    Gibt den exakten Spaltennamen zurück oder wirft einen KeyError mit Info.
     """
     cols = df.columns.tolist()
+    # 1) Exakter Vergleich (case-insensitive, ohne führende/trailing spaces)
     for cand in candidates:
         for col in cols:
             if col.strip().lower() == cand.strip().lower():
                 return col
+    # 2) Teil-Übereinstimmung: Kandidat ist Substring in Spaltenname
+    for cand in candidates:
+        lc = cand.strip().lower()
+        for col in cols:
+            if lc in col.strip().lower():
+                return col
+    # 3) kein Treffer
     raise KeyError(
         f"Spalte für «{label}» fehlt – gesucht unter {candidates}.\n"
         f"Verfügbare Spalten: {cols}"
     )
 
+# --- Anreicherung ----------------------------------------------------------
 @st.cache_data(show_spinner="🔗 Daten anreichern …")
 def enrich(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> pd.DataFrame:
-    # Kopien anlegen und Spalten trimmen
     sell = sell_df.copy()
     price = price_df.copy()
     sell.columns = sell.columns.str.strip()
     price.columns = price.columns.str.strip()
 
-    # Spalten finden
-    # Sell-Out Report
-    c_nr_s    = find_column(sell,  ["Hersteller-Nr.","Artikelnr","Artikelnummer"], "Artikelnr")
-    c_ean_s   = find_column(sell,  ["EAN","GTIN"],                      "EAN")
-    c_qty_s   = find_column(sell,  ["Verkauf","Sell-Out bis","Menge"],  "Verkaufsmenge")
-    c_stock_s = find_column(sell,  ["Bestand","Verfügbar","Lagerbestand"], "Lagerbestand")
+    # Sell-Out Report Spalten
+    c_nr_s    = find_column(sell,  ["Hersteller-Nr.","Artikelnr","Artikelnummer"],   "Artikelnr")
+    c_ean_s   = find_column(sell,  ["EAN","GTIN"],                                   "EAN")
+    c_qty_s   = find_column(sell,  ["Verkauf","Sell-Out bis","Menge"],               "Verkaufsmenge")
+    c_stock_s = find_column(sell,  ["Bestand","Verfügbar","Lagerbestand"],            "Lagerbestand")
 
-    # Preisliste
-    c_nr_p    = find_column(price, ["Artikelnr","Artikelnummer","Hersteller-Nr."], "Artikelnr")
-    c_ean_p   = find_column(price, ["EAN","GTIN"],                        "EAN")
-    c_name_p  = find_column(price, ["Bezeichnung","Bez","Name","Produktname"], "Bezeichnung")
-    c_cat_p   = find_column(price, ["Zusatz","Warengruppe","Kategorie"],   "Kategorie")
-    c_price_p = find_column(price, ["Preis","NETTO","VK"],                "Preis")
+    # Preisliste Spalten
+    c_nr_p    = find_column(price, ["Artikelnr","Artikelnummer","Hersteller-Nr."],   "Artikelnr")
+    c_ean_p   = find_column(price, ["EAN","GTIN"],                                   "EAN")
+    c_name_p  = find_column(price, ["Bezeichnung","Bez","Name","Produktname"],        "Bezeichnung")
+    c_cat_p   = find_column(price, ["Zusatz","Warengruppe","Kategorie"],             "Kategorie")
+    c_price_p = find_column(price, ["Preis","NETTO","VK"],                           "Preis")
 
-    # Spalten umbenennen auf Standard
+    # Spalten umbenennen
     sell = sell.rename(columns={
         c_nr_s:    "Artikelnr",
         c_ean_s:   "EAN",
@@ -63,14 +70,13 @@ def enrich(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> pd.DataFrame:
         c_price_p: "Preis",
     })
 
-    # 1) Merge auf Artikel-Nr.
+    # 1) Merge auf Artikelnummer
     merged = sell.merge(
         price[["Artikelnr","Bezeichnung","Kategorie","Preis"]],
-        on="Artikelnr",
-        how="left",
+        on="Artikelnr", how="left"
     )
 
-    # 2) Fallback via EAN/GTIN
+    # 2) Fallback via EAN
     mask = merged["Preis"].isna() & merged["EAN"].notna()
     if mask.any():
         price_ean = price.drop_duplicates("EAN")
@@ -81,15 +87,14 @@ def enrich(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> pd.DataFrame:
         )
         merged.loc[mask, ["Bezeichnung","Kategorie","Preis"]] = tmp[["Bezeichnung","Kategorie","Preis"]].values
 
-    # 3) Fuzzy-Match über ersten 2 Wörter der Bezeichnung
+    # 3) Fuzzy-Match (erste 2 Wörter)
     mask = merged["Preis"].isna()
     if mask.any():
-        # Token generieren
         price["token"] = price["Bezeichnung"].str.lower().str.split().str[:2].str.join(" ")
+        choices = price["token"].dropna().unique().tolist()
         for idx in merged[mask].index:
             tok = str(merged.at[idx, "Bezeichnung"]).lower().split()[:2]
             tok = " ".join(tok)
-            choices = price["token"].dropna().unique().tolist()
             best = get_close_matches(tok, choices, n=1, cutoff=0.8)
             if best:
                 row = price[price["token"] == best[0]].iloc[0]
@@ -97,8 +102,8 @@ def enrich(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> pd.DataFrame:
                 merged.at[idx, "Kategorie"]  = row["Kategorie"]
                 merged.at[idx, "Preis"]      = row["Preis"]
 
-    # Berechne Werte
-    merged["Einkaufsmenge"] = merged["Verkauf"]         # gleich Verkauf
+    # Werte berechnen
+    merged["Einkaufsmenge"] = merged["Verkauf"]
     merged["Einkaufswert"]  = merged["Verkauf"] * merged["Preis"]
     merged["Verkaufsmenge"] = merged["Verkauf"]
     merged["Verkaufswert"]  = merged["Verkauf"] * merged["Preis"]
@@ -107,8 +112,9 @@ def enrich(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> pd.DataFrame:
 
     return merged
 
+# --- Aggregation ----------------------------------------------------------
 @st.cache_data(show_spinner="🔢 Aggregieren …")
-def compute_agg(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, float]]:
+def compute_agg(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str,float]]:
     grp = (
         df
         .groupby(["Artikelnr","Bezeichnung","Kategorie"], as_index=False)
@@ -128,11 +134,9 @@ def compute_agg(df: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, float]]:
     }
     return grp, totals
 
-# --- Haupt-Workflow --------------------------------------------------------
-
+# --- Main ---------------------------------------------------------------
 def main():
     st.title("📦 Galaxus Sell-out Aggregator")
-
     c1, c2 = st.columns(2)
     with c1:
         sell_file  = st.file_uploader("Sell-out-Report (.xlsx)", key="sell",  type="xlsx")
