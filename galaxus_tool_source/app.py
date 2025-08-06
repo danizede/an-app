@@ -1,158 +1,110 @@
 import streamlit as st
 import pandas as pd
 
-st.set_page_config(layout="wide")
-
-
 def find_column(df: pd.DataFrame, candidates: list[str], purpose: str) -> str:
     """
-    Sucht in df erst exakten Spaltennamen, dann case-insensitive Substring.
-    Gibt den gefundenen Namen zurück oder wirft einen KeyError mit klarer Fehlermeldung.
+    Sucht in df.columns einen der Kandidaten und gibt ihn zurück.
+    Falls keiner passt, wird ein KeyError mit allen verfügbaren Spalten geworfen.
     """
-    cols = df.columns.tolist()
-    # Exakte Übereinstimmung
     for c in candidates:
-        if c in cols:
+        if c in df.columns:
             return c
-    # Substring-Match
-    for c in candidates:
-        for col in cols:
-            if c.lower() in col.lower():
-                return col
     raise KeyError(
         f"Spalte für «{purpose}» fehlt – gesucht unter {candidates}.\n"
-        f"Verfügbare Spalten: {cols}"
+        f"Verfügbare Spalten: {list(df.columns)}"
     )
 
-
-@st.cache_data
-def enrich_and_merge(sell: pd.DataFrame, price: pd.DataFrame) -> pd.DataFrame:
-    # ---------- Spalten in der Preisliste finden & umbenennen ----------
-    price_cols = {
-        find_column(price, ["Artikelnummer", "Artikelnr", "Hersteller-Nr."], "Artikelnr in PL"): "Artikelnr",
-        find_column(price, ["GTIN", "EAN"], "EAN in PL"):                 "EAN",
-        find_column(price, ["Bezeichnung", "Produktname"], "Bezeichnung in PL"): "Bezeichnung",
-        find_column(price, ["Zusatz", "Kategorie", "Warengruppe"], "Kategorie in PL"): "Kategorie",
-        find_column(price, ["NETTO NETTO", "Einkaufspreis", "Einkauf", "Netto"], "Einstandspreis in PL"): "Einstandspreis",
-        find_column(price, ["Bestand", "Verfügbar"], "Bestand in PL"):   "Bestand"
-    }
-    price = price.rename(columns=price_cols)[
-        ["Artikelnr", "EAN", "Bezeichnung", "Kategorie", "Einstandspreis", "Bestand"]
-    ]
-
-    # ---------- Spalten im Sell-Out-Report finden & umbenennen ----------
-    sell_cols = {
-        find_column(sell, ["Artikelnr", "Artikelnummer", "Hersteller-Nr.", "Produkt ID"], "Artikelnr im Sales"): "Artikelnr",
-        find_column(sell, ["GTIN", "EAN"], "EAN im Sales"):              "EAN",
-        find_column(sell, ["Bezeichnung", "Produktname", "Name"], "Bezeichnung im Sales"): "Bezeichnung_Sales",
-        find_column(sell, ["Verkauf", "Sell-Out", "Absatz"], "Verkaufsmenge im Sales"): "SalesQty"
-    }
-    sell = sell.rename(columns=sell_cols)[
-        ["Artikelnr", "EAN", "Bezeichnung_Sales", "SalesQty"]
-    ]
-
-    # Wenn Bezeichnung im Sales fehlt, aus PL ziehen
-    # (Dazu brauchen wir Merge per Artikelnr & EAN, daher später)
-
-    # ---------- 1. Merge per Artikelnummer ----------
-    m1 = pd.merge(
-        sell,
-        price,
-        on="Artikelnr",
-        how="left",
-        suffixes=("_sales", "_pl"),
-        validate="many_to_one",
-        indicator=True
+@st.cache_data(ttl=3600)
+def enrich(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> pd.DataFrame:
+    # 1) Spalten in sell-out-Report finden
+    sell_nr_col     = find_column(sell_df,     ["Hersteller-Nr.", "Produkt ID", "EAN"],      "Artikelnr im Sell-Out-Report")
+    purchase_col    = find_column(sell_df,     ["Einkauf"],                                    "Einkaufsmenge")
+    sold_col        = find_column(sell_df,     ["Verkauf"],                                    "Verkaufsmenge")
+    name_col        = find_column(sell_df,     ["Produktname", "Bezeichnung"],                 "Bezeichnung")
+    
+    # 2) Spalten in Preisliste finden
+    price_nr_col    = find_column(price_df,    ["Artikelnummer", "Hersteller-Nr.", "GTIN", "EAN"], "Artikelnr in Preisliste")
+    stock_col       = find_column(price_df,    ["Bestand", "Verfügbar"],                       "Lagermenge")
+    price_col       = find_column(price_df,    ["NETTO NETTO", "Netto", "Preis"],              "Preis in PL")
+    category_col    = find_column(price_df,    ["Zusatz", "Kategorie", "Warengruppe"],         "Kategorie")
+    
+    # 3) Umbenennen für einheitliches Merge-Feld
+    sell = sell_df.rename(columns={
+        sell_nr_col:  "ArtNr",
+        purchase_col: "Einkaufsmenge",
+        sold_col:     "Verkaufsmenge",
+        name_col:     "Bezeichnung"
+    })
+    price = price_df.rename(columns={
+        price_nr_col:   "ArtNr",
+        stock_col:      "Lagermenge",
+        price_col:      "Preis in PL",
+        category_col:   "Kategorie"
+    })
+    
+    # 4) Merge auf ArtNr
+    merged = pd.merge(
+        sell[["ArtNr", "Bezeichnung", "Einkaufsmenge", "Verkaufsmenge"]],
+        price[["ArtNr", "Kategorie", "Lagermenge", "Preis in PL"]],
+        on="ArtNr",
+        how="left"
     )
-
-    # ---------- 2. Fallback-Merge per EAN für alle, die in m1 kein price gefunden haben ----------
-    no_price = m1["_merge"] == "left_only"
-    if no_price.any():
-        # Select nur die Rows ohne match
-        fallback = pd.merge(
-            m1.loc[no_price, ["Artikelnr", "EAN", "Bezeichnung_Sales", "SalesQty"]],
-            price,
-            left_on="EAN",
-            right_on="EAN",
-            how="left",
-            suffixes=("", "_pl2"),
-            validate="many_to_one"
-        )
-        # Bezeichnung aus Sales falls vorhanden, sonst PL
-        fallback["Bezeichnung"] = fallback["Bezeichnung_Sales"].fillna(fallback["Bezeichnung_pl2"])
-        # Bestand, Einstandspreis, Kategorie aus PL übernehmen
-        for col in ["Bestand", "Einstandspreis", "Kategorie"]:
-            fallback[col] = fallback[col].combine_first(fallback[f"{col}_pl2"])
-        # Drop unnötige
-        fallback = fallback[ m1.columns.drop("_merge") ]  # selbe Struktur wie m1 ohne _merge
-
-        # Nun alte rows in m1 überschreiben
-        m1 = pd.concat([
-            m1.loc[~no_price, m1.columns != "_merge"],
-            fallback
-        ], ignore_index=True)
-
-    else:
-        m1 = m1.drop(columns="_merge")
-
-    # ---------- Finale Spalten aufräumen ----------
-    # Wenn in m1 weder Bezeichnung_Sales noch PL-Bezeichnung existieren, bleibt NaN
-    m1["Bezeichnung"] = m1["Bezeichnung_Sales"].fillna(m1["Bezeichnung"])
-
-    return m1[
-        ["Artikelnr", "EAN", "Bezeichnung", "Kategorie", "SalesQty", "Einstandspreis", "Bestand"]
-    ]
-
-
-def main():
-    st.title("📦 Galaxus Sell-out Aggregator")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        sell_file  = st.file_uploader("Sell-Out-Report (.xlsx)", type="xlsx", key="u1")
-    with col2:
-        price_file = st.file_uploader("Preisliste (.xlsx)",       type="xlsx", key="u2")
-
-    if not sell_file or not price_file:
-        st.info("Bitte beide Dateien hochladen.")
-        return
-
-    sell_df  = pd.read_excel(sell_file)
-    price_df = pd.read_excel(price_file)
-
-    # Merge & Enrichment
-    merged = enrich_and_merge(sell_df, price_df)
-
-    # ---------- Aggregation ----------
-    agg = merged.groupby(
-        ["Artikelnr", "Bezeichnung", "Kategorie"],
-        as_index=False
-    ).agg(
-        Verkaufsmenge = ("SalesQty", "sum"),
-        # Lagermenge nur einmal pro Artikel: nehmen wir das Maximum des (verfügbaren) Bestands
-        Lagermenge    = ("Bestand",    "max"),
-        # Einstandspreis sollte pro Artikel gleich sein: nehmen wir das erste
-        Einstandspreis = ("Einstandspreis", "first")
-    )
-
-    # ---------- Werte berechnen ----------
-    agg["Einkaufsmenge"] = agg["Verkaufsmenge"]
-    agg["Verkaufswert"]  = agg["Verkaufsmenge"] * agg["Einstandspreis"]
-    agg["Einkaufswert"]  = agg["Einkaufsmenge"] * agg["Einstandspreis"]
-    agg["Lagerwert"]     = agg["Lagermenge"]    * agg["Einstandspreis"]
-
-    # ---------- Ergebnis-Tabelle in exakter Spaltenreihenfolge ----------
-    result = agg[
+    
+    # 5) Berechnungen
+    merged["Einkaufswert"]  = merged["Einkaufsmenge"]  * merged["Preis in PL"]
+    merged["Verkaufswert"]  = merged["Verkaufsmenge"]  * merged["Preis in PL"]
+    merged["Lagerwert"]     = merged["Lagermenge"]     * merged["Preis in PL"]
+    
+    # 6) Nur die gewünschten Spalten in dieser Reihenfolge
+    return merged[
         [
-            "Artikelnr", "Bezeichnung", "Kategorie",
+            "ArtNr", "Bezeichnung", "Kategorie",
             "Einkaufsmenge", "Einkaufswert",
             "Verkaufsmenge", "Verkaufswert",
-            "Lagermenge",   "Lagerwert"
+            "Lagermenge", "Lagerwert"
         ]
     ]
 
-    st.dataframe(result, use_container_width=True)
+@st.cache_data(ttl=3600)
+def compute_agg(enriched: pd.DataFrame) -> pd.DataFrame:
+    return (
+        enriched
+        .groupby(["ArtNr", "Bezeichnung", "Kategorie"], as_index=False)
+        .agg({
+            "Einkaufsmenge": "sum",
+            "Einkaufswert":  "sum",
+            "Verkaufsmenge": "sum",
+            "Verkaufswert":  "sum",
+            "Lagermenge":    "sum",
+            "Lagerwert":     "sum"
+        })
+    )
 
+def main():
+    st.set_page_config(layout="wide")
+    st.title("📦 Galaxus Sell-out Aggregator")
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        sell_file = st.file_uploader("Sell-out-Report (.xlsx)", type="xlsx")
+    with col2:
+        price_file = st.file_uploader("Preisliste (.xlsx)", type="xlsx")
+    
+    if sell_file and price_file:
+        try:
+            sell_df  = pd.read_excel(sell_file)
+            price_df = pd.read_excel(price_file)
+            
+            enriched = enrich(sell_df, price_df)
+            agg      = compute_agg(enriched)
+            
+            st.subheader("Aggregierte Kennzahlen pro Artikel")
+            st.dataframe(agg, use_container_width=True)
+            
+        except Exception as e:
+            st.error(f"Fehler während Berechnung:\n{e}")
+    else:
+        st.info("Bitte beide Dateien hochladen, um die Auswertung zu starten.")
 
 if __name__ == "__main__":
     main()
