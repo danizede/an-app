@@ -1,96 +1,86 @@
 import streamlit as st
 import pandas as pd
 
-# ---------- Hilfsfunktionen -----------------------------------------
+st.set_page_config(page_title="Galaxus Sell-out Aggregator", layout="wide")
+
+# ------------------ Helferfunktionen ------------------
 
 def find_column(df: pd.DataFrame, candidates: list[str], purpose: str) -> str:
     """
-    Sucht in df.columns nach einer der Kandidaten (case-insensitive).
-    Gibt den erste Treffer zurück oder wirft KeyError mit Klartext.
+    Sucht in df.columns nacheinander nach den Kandidaten und
+    liefert den ersten gefundenen Spaltennamen zurück.
     """
-    cols_lower = {c.lower(): c for c in df.columns}
-    for cand in candidates:
-        if cand.lower() in cols_lower:
-            return cols_lower[cand.lower()]
-    raise KeyError(
-        f"Spalte für «{purpose}» fehlt – gesucht unter {candidates}.\n"
-        f"Verfügbare Spalten: {list(df.columns)}"
+    for c in candidates:
+        if c in df.columns:
+            return c
+    st.error(f"❌ Spalte für «{purpose}» fehlt – gesucht unter {candidates}.\n"
+             f"Verfügbare Spalten: {list(df.columns)}")
+    st.stop()
+
+@st.cache_data(show_spinner="🔗 Dateien einlesen …")
+def load_data(sell_file: bytes, price_file: bytes):
+    sell_df = pd.read_excel(sell_file, engine="openpyxl")
+    price_df = pd.read_excel(price_file, engine="openpyxl")
+    return sell_df, price_df
+
+@st.cache_data(show_spinner="🔗 Daten matchen & anreichern …")
+def enrich(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> pd.DataFrame:
+    # 1) Spalten ermitteln
+    s_nr    = find_column(sell_df,  ["Hersteller-Nr.","Produkt ID","ArtNr"],       "Hersteller-Nr.")
+    s_ean   = find_column(sell_df,  ["EAN"],                                        "EAN")
+    s_eink  = find_column(sell_df,  ["Einkauf","Einkaufsmenge"],                    "Einkauf")
+    s_sell  = find_column(sell_df,  ["Verkauf","Sell-Out"],                         "Verkauf")
+    s_best  = find_column(sell_df,  ["Verfügbar","Lagerbestand","Bestand"],         "Bestand")
+    #
+    p_nr    = find_column(price_df, ["Artikelnummer","Hersteller-Nr.","Produkt ID"],"Artikelnummer")
+    p_ean   = find_column(price_df, ["GTIN","EAN"],                                 "EAN")
+    p_name  = find_column(price_df, ["Bezeichnung","Produktname","Name"],            "Bezeichnung")
+    p_add   = find_column(price_df, ["Zusatz","Warengruppe"],                       "Zusatz")
+    p_best  = find_column(price_df, ["Bestand","Verfügbar"],                        "Lagerbestand")
+    p_price = find_column(price_df, ["NETTO NETTO","NETTO","Einkauf"],              "Preis")
+
+    # 2) Merge auf Hersteller-Nr.
+    merged = sell_df.merge(
+        price_df[[p_nr,p_ean,p_name,p_add,p_price]],
+        left_on=s_nr, right_on=p_nr, how="left", suffixes=("","_pl")
     )
 
-@st.cache_data(show_spinner="📥 Dateien laden …")
-def load_df(uploader) -> pd.DataFrame:
-    """Lädt eine Excel-Datei ins DataFrame."""
-    return pd.read_excel(uploader, engine="openpyxl")
-
-@st.cache_data(show_spinner="🔗 Matching & Enrichment …", max_entries=5)
-def enrich(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> pd.DataFrame:
-    """Matcht Sell-Out-Report und Preisliste, rechnet Mengen in Werte um."""
-    # 1) Spalten in Sell-Out finden
-    c_artnr   = find_column(sell_df,  ["Artikelnr","Artikelnummer","Hersteller-Nr.","Produkt ID"], "Artikelnr")
-    c_ean     = find_column(sell_df,  ["EAN","GTIN"],                                  "EAN")
-    c_sold    = find_column(sell_df,  ["Verkauf","Sell-Out von","Sell-Out bis","Verkaufsmenge"], "Verkaufsmenge")
-    c_stock   = find_column(sell_df,  ["Verfügbar","Bestand","Lagermenge"],             "Lagermenge")
-    c_buy     = find_column(sell_df,  ["Einkauf","EK","Cost"],                          "Einkaufsmenge")
-
-    # 2) Spalten in Preisliste finden
-    p_artnr   = find_column(price_df, ["Artikelnr","Artikelnummer","Hersteller-Nr."], "Artikelnr")
-    p_ean     = find_column(price_df, ["EAN","GTIN"],                                "EAN")
-    p_name    = find_column(price_df, ["Bezeichnung","Produktname","Name"],           "Bezeichnung")
-    p_cat     = find_column(price_df, ["Zusatz","Warengruppe","Kategorie"],           "Kategorie")
-    p_price   = find_column(price_df, ["Preis","VK","NETTO"],                         "Preis")
-
-    # 3) Preisliste umbenennen auf eindeutige Spalten
-    prices = price_df.rename(columns={
-        p_artnr: "Artikelnr",
-        p_ean:   "EAN",
-        p_name:  "Bezeichnung",
-        p_cat:   "Kategorie",
-        p_price: "Preis"
-    })[["Artikelnr","EAN","Bezeichnung","Kategorie","Preis"]]
-
-    # 4) Sell-Out-Daten umbenennen
-    sell = sell_df.rename(columns={
-        c_artnr: "Artikelnr",
-        c_ean:   "EAN",
-        c_sold:  "Verkaufsmenge",
-        c_stock: "Lagermenge",
-        c_buy:   "Einkaufsmenge"
-    })[["Artikelnr","EAN","Verkaufsmenge","Lagermenge","Einkaufsmenge"]]
-
-    # 5) Merge über Artikelnr
-    merged = sell.merge(prices, on="Artikelnr", how="left")
-
-    # 6) Fehlende Preise via EAN nachtragen
-    mask = merged["Preis"].isna() & merged["EAN"].notna()
+    # 3) Fallback Merge auf EAN, wo noch kein Preis gefunden
+    mask = merged[p_price].isna() & merged[s_ean].notna()
     if mask.any():
-        tmp = merged[mask].merge(
-            prices[["EAN","Bezeichnung","Kategorie","Preis"]].drop_duplicates("EAN"),
-            on="EAN", how="left"
+        fallback = merged.loc[mask, :].merge(
+            price_df[[p_ean,p_name,p_add,p_price]],
+            left_on=s_ean, right_on=p_ean, how="left"
         )
-        for col in ["Bezeichnung","Kategorie","Preis"]:
-            merged.loc[mask, col] = tmp[col].values
+        for col in [p_name, p_add, p_price]:
+            merged.loc[mask, col] = fallback[col].values
 
-    # 7) Fehlende Preise = 0
-    merged["Preis"] = merged["Preis"].fillna(0)
+    return merged, (s_eink, s_sell, s_best, p_price, p_name, p_add)
 
-    # 8) Werte berechnen
-    merged["Einkaufswert"]  = merged["Einkaufsmenge"]  * merged["Preis"]
-    merged["Verkaufswert"]  = merged["Verkaufsmenge"]  * merged["Preis"]
-    merged["Lagerwert"]     = merged["Lagermenge"]     * merged["Preis"]
+@st.cache_data(show_spinner="🔢 Aggregation berechnen …")
+def compute_agg(merged: pd.DataFrame, cols):
+    s_eink, s_sell, s_best, p_price, p_name, p_add = cols
 
-    return merged
+    # 4) Wert-Spalten berechnen
+    merged["Einkaufswert"] = merged[s_eink] * merged[p_price]
+    merged["Verkaufswert"] = merged[s_sell] * merged[p_price]
+    merged["Lagerwert"]    = merged[s_best] * merged[p_price]
 
-@st.cache_data(show_spinner="📊 Aggregation …", max_entries=5)
-def compute_agg(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
-    """Aggregiert nach Artikel und summiert alle Mengen & Werte."""
-    tbl = df.groupby(["Artikelnr","Bezeichnung","Kategorie"], dropna=False).agg(
-        Einkaufsmenge   = ("Einkaufsmenge",  "sum"),
-        Einkaufswert    = ("Einkaufswert",   "sum"),
-        Verkaufsmenge   = ("Verkaufsmenge",  "sum"),
-        Verkaufswert    = ("Verkaufswert",   "sum"),
-        Lagermenge      = ("Lagermenge",     "sum"),
-        Lagerwert       = ("Lagerwert",      "sum"),
-    ).reset_index()
+    # 5) Gruppieren
+    tbl = (
+        merged
+        .groupby([p_name, p_add], dropna=False)
+        .agg(
+            Einkaufsmenge  = (s_eink,  "sum"),
+            Einkaufswert   = ("Einkaufswert", "sum"),
+            Verkaufsmenge  = (s_sell,  "sum"),
+            Verkaufswert   = ("Verkaufswert", "sum"),
+            Lagermenge     = (s_best,  "sum"),
+            Lagerwert      = ("Lagerwert", "sum"),
+        )
+        .reset_index()
+    )
+
     totals = {
         "EK": tbl["Einkaufswert"].sum(),
         "VK": tbl["Verkaufswert"].sum(),
@@ -98,50 +88,34 @@ def compute_agg(df: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     }
     return tbl, totals
 
-# ---------------- Hauptprogramm ---------------------------------------
+# ------------------ UI & Main ------------------
 
 def main():
-    st.set_page_config(page_title="Galaxus Sell-out", layout="wide")
     st.title("📦 Galaxus Sell-out Aggregator")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        sell_file  = st.file_uploader("Sell-Out-Report (.xlsx)", type="xlsx")
-    with col2:
-        price_file = st.file_uploader("Preisliste (.xlsx)",      type="xlsx")
+    st.markdown("**1. Sell-out-Report (.xlsx)**")
+    sell_file  = st.file_uploader("Drag and drop hier den Sell-out-Report", type="xlsx", key="sell")
+    st.markdown("**2. Preisliste (.xlsx)**")
+    price_file = st.file_uploader("Drag and drop hier die Preisliste",       type="xlsx", key="price")
 
     if not sell_file or not price_file:
-        st.info("Bitte beide Dateien hochladen, um zu starten.")
+        st.info("📌 Bitte beide Dateien hochladen, um fortzufahren.")
         return
 
-    sell_df  = load_df(sell_file)
-    price_df = load_df(price_file)
+    sell_df, price_df = load_data(sell_file, price_file)
 
-    enriched = enrich(sell_df, price_df)
+    merged, cols = enrich(sell_df, price_df)
+    tbl, totals = compute_agg(merged, cols)
 
-    # —— Diagnostik: Artikel mit Menge aber Preis=0 ——
-    no_price = enriched.query("Preis == 0 and (Einkaufsmenge>0 or Verkaufsmenge>0 or Lagermenge>0)")
-    if not no_price.empty:
-        st.error(f"{len(no_price)} Zeilen haben Menge > 0, aber Preis=0 → kein Wert.")
-        st.dataframe(
-            no_price[["Artikelnr","EAN","Einkaufsmenge","Verkaufsmenge","Lagermenge"]],
-            use_container_width=True
-        )
-        st.stop()
+    # Kennzahlen oben
+    c1, c2, c3 = st.columns(3)
+    c1.metric("💰 Einkaufswert (CHF)", f"{totals['EK']:,.0f}")
+    c2.metric("💰 Verkaufswert (CHF)", f"{totals['VK']:,.0f}")
+    c3.metric("💰 Lagerwert (CHF)",    f"{totals['LG']:,.0f}")
 
-    # —— Aggregation & Anzeige ——
-    agg_tbl, totals = compute_agg(enriched)
-
-    # Kennzahlen in einer Zeile
-    k1, k2, k3, k4, k5, k6 = st.columns(6)
-    k1.metric("EK-Menge",   f"{agg_tbl['Einkaufsmenge'].sum():,.0f}")
-    k2.metric("EK-Wert",    f"{totals['EK']:,.0f}")
-    k3.metric("VK-Menge",   f"{agg_tbl['Verkaufsmenge'].sum():,.0f}")
-    k4.metric("VK-Wert",    f"{totals['VK']:,.0f}")
-    k5.metric("LG-Menge",   f"{agg_tbl['Lagermenge'].sum():,.0f}")
-    k6.metric("LG-Wert",    f"{totals['LG']:,.0f}")
-
-    st.dataframe(agg_tbl, use_container_width=True)
+    # Tabelle breit ausgeben
+    st.write("### Detailauswertung nach Kategorie")
+    st.dataframe(tbl, use_container_width=True)
 
 if __name__ == "__main__":
     main()
