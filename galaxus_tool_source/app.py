@@ -1,11 +1,5 @@
 # app.py
 # Galaxus Sell-out Aggregator – robust & stabil
-# - flexible Spaltenerkennung (Preislisten & Sell-out-Report)
-# - Schweizer Zahlenformat (Apostroph-Tausender, Komma-Dezimal) wird korrekt geparst
-# - Merge-Fallbacks: Artikelnummer -> EAN -> normalisierter Name
-# - Einkaufs-/Verkaufs-/Lager-Mengen & -Werte werden getrennt berechnet
-# - Anzeige: rundet auf ganze Zahlen + Tausendertrennzeichen
-
 import re
 import unicodedata
 import numpy as np
@@ -17,7 +11,7 @@ st.set_page_config(page_title="Galaxus Sell-out Aggregator", layout="wide")
 # =========================
 # Anzeige-Helfer (Runden + Tausender)
 # =========================
-THOUSANDS_SEP = "'"  # Schweizer Format
+THOUSANDS_SEP = "'"
 NUM_COLS_DEFAULT = [
     "Einkaufsmenge", "Einkaufswert",
     "Verkaufsmenge", "Verkaufswert",
@@ -62,11 +56,9 @@ def normalize_key(s: str) -> str:
 
 def find_column(df: pd.DataFrame, candidates, purpose: str, required=True) -> str | None:
     cols = list(df.columns)
-    # exakte Treffer
     for cand in candidates:
         if cand in cols:
             return cand
-    # case-insensitive + Leerzeichen/Bindestrich tolerant
     canon = {re.sub(r"[\s\-_/]+", "", c).lower(): c for c in cols}
     for cand in candidates:
         key = re.sub(r"[\s\-_/]+", "", cand).lower()
@@ -81,26 +73,19 @@ def find_column(df: pd.DataFrame, candidates, purpose: str, required=True) -> st
 def parse_number_series(s: pd.Series) -> pd.Series:
     if s.dtype.kind in ("i", "u", "f"):
         return s
-
-    # zuerst Apostroph als Tausender raus, dann Komma -> Punkt
     def _clean(x):
         if pd.isna(x):
             return np.nan
         x = str(x).strip()
-        # gängige Tausendertrenner entfernen
         x = x.replace("’", "").replace("'", "").replace(" ", "")
-        # Dezimal-Komma -> Punkt
         x = x.replace(",", ".")
-        # vereinzelte Punkte als Tausender rausholen, wenn mehr als ein Punkt
         if x.count(".") > 1:
-            # alles bis auf die letzte Punktinstanz entfernen
             parts = x.split(".")
             x = "".join(parts[:-1]) + "." + parts[-1]
         try:
             return float(x)
         except Exception:
             return np.nan
-
     return s.map(_clean)
 
 # =========================
@@ -123,14 +108,11 @@ STOCK_CANDIDATES = ["Bestand", "Verfügbar", "Lagerbestand"]
 
 def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     df = normalize_cols(df)
-
     col_art  = find_column(df, ARTNR_CANDIDATES, "Artikelnummer")
     col_ean  = find_column(df, EAN_CANDIDATES, "EAN/GTIN", required=False)
     col_name = find_column(df, NAME_CANDIDATES_PL, "Bezeichnung")
     col_cat  = find_column(df, CAT_CANDIDATES, "Kategorie", required=False)
     col_stock= find_column(df, STOCK_CANDIDATES, "Bestand/Lager", required=False)
-
-    # Preise
     col_buy  = find_column(df, BUY_PRICE_CANDIDATES,  "Einkaufspreis", required=False)
     col_sell = find_column(df, SELL_PRICE_CANDIDATES, "Verkaufspreis", required=False)
     col_any  = None
@@ -140,21 +122,16 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame()
     out["ArtikelNr"]   = df[col_art].astype(str)
     out["ArtikelNr_key"] = out["ArtikelNr"].map(normalize_key)
-
     out["EAN"] = df[col_ean].astype(str) if col_ean else ""
     out["EAN_key"] = out["EAN"].map(lambda x: re.sub(r"[^0-9]+", "", str(x)))
-
     out["Bezeichnung"] = df[col_name].astype(str)
     out["Bezeichnung_key"] = out["Bezeichnung"].map(normalize_key)
-
     out["Kategorie"] = df[col_cat].astype(str) if col_cat else ""
-
     if col_stock:
         out["Lagermenge"] = parse_number_series(df[col_stock]).fillna(0).astype("Int64")
     else:
         out["Lagermenge"] = pd.Series([0]*len(out), dtype="Int64")
 
-    # Preise: Einkauf + Verkauf wenn vorhanden, sonst eine Preis-Spalte verwenden
     if col_buy:
         out["Einkaufspreis"] = parse_number_series(df[col_buy])
     if col_sell:
@@ -163,13 +140,10 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
         price_any = parse_number_series(df[col_any])
         out["Einkaufspreis"] = price_any
         out["Verkaufspreis"] = price_any
-
-    # Defaults falls eine Seite fehlt
     if "Einkaufspreis" not in out:
         out["Einkaufspreis"] = out.get("Verkaufspreis", pd.Series([np.nan]*len(out)))
     if "Verkaufspreis" not in out:
         out["Verkaufspreis"] = out.get("Einkaufspreis", pd.Series([np.nan]*len(out)))
-
     return out
 
 # =========================
@@ -181,7 +155,6 @@ BUY_QTY_CANDIDATES   = ["Einkauf", "Einkaufsmenge", "Menge Einkauf"]
 
 def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
     df = normalize_cols(df)
-
     col_art  = find_column(df, ARTNR_CANDIDATES, "Artikelnummer", required=False)
     col_ean  = find_column(df, EAN_CANDIDATES, "EAN/GTIN", required=False)
     col_name = find_column(df, NAME_CANDIDATES_SO, "Bezeichnung", required=False)
@@ -191,28 +164,22 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
     out = pd.DataFrame()
     out["ArtikelNr"] = df[col_art].astype(str) if col_art else ""
     out["ArtikelNr_key"] = out["ArtikelNr"].map(normalize_key)
-
     out["EAN"] = df[col_ean].astype(str) if col_ean else ""
     out["EAN_key"] = out["EAN"].map(lambda x: re.sub(r"[^0-9]+", "", str(x)))
-
     out["Bezeichnung"] = df[col_name].astype(str) if col_name else ""
     out["Bezeichnung_key"] = out["Bezeichnung"].map(normalize_key)
-
     out["Verkaufsmenge"] = parse_number_series(df[col_sales]).fillna(0).astype("Int64")
     if col_buy:
         out["Einkaufsmenge"] = parse_number_series(df[col_buy]).fillna(0).astype("Int64")
     else:
         out["Einkaufsmenge"] = pd.Series([0]*len(out), dtype="Int64")
-
     return out
 
 # =========================
-# Merge & Berechnung
+# Merge & Berechnung (FIXED ndarray → Series)
 # =========================
 @st.cache_data(show_spinner=False)
 def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Gibt (detail_tabelle, totals) zurück."""
-    # 1) exakter Merge auf ArtikelNr
     merged = sell_df.merge(
         price_df,
         on=["ArtikelNr_key"],
@@ -220,18 +187,20 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> tuple[pd.
         suffixes=("", "_pl")
     )
 
-    # 2) fehlende Preise/Infos via EAN nachziehen
-    mask_need = merged["Verkaufspreis"].isna() & (sell_df["EAN_key"].astype(bool))
+    # --- Fallback via EAN: fehlende Preise mit Preislistenwerten ergänzen ---
+    mask_need = merged["Verkaufspreis"].isna() & merged["EAN_key"].astype(bool)
     if mask_need.any():
-        tmp = sell_df.loc[mask_need, ["EAN_key"]].merge(
+        tmp = merged.loc[mask_need, ["EAN_key"]].merge(
             price_df[["EAN_key", "Einkaufspreis", "Verkaufspreis", "Lagermenge", "Bezeichnung", "Kategorie", "ArtikelNr"]],
             on="EAN_key", how="left"
         )
+        # **WICHTIG**: Indizes angleichen, dann Series-weise füllen (kein ndarray!)
         idx = merged.index[mask_need]
+        tmp.index = idx  # jetzt gleiche Indexachse
         for col in ["Einkaufspreis", "Verkaufspreis", "Lagermenge", "Bezeichnung", "Kategorie", "ArtikelNr"]:
-            merged.loc[idx, col] = merged.loc[idx, col].fillna(tmp[col].values)
+            merged.loc[idx, col] = merged.loc[idx, col].fillna(tmp[col])
 
-    # 3) letzter Fallback: normalisierte Bezeichnung
+    # --- Fallback via normalisierte Bezeichnung ---
     mask_need = merged["Verkaufspreis"].isna()
     if mask_need.any():
         name_map = price_df.drop_duplicates("Bezeichnung_key").set_index("Bezeichnung_key")
@@ -244,31 +213,26 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> tuple[pd.
                     if pd.isna(merged.at[i, col]) or col in ("ArtikelNr", "Bezeichnung", "Kategorie"):
                         merged.at[i, col] = row.get(col, merged.at[i, col])
 
-    # Sicherstellen: Preise numerisch
+    # Numerisch setzen
     for pcol in ["Einkaufspreis", "Verkaufspreis"]:
         merged[pcol] = pd.to_numeric(merged[pcol], errors="coerce")
-
-    # Restliche Defaults
     merged["Kategorie"] = merged["Kategorie"].fillna("")
     merged["Bezeichnung"] = merged["Bezeichnung"].replace("", sell_df["Bezeichnung"]).fillna("")
 
-    # 4) Werte berechnen (mit vorhandenen Spalten)
+    # Werte berechnen
     merged["Einkaufswert"] = (merged["Einkaufsmenge"].astype("Int64").fillna(0) * merged["Einkaufspreis"].fillna(0)).astype(float)
     merged["Verkaufswert"] = (merged["Verkaufsmenge"].astype("Int64").fillna(0) * merged["Verkaufspreis"].fillna(0)).astype(float)
     merged["Lagerwert"]    = (merged["Lagermenge"].astype("Int64").fillna(0)    * merged["Verkaufspreis"].fillna(0)).astype(float)
 
-    # Anzeige- und Exporttabelle (geordnet)
     display_cols = [
         "ArtikelNr", "Bezeichnung", "Kategorie",
         "Einkaufsmenge", "Einkaufswert",
         "Verkaufsmenge", "Verkaufswert",
         "Lagermenge", "Lagerwert"
     ]
-    # evtl. nicht existierende Spalten filtern
     display_cols = [c for c in display_cols if c in merged.columns]
     detail = merged[display_cols].copy()
 
-    # Totals (über Artikel zusammengefasst) – falls gewünscht pro Artikel
     totals = (
         detail.groupby(["ArtikelNr", "Bezeichnung", "Kategorie"], dropna=False, as_index=False)
               .agg({
@@ -280,7 +244,6 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> tuple[pd.
                    "Lagerwert": "sum"
               })
     )
-
     return detail, totals
 
 # =========================
@@ -316,7 +279,6 @@ if sell_file and price_file:
         with st.spinner("🔗 Matche & berechne Werte…"):
             detail, totals = enrich_and_merge(sell_df, price_df)
 
-        # Anzeige – gerundet + Tausendertrennzeichen
         st.subheader("Detailtabelle")
         d_rounded, d_styler = style_numeric(detail)
         st.dataframe(d_styler, use_container_width=True)
@@ -325,7 +287,6 @@ if sell_file and price_file:
         t_rounded, t_styler = style_numeric(totals)
         st.dataframe(t_styler, use_container_width=True)
 
-        # Optional: Downloads (Export bleibt numerisch, aber gerundet auf ganze Werte)
         c1, c2 = st.columns(2)
         with c1:
             st.download_button(
