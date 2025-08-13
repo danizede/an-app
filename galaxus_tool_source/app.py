@@ -1,10 +1,12 @@
 # app.py — Galaxus Sell‑out Aggregator (Summenansicht, robustes Matching)
-# Matching-Reihenfolge: ArtikelNr -> EAN -> erste 2 Wörter (ohne Klammern)
+# Matching-Reihenfolge: ArtikelNr -> EAN -> erste 2 Wörter (ohne Klammern) -> vollständiger Name
+
 import re
 import unicodedata
 import numpy as np
 import pandas as pd
 import streamlit as st
+from typing import Optional, List
 
 st.set_page_config(page_title="Galaxus Sell‑out Aggregator", layout="wide")
 
@@ -49,7 +51,7 @@ def first2_words_key(name: str) -> str:
     first2 = "".join(tokens[:2]).lower()
     return first2
 
-def find_column(df: pd.DataFrame, candidates, purpose: str, required=True) -> str|None:
+def find_column(df: pd.DataFrame, candidates: List[str], purpose: str, required=True) -> Optional[str]:
     cols = list(df.columns)
     for cand in candidates:
         if cand in cols: return cand
@@ -102,7 +104,9 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     if not col_sell and not col_buy:
         col_any = find_column(df, PRICE_COL_CANDIDATES, "Preis", required=True)
 
-    out = pd.DataFrame()
+    # **Fix**: DataFrame mit gleichem Index wie Quelle, um Length mismatch auszuschließen
+    out = pd.DataFrame(index=df.index)
+
     out["ArtikelNr"]        = df[col_art].astype(str)
     out["ArtikelNr_key"]    = out["ArtikelNr"].map(normalize_key)
     out["EAN"]              = df[col_ean].astype(str) if col_ean else ""
@@ -128,9 +132,9 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     if "Verkaufspreis" not in out:   out["Verkaufspreis"]  = out.get("Einkaufspreis", pd.Series([np.nan]*len(out)))
 
     def build_display(row):
-        base = row["Bezeichnung"].strip()
+        base = str(row["Bezeichnung"]).strip()
         color = str(row["Farbe"]).strip()
-        return f"{base} ({color})" if color else base
+        return f"{base} ({color})" if base and color else base
     out["DisplayName"] = out.apply(build_display, axis=1)
     return out
 
@@ -145,13 +149,13 @@ END_DATE_CANDS    = ["Bis","Ende","Enddatum","Period End","Zeitraum Ende","Schlu
 KW_CANDIDATES     = ["KW","Kalenderwoche","Week"]
 YEAR_CANDIDATES   = ["Jahr","Year"]
 
-def _first_existing(df, cands):
+def _first_existing(df: pd.DataFrame, cands: List[str]) -> Optional[str]:
     for c in cands:
         col = find_column(df,[c],c,required=False)
         if col: return col
     return None
 
-def _find_any_date_column(df):
+def _find_any_date_column(df: pd.DataFrame) -> Optional[str]:
     for col in df.columns:
         s = pd.to_datetime(df[col], errors="coerce")
         if s.notna().sum() > 0:
@@ -166,13 +170,14 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
     col_sales = find_column(df, SALES_QTY_CANDIDATES, "Verkaufsmenge", required=True)
     col_buy   = find_column(df, BUY_QTY_CANDIDATES,   "Einkaufsmenge", required=False)
 
-    # Datum/Periode erkennen
     col_date  = find_column(df, DATE_CANDIDATES, "Datum", required=False)
     col_start = _first_existing(df, START_DATE_CANDS)
     col_kw    = _first_existing(df, KW_CANDIDATES)
     col_year  = _first_existing(df, YEAR_CANDIDATES)
 
-    out = pd.DataFrame()
+    # **Fix**: DataFrame mit gleichem Index wie Quelle
+    out = pd.DataFrame(index=df.index)
+
     out["ArtikelNr"]        = df[col_art].astype(str) if col_art else ""
     out["ArtikelNr_key"]    = out["ArtikelNr"].map(normalize_key)
     out["EAN"]              = df[col_ean].astype(str) if col_ean else ""
@@ -183,20 +188,24 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
     out["Verkaufsmenge"]    = parse_number_series(df[col_sales]).fillna(0).astype("Int64")
     out["Einkaufsmenge"]    = parse_number_series(df[col_buy]).fillna(0).astype("Int64") if col_buy else pd.Series([0]*len(out), dtype="Int64")
 
+    # Datum erzeugen
     if col_date:
         out["Datum"] = parse_date_series(df[col_date])
     elif col_start:
         out["Datum"] = parse_date_series(df[col_start])
     elif col_kw and col_year:
-        kw = pd.to_numeric(df[col_kw], errors="coerce").astype("Int64")
-        yr = pd.to_numeric(df[col_year], errors="coerce").astype("Int64")
-        def kw_to_date(k,y):
-            if pd.isna(k) or pd.isna(y): return pd.NaT
-            return pd.to_datetime(f"{int(y)}-W{int(k):02d}-1", format="%G-W%V-%u", errors="coerce")
-        out["Datum"] = [kw_to_date(k,y) for k,y in zip(kw,yr)]
+        # **Fix**: vektorisierte ISO‑Woche → Montags‑Datum, kein zip()
+        kw = pd.to_numeric(df[col_kw], errors="coerce")
+        yr = pd.to_numeric(df[col_year], errors="coerce")
+        iso_str = (
+            yr.fillna(-1).astype(int).astype(str) + "-W" +
+            kw.fillna(-1).astype(int).astype(str).str.zfill(2) + "-1"
+        )
+        out["Datum"] = pd.to_datetime(iso_str, format="%G-W%V-%u", errors="coerce")
     else:
         col_any = _find_any_date_column(df)
-        if col_any: out["Datum"] = parse_date_series(df[col_any])
+        if col_any:
+            out["Datum"] = parse_date_series(df[col_any])
 
     return out
 
@@ -205,14 +214,17 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
 def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame):
     merged = sell_df.merge(price_df, on=["ArtikelNr_key"], how="left", suffixes=("","_pl"))
 
-    def _fallback_join(key):
+    def _fallback_join(key: str):
+        if key not in merged.columns or key not in price_df.columns:
+            return
         mask = merged["Verkaufspreis"].isna() & merged[key].astype(bool)
         if not mask.any(): return
         cols = ["Einkaufspreis","Verkaufspreis","Lagermenge","Bezeichnung","Kategorie","ArtikelNr","Farbe","DisplayName"]
-        tmp = merged.loc[mask, [key]].merge(price_df[[key]+cols], on=key, how="left")
+        tmp = merged.loc[mask, [key]].merge(price_df[[key]+[c for c in cols if c in price_df.columns]], on=key, how="left")
         idx = merged.index[mask]; tmp.index = idx
         for c in cols:
-            merged.loc[idx, c] = merged.loc[idx, c].fillna(tmp[c])
+            if c in tmp.columns:
+                merged.loc[idx, c] = merged.loc[idx, c].fillna(tmp[c])
 
     # Fallback 1: EAN
     _fallback_join("EAN_key")
@@ -221,27 +233,30 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame):
     # Fallback 3: vollständiger, normalisierter Name (letzte Rettung)
     if merged["Verkaufspreis"].isna().any():
         key = "Bezeichnung_key"
-        mask = merged["Verkaufspreis"].isna() & merged[key].astype(bool)
-        if mask.any():
-            name_map = price_df.drop_duplicates(key).set_index(key)
-            for i, k in zip(merged.index[mask], merged.loc[mask, key]):
-                if k in name_map.index:
-                    row = name_map.loc[k]
-                    for c in ["Einkaufspreis","Verkaufspreis","Lagermenge","Bezeichnung","Kategorie","ArtikelNr","Farbe","DisplayName"]:
-                        if pd.isna(merged.at[i, c]) or c in ("ArtikelNr","Bezeichnung","Kategorie","Farbe","DisplayName"):
-                            merged.at[i, c] = row.get(c, merged.at[i, c])
+        if key in sell_df.columns and key in price_df.columns:
+            mask = merged["Verkaufspreis"].isna() & merged[key].astype(bool)
+            if mask.any():
+                name_map = price_df.drop_duplicates(key).set_index(key)
+                for i, k in zip(merged.index[mask], merged.loc[mask, key]):
+                    if k in name_map.index:
+                        row = name_map.loc[k]
+                        for c in ["Einkaufspreis","Verkaufspreis","Lagermenge","Bezeichnung","Kategorie","ArtikelNr","Farbe","DisplayName"]:
+                            if (c in row) and (pd.isna(merged.at[i, c]) or c in ("ArtikelNr","Bezeichnung","Kategorie","Farbe","DisplayName")):
+                                merged.at[i, c] = row.get(c, merged.at[i, c])
 
     # Strings säubern – Kategorie nie 'nan'
-    merged["Kategorie"]  = merged.get("Kategorie","").astype(str).replace(["nan","None"],"").fillna("")
-    merged["Bezeichnung"]= merged.get("Bezeichnung","").astype(str).replace(["nan","None"],"").fillna("")
-    merged["Farbe"]      = merged.get("Farbe","").astype(str).replace(["nan","None"],"").fillna("")
+    merged["Kategorie"]   = merged.get("Kategorie","").astype(str).replace(["nan","None"],"").fillna("")
+    merged["Bezeichnung"] = merged.get("Bezeichnung","").astype(str).replace(["nan","None"],"").fillna("")
+    merged["Farbe"]       = merged.get("Farbe","").astype(str).replace(["nan","None"],"").fillna("")
     # DisplayName sicherstellen
     def _disp(row):
         base = str(row.get("Bezeichnung","")).strip()
         col  = str(row.get("Farbe","")).strip()
         return f"{base} ({col})" if base and col else base or ""
     merged["DisplayName"] = merged.get("DisplayName","").astype(str).replace(["nan","None"],"").fillna("")
-    merged.loc[merged["DisplayName"]=="","DisplayName"] = merged[merged["DisplayName"]==""].apply(_disp, axis=1)
+    missing_disp = (merged["DisplayName"] == "")
+    if missing_disp.any():
+        merged.loc[missing_disp, "DisplayName"] = merged.loc[missing_disp].apply(_disp, axis=1)
 
     # Werte berechnen
     for pcol in ["Einkaufspreis","Verkaufspreis"]:
@@ -250,19 +265,19 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame):
     merged["Verkaufswert"] = (merged["Verkaufsmenge"].astype("Int64").fillna(0) * merged["Verkaufspreis"]).astype(float)
     merged["Lagerwert"]    = (merged["Lagermenge"].astype("Int64").fillna(0)    * merged["Verkaufspreis"]).astype(float)
 
+    # Anzeige + Aggregation
     display_cols = ["ArtikelNr","DisplayName","Kategorie","Einkaufsmenge","Einkaufswert","Verkaufsmenge","Verkaufswert","Lagermenge","Lagerwert"]
     detail = merged[[c for c in display_cols if c in merged.columns]].copy()
-
     totals = (detail.groupby(["ArtikelNr","DisplayName","Kategorie"], dropna=False, as_index=False)
                     .agg({"Einkaufsmenge":"sum","Einkaufswert":"sum","Verkaufsmenge":"sum","Verkaufswert":"sum","Lagermenge":"sum","Lagerwert":"sum"}))
 
-    # Liste der nicht gematchten Positionen (falls vorhanden)
+    # Liste der nicht gematchten Positionen (optional)
     unmatched = merged[merged["Verkaufspreis"].isna()][["ArtikelNr","EAN","Bezeichnung","First2_key","Verkaufsmenge","Einkaufsmenge"]].copy() if "Verkaufspreis" in merged else pd.DataFrame()
     return detail, totals, unmatched
 
 # ========= UI =========
 st.title("📦 Galaxus Sell‑out Aggregator")
-st.caption("Summenansicht mit robustem Matching (ArtNr → EAN → erste 2 Wörter).")
+st.caption("Summenansicht mit robustem Matching und Periodenfilter (KW/Jahr).")
 
 c1, c2 = st.columns(2)
 with c1:
@@ -281,7 +296,7 @@ if sell_file and price_file:
             sell_df  = prepare_sell_df(raw_sell)
             price_df = prepare_price_df(raw_price)
 
-        # Perioden-Filter (KW/Jahr) mit „Gesamten Zeitraum“
+        # Perioden-Filter (KW/Jahr) + "Gesamten Zeitraum"
         filtered_sell_df = sell_df
         period_enabled = False
         if "Datum" in sell_df.columns and not sell_df["Datum"].isna().all():
@@ -305,13 +320,12 @@ if sell_file and price_file:
         with st.spinner("🔗 Matche & berechne Werte…"):
             detail, totals, unmatched = enrich_and_merge(filtered_sell_df, price_df)
 
-        # NUR Summen anzeigen
+        # Nur Summen anzeigen
         st.subheader("Summen pro Artikel")
         t_rounded, t_styler = style_numeric(totals)
         st.dataframe(t_styler, use_container_width=True)
         st.download_button("⬇️ Summen (CSV)", data=t_rounded.to_csv(index=False).encode("utf-8"), file_name="summen.csv", mime="text/csv")
 
-        # Hinweis + optionaler Download für nicht gematchte Positionen
         if unmatched is not None and len(unmatched)>0:
             st.warning(f"{len(unmatched)} Position(en) ohne Preis-Match. (ArtNr/EAN/erste 2 Wörter prüfen)")
             st.download_button("⬇️ Ungematchte (CSV)", data=unmatched.to_csv(index=False).encode("utf-8"), file_name="ungematcht.csv", mime="text/csv")
