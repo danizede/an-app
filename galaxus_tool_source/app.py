@@ -1,4 +1,4 @@
-# app.py — Galaxus Sell‑out Aggregator (mit Persistenz, robustem Matching, Farbanzeige, KW-Filter)
+# app.py — Galaxus Sell‑out Aggregator (Summenansicht, robustes Matching, Farbanzeige, KW‑Filter und Datenpersistenz)
 
 import os
 import re
@@ -144,7 +144,7 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     out["Bezeichnung"]      = df[col_name].astype(str)
     out["Bezeichnung_key"]  = out["Bezeichnung"].map(normalize_key)
     out["First2_key"]       = out["Bezeichnung"].map(first2_words_key)
-    out["Kategorie"]        = (df[col_cat].astype(str) if col_cat else "").replace(["nan", "None"], "").fillna("")
+    out["Kategorie"]        = (df[col_cat].astype(str) if col_cat else "").replace(["nan","None"], "").fillna("")
     out["Farbe"]            = (df[col_color].astype(str) if col_color else "").replace(["nan","None"], "").fillna("")
 
     if col_stock:
@@ -223,7 +223,7 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
     out["Verkaufsmenge"]    = parse_number_series(df[col_sales]).fillna(0).astype("Int64")
     out["Einkaufsmenge"]    = parse_number_series(df[col_buy]).fillna(0).astype("Int64") if col_buy else pd.Series([0] * len(out), dtype="Int64")
 
-    # Datum erzeugen
+    # Datum erzeugen (EU-Format YYYY-MM-DD wird richtig erkannt)
     if col_date:
         out["Datum"] = parse_date_series(df[col_date])
     elif col_start:
@@ -239,6 +239,13 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
         col_any = _find_any_date_column(df)
         if col_any:
             out["Datum"] = parse_date_series(df[col_any])
+        else:
+            out["Datum"] = pd.NaT
+
+    # Kalenderwoche (KW) und Jahr direkt hier berechnen – immer gleiche Länge wie out
+    out["KW"] = out["Datum"].apply(lambda d: d.isocalendar()[1] if pd.notna(d) else pd.NA).astype("Int64")
+    out["KW_Year"] = out["Datum"].apply(lambda d: d.isocalendar()[0] if pd.notna(d) else pd.NA).astype("Int64")
+    out["Period"] = out["KW"].astype(str) + "/" + out["KW_Year"].astype(str)
 
     return out
 
@@ -332,7 +339,7 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame):
 # UI – Dateien laden & persistieren
 # =========================
 st.title("📦 Galaxus Sell‑out Aggregator")
-st.caption("Summenansicht, robustes Matching (ArtNr → EAN → 1./2. Wort), KW-Filter und Datenspeicherung.")
+st.caption("Summenansicht, robustes Matching (ArtNr → EAN → 1./2. Wort), KW-Filter (EU-Datumsformat) und Datenspeicherung.")
 
 col1, col2 = st.columns(2)
 with col1:
@@ -377,35 +384,27 @@ if raw_sell is not None and raw_price is not None:
             sell_df  = prepare_sell_df(raw_sell)
             price_df = prepare_price_df(raw_price)
 
-        # KW/Jahr-Filter mit „Gesamten Zeitraum“
+        # KW/Jahr-Filter aus vorab berechneter 'Period' – stabil
         filtered_sell_df = sell_df.copy()
         period_enabled = False
-        if "Datum" in sell_df.columns and not sell_df["Datum"].isna().all():
-            try:
-                # Sichere Berechnung von KW/Jahr (pro Zeile)
-                sell_df["KW"] = sell_df["Datum"].apply(lambda d: d.isocalendar()[1] if pd.notna(d) else pd.NA)
-                sell_df["KW_Year"] = sell_df["Datum"].apply(lambda d: d.isocalendar()[0] if pd.notna(d) else pd.NA)
-                sell_df["Period"] = sell_df["KW"].astype("Int64").astype(str) + "/" + sell_df["KW_Year"].astype("Int64").astype(str)
-                periods = sorted(sell_df["Period"].dropna().unique().tolist())
-                if periods:
-                    period_enabled = True
-                    st.subheader("Periode wählen")
-                    key_period = "period_select"
-                    sel = st.selectbox(
-                        "Kalenderwoche (KW/Jahr) oder 'Alle'",
-                        options=["Alle"] + periods,
-                        index=0,
-                        key=key_period
-                    )
-                    def set_all():
-                        st.session_state[key_period] = "Alle"
-                    st.button("Gesamten Zeitraum", on_click=set_all)
-                    sel = st.session_state.get(key_period, sel)
-                    if sel != "Alle":
-                        filtered_sell_df = sell_df[sell_df["Period"] == sel].copy()
-            except Exception:
-                st.warning("Periode konnte nicht berechnet werden – Filter deaktiviert.")
-                period_enabled = False
+        if "Period" in sell_df.columns and not sell_df["Period"].isna().all():
+            periods = sorted(sell_df["Period"].dropna().unique().tolist())
+            if periods:
+                period_enabled = True
+                st.subheader("Periode wählen")
+                key_period = "period_select"
+                sel = st.selectbox(
+                    "Kalenderwoche (KW/Jahr) oder 'Alle'",
+                    options=["Alle"] + periods,
+                    index=0,
+                    key=key_period
+                )
+                def set_all():
+                    st.session_state[key_period] = "Alle"
+                st.button("Gesamten Zeitraum", on_click=set_all)
+                sel = st.session_state.get(key_period, sel)
+                if sel != "Alle":
+                    filtered_sell_df = sell_df[sell_df["Period"] == sel].copy()
         if not period_enabled:
             st.info("Hinweis: Keine Datum-/KW-Informationen erkannt – Filter ausgeblendet.")
 
