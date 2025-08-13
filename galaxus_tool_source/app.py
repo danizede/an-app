@@ -176,7 +176,7 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 # =========================
-# Merge & Berechnung (FIXED ndarray → Series)
+# Merge & Berechnung (Series- statt ndarray-Fallback)
 # =========================
 @st.cache_data(show_spinner=False)
 def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -187,16 +187,15 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> tuple[pd.
         suffixes=("", "_pl")
     )
 
-    # --- Fallback via EAN: fehlende Preise mit Preislistenwerten ergänzen ---
+    # --- Fallback via EAN ---
     mask_need = merged["Verkaufspreis"].isna() & merged["EAN_key"].astype(bool)
     if mask_need.any():
         tmp = merged.loc[mask_need, ["EAN_key"]].merge(
             price_df[["EAN_key", "Einkaufspreis", "Verkaufspreis", "Lagermenge", "Bezeichnung", "Kategorie", "ArtikelNr"]],
             on="EAN_key", how="left"
         )
-        # **WICHTIG**: Indizes angleichen, dann Series-weise füllen (kein ndarray!)
         idx = merged.index[mask_need]
-        tmp.index = idx  # jetzt gleiche Indexachse
+        tmp.index = idx  # Align
         for col in ["Einkaufspreis", "Verkaufspreis", "Lagermenge", "Bezeichnung", "Kategorie", "ArtikelNr"]:
             merged.loc[idx, col] = merged.loc[idx, col].fillna(tmp[col])
 
@@ -213,11 +212,13 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> tuple[pd.
                     if pd.isna(merged.at[i, col]) or col in ("ArtikelNr", "Bezeichnung", "Kategorie"):
                         merged.at[i, col] = row.get(col, merged.at[i, col])
 
-    # Numerisch setzen
+    # sauber numerisch
     for pcol in ["Einkaufspreis", "Verkaufspreis"]:
         merged[pcol] = pd.to_numeric(merged[pcol], errors="coerce")
+
+    # **Fix**: Keine Series.replace mit Series als Ersatz – nur leere NAs auffüllen
     merged["Kategorie"] = merged["Kategorie"].fillna("")
-    merged["Bezeichnung"] = merged["Bezeichnung"].replace("", sell_df["Bezeichnung"]).fillna("")
+    merged["Bezeichnung"] = merged["Bezeichnung"].fillna("")
 
     # Werte berechnen
     merged["Einkaufswert"] = (merged["Einkaufsmenge"].astype("Int64").fillna(0) * merged["Einkaufspreis"].fillna(0)).astype(float)
