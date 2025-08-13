@@ -182,6 +182,11 @@ NAME_CANDIDATES_PL = ["Bezeichnung", "Produktname", "Name", "Titel", "Artikelnam
 CAT_CANDIDATES = ["Kategorie", "Warengruppe", "Zusatz"]
 STOCK_CANDIDATES = ["Bestand", "Verfügbar", "Lagerbestand"]
 
+# Neu: mögliche Spalten, in denen eine Farbangabe enthalten sein könnte. Diese
+# Liste wird verwendet, um Produkte mit identischer Bezeichnung, aber
+# unterschiedlicher Farbvariante zu differenzieren.
+COLOR_CANDIDATES = ["Farbe", "Color", "Colour", "Farben", "Zusatz"]
+
 def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     """
     Bereitet die Preisliste für den Abgleich vor. Es werden relevante
@@ -190,14 +195,15 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     Schlüssel zur Identifikation verwendet.
     """
     df = normalize_cols(df)
-    col_art  = find_column(df, ARTNR_CANDIDATES, "Artikelnummer")
-    col_ean  = find_column(df, EAN_CANDIDATES, "EAN/GTIN", required=False)
-    col_name = find_column(df, NAME_CANDIDATES_PL, "Bezeichnung")
-    col_cat  = find_column(df, CAT_CANDIDATES, "Kategorie", required=False)
-    col_stock= find_column(df, STOCK_CANDIDATES, "Bestand/Lager", required=False)
-    col_buy  = find_column(df, BUY_PRICE_CANDIDATES,  "Einkaufspreis", required=False)
-    col_sell = find_column(df, SELL_PRICE_CANDIDATES, "Verkaufspreis", required=False)
-    col_any  = None
+    col_art   = find_column(df, ARTNR_CANDIDATES, "Artikelnummer")
+    col_ean   = find_column(df, EAN_CANDIDATES, "EAN/GTIN", required=False)
+    col_name  = find_column(df, NAME_CANDIDATES_PL, "Bezeichnung")
+    col_cat   = find_column(df, CAT_CANDIDATES, "Kategorie", required=False)
+    col_stock = find_column(df, STOCK_CANDIDATES, "Bestand/Lager", required=False)
+    col_buy   = find_column(df, BUY_PRICE_CANDIDATES,  "Einkaufspreis", required=False)
+    col_sell  = find_column(df, SELL_PRICE_CANDIDATES, "Verkaufspreis", required=False)
+    col_color = find_column(df, COLOR_CANDIDATES, "Farbe", required=False)
+    col_any   = None
     if not col_sell and not col_buy:
         col_any = find_column(df, PRICE_COL_CANDIDATES, "Preis", required=True)
 
@@ -208,7 +214,15 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     out["EAN_key"] = out["EAN"].map(lambda x: re.sub(r"[^0-9]+", "", str(x)))
     out["Bezeichnung"] = df[col_name].astype(str)
     out["Bezeichnung_key"] = out["Bezeichnung"].map(normalize_key)
-    out["Kategorie"] = df[col_cat].astype(str) if col_cat else ""
+    # Kategorie: NaN durch leere Zeichenkette ersetzen
+    out["Kategorie"] = df[col_cat].fillna("").astype(str) if col_cat else ""
+    # Farbe: Farbinformation extrahieren, falls vorhanden
+    if col_color:
+        out["Farbe"] = df[col_color].fillna("").astype(str)
+        # Leerzeichen und 'nan' entfernen
+        out["Farbe"] = out["Farbe"].replace(["nan", "None"], "")
+    else:
+        out["Farbe"] = ""
     # Lagerbestand: wenn vorhanden, numerisch interpretieren, sonst null
     if col_stock:
         out["Lagermenge"] = parse_number_series(df[col_stock]).fillna(0).astype("Int64")
@@ -227,6 +241,15 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
         out["Einkaufspreis"] = out.get("Verkaufspreis", pd.Series([np.nan]*len(out)))
     if "Verkaufspreis" not in out:
         out["Verkaufspreis"] = out.get("Einkaufspreis", pd.Series([np.nan]*len(out)))
+    # Ableitung des angezeigten Produktnamens: Basis + Farbzusatz (falls vorhanden)
+    def build_display(row):
+        base = row["Bezeichnung"].strip()
+        color = str(row["Farbe"]).strip()
+        if color:
+            return f"{base} ({color})"
+        # Wenn keine Farbe vorhanden ist, gib den Basisnamen zurück
+        return base
+    out["DisplayName"] = out.apply(build_display, axis=1)
     return out
 
 # =========================
@@ -293,12 +316,15 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> tuple[pd.
     mask_need = merged["Verkaufspreis"].isna() & merged["EAN_key"].astype(bool)
     if mask_need.any():
         tmp = merged.loc[mask_need, ["EAN_key"]].merge(
-            price_df[["EAN_key", "Einkaufspreis", "Verkaufspreis", "Lagermenge", "Bezeichnung", "Kategorie", "ArtikelNr"]],
+            price_df[[
+                "EAN_key", "Einkaufspreis", "Verkaufspreis", "Lagermenge", "Bezeichnung", "Kategorie",
+                "ArtikelNr", "Farbe", "DisplayName"
+            ]],
             on="EAN_key", how="left"
         )
         idx = merged.index[mask_need]
         tmp.index = idx  # Align
-        for col in ["Einkaufspreis", "Verkaufspreis", "Lagermenge", "Bezeichnung", "Kategorie", "ArtikelNr"]:
+        for col in ["Einkaufspreis", "Verkaufspreis", "Lagermenge", "Bezeichnung", "Kategorie", "ArtikelNr", "Farbe", "DisplayName"]:
             merged.loc[idx, col] = merged.loc[idx, col].fillna(tmp[col])
     # --- Fallback via normalisierte Bezeichnung ---
     mask_need = merged["Verkaufspreis"].isna()
@@ -309,8 +335,8 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> tuple[pd.
         for i, k in zip(idx, keys):
             if k in name_map.index:
                 row = name_map.loc[k]
-                for col in ["Einkaufspreis", "Verkaufspreis", "Lagermenge", "Bezeichnung", "Kategorie", "ArtikelNr"]:
-                    if pd.isna(merged.at[i, col]) or col in ("ArtikelNr", "Bezeichnung", "Kategorie"):
+                for col in ["Einkaufspreis", "Verkaufspreis", "Lagermenge", "Bezeichnung", "Kategorie", "ArtikelNr", "Farbe", "DisplayName"]:
+                    if pd.isna(merged.at[i, col]) or col in ("ArtikelNr", "Bezeichnung", "Kategorie", "Farbe", "DisplayName"):
                         merged.at[i, col] = row.get(col, merged.at[i, col])
     # sauber numerisch
     for pcol in ["Einkaufspreis", "Verkaufspreis"]:
@@ -323,15 +349,16 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> tuple[pd.
     merged["Verkaufswert"] = (merged["Verkaufsmenge"].astype("Int64").fillna(0) * merged["Verkaufspreis"].fillna(0)).astype(float)
     merged["Lagerwert"]    = (merged["Lagermenge"].astype("Int64").fillna(0)    * merged["Verkaufspreis"].fillna(0)).astype(float)
     display_cols = [
-        "ArtikelNr", "Bezeichnung", "Kategorie",
+        "ArtikelNr", "DisplayName", "Kategorie",
         "Einkaufsmenge", "Einkaufswert",
         "Verkaufsmenge", "Verkaufswert",
         "Lagermenge", "Lagerwert",
     ]
     display_cols = [c for c in display_cols if c in merged.columns]
     detail = merged[display_cols].copy()
+    # Aggregation: gruppiere nach Artikelnummer, DisplayName und Kategorie
     totals = (
-        detail.groupby(["ArtikelNr", "Bezeichnung", "Kategorie"], dropna=False, as_index=False)
+        detail.groupby(["ArtikelNr", "DisplayName", "Kategorie"], dropna=False, as_index=False)
               .agg({
                     "Einkaufsmenge": "sum",
                     "Einkaufswert": "sum",
@@ -375,50 +402,40 @@ if sell_file and price_file:
         with st.spinner("📖 Lese & prüfe Spalten…"):
             sell_df  = prepare_sell_df(raw_sell)
             price_df = prepare_price_df(raw_price)
-        # Datumsfilter nur anbieten, wenn eine Datumsspalte existiert
+        # Periodenfilter: Auswahl nach Kalenderwoche (KW/Jahr) via Dropdown
         if "Datum" in sell_df.columns and not sell_df["Datum"].isna().all():
-            min_date = sell_df["Datum"].min().date()
-            max_date = sell_df["Datum"].max().date()
-            st.subheader("Zeitraum filtern")
-            start_date, end_date = st.date_input(
-                "Zeitraum auswählen",
-                value=(min_date, max_date),
-                min_value=min_date,
-                max_value=max_date,
-                help="Wähle Start- und Enddatum des auszuwertenden Zeitraums."
+            iso = sell_df["Datum"].dt.isocalendar()
+            sell_df["KW"] = iso["week"]
+            sell_df["KW_Year"] = iso["year"]
+            sell_df["Period"] = sell_df["KW"].astype(str) + "/" + sell_df["KW_Year"].astype(str)
+            periods = sorted(sell_df["Period"].dropna().unique().tolist())
+            options = ["Alle"] + periods
+            st.subheader("Periode wählen")
+            selected_period = st.selectbox(
+                "Wähle eine Kalenderwoche (KW/Jahr) oder 'Alle'",
+                options=options,
+                index=0,
+                help="Zeigt die verfügbaren Kalenderwochen basierend auf den Datumswerten des Sell-out Reports."
             )
-            # Falls Benutzer nur ein Datum auswählt (z.B. bei einfachen Klick), konvertiere zu Tuple
-            if isinstance(start_date, tuple):
-                # Streamlit gibt bei date_input ein Tupel mit zwei Datumswerten zurück
-                start_date, end_date = start_date[0], start_date[1]
-            # Filter anwenden
-            mask_period = (sell_df["Datum"].dt.date >= start_date) & (sell_df["Datum"].dt.date <= end_date)
-            filtered_sell_df = sell_df.loc[mask_period].copy()
+            if selected_period == "Alle":
+                filtered_sell_df = sell_df.copy()
+            else:
+                filtered_sell_df = sell_df[sell_df["Period"] == selected_period].copy()
         else:
             filtered_sell_df = sell_df
         with st.spinner("🔗 Matche & berechne Werte…"):
             detail, totals = enrich_and_merge(filtered_sell_df, price_df)
-        st.subheader("Detailtabelle")
-        d_rounded, d_styler = style_numeric(detail)
-        st.dataframe(d_styler, use_container_width=True)
+        # Anzeige nur der Summen pro Artikel (aggregiert)
         st.subheader("Summen pro Artikel")
         t_rounded, t_styler = style_numeric(totals)
         st.dataframe(t_styler, use_container_width=True)
-        c1, c2 = st.columns(2)
-        with c1:
-            st.download_button(
-                "⬇️ Detail (CSV)",
-                data=d_rounded.to_csv(index=False).encode("utf-8"),
-                file_name="detail.csv",
-                mime="text/csv",
-            )
-        with c2:
-            st.download_button(
-                "⬇️ Summen (CSV)",
-                data=t_rounded.to_csv(index=False).encode("utf-8"),
-                file_name="summen.csv",
-                mime="text/csv",
-            )
+        # Downloadoption für Summen
+        st.download_button(
+            "⬇️ Summen (CSV)",
+            data=t_rounded.to_csv(index=False).encode("utf-8"),
+            file_name="summen.csv",
+            mime="text/csv",
+        )
     except KeyError as e:
         st.error(str(e))
     except Exception as e:
