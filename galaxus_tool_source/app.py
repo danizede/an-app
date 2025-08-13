@@ -1,4 +1,4 @@
-# app.py — Galaxus Sell‑out Aggregator (Summenansicht, robustes Matching, Datenpersistenz)
+# app.py — Galaxus Sell‑out Aggregator (mit Persistenz, robustem Matching, Farbanzeige, KW-Filter)
 
 import os
 import re
@@ -23,11 +23,7 @@ st.set_page_config(page_title="Galaxus Sell‑out Aggregator", layout="wide")
 # Anzeige-Helfer
 # =========================
 THOUSANDS_SEP = "'"
-NUM_COLS_DEFAULT = [
-    "Einkaufsmenge", "Einkaufswert",
-    "Verkaufsmenge", "Verkaufswert",
-    "Lagermenge",   "Lagerwert",
-]
+NUM_COLS_DEFAULT = ["Einkaufsmenge","Einkaufswert","Verkaufsmenge","Verkaufswert","Lagermenge","Lagerwert"]
 
 def _fmt_thousands(x, sep=THOUSANDS_SEP):
     if pd.isna(x):
@@ -68,7 +64,6 @@ def strip_parens(txt: str) -> str:
     return re.sub(r"\([^)]*\)", "", txt or "")
 
 def first2_words_key(name: str) -> str:
-    """Erste zwei Wörter ohne Klammern, normalisiert (a-z0-9)."""
     base = strip_parens(str(name))
     tokens = re.findall(r"[A-Za-z0-9]+", unicodedata.normalize("NFKD", base))
     return "".join(tokens[:2]).lower()
@@ -115,24 +110,16 @@ def parse_date_series(s: pd.Series) -> pd.Series:
 # =========================
 # Parsing – Preislisten
 # =========================
-PRICE_COL_CANDIDATES = [
-    "Preis", "VK", "Netto", "NETTO", "Einkaufspreis", "Verkaufspreis", "NETTO NETTO", "Einkauf"
-]
-BUY_PRICE_CANDIDATES = ["Einkaufspreis", "Einkauf"]
-SELL_PRICE_CANDIDATES = ["Verkaufspreis", "VK", "Preis"]
+PRICE_COL_CANDIDATES = ["Preis","VK","Netto","NETTO","Einkaufspreis","Verkaufspreis","NETTO NETTO","Einkauf"]
+BUY_PRICE_CANDIDATES = ["Einkaufspreis","Einkauf"]
+SELL_PRICE_CANDIDATES = ["Verkaufspreis","VK","Preis"]
 
-ARTNR_CANDIDATES = [
-    "Artikelnummer", "Artikelnr", "ArtikelNr", "Artikel-Nr.",
-    "Hersteller-Nr.", "Produkt ID", "ProdNr", "ArtNr", "ArtikelNr.", "Artikel"
-]
-EAN_CANDIDATES = ["EAN", "GTIN", "BarCode", "Barcode"]
-NAME_CANDIDATES_PL = ["Bezeichnung", "Produktname", "Name", "Titel", "Artikelname"]
-CAT_CANDIDATES = ["Kategorie", "Warengruppe", "Zusatz"]
-STOCK_CANDIDATES = ["Bestand", "Verfügbar", "Lagerbestand"]
-COLOR_CANDIDATES = [
-    "Farbe", "Color", "Colour", "Farben", "Farbvariante",
-    "Variante", "Colorway", "Farbton", "Farbe / Color", "Zusatz"
-]
+ARTNR_CANDIDATES = ["Artikelnummer","Artikelnr","ArtikelNr","Artikel-Nr.","Hersteller-Nr.","Produkt ID","ProdNr","ArtNr","ArtikelNr.","Artikel"]
+EAN_CANDIDATES = ["EAN","GTIN","BarCode","Barcode"]
+NAME_CANDIDATES_PL = ["Bezeichnung","Produktname","Name","Titel","Artikelname"]
+CAT_CANDIDATES = ["Kategorie","Warengruppe","Zusatz"]
+STOCK_CANDIDATES = ["Bestand","Verfügbar","Lagerbestand"]
+COLOR_CANDIDATES = ["Farbe","Color","Colour","Farben","Farbvariante","Variante","Colorway","Farbton","Farbe / Color","Zusatz"]
 
 def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     df = normalize_cols(df)
@@ -148,7 +135,6 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     if not col_sell and not col_buy:
         col_any = find_column(df, PRICE_COL_CANDIDATES, "Preis", required=True)
 
-    # Neue DataFrame mit identischem Index (wichtig für Längen-Konsistenz)
     out = pd.DataFrame(index=df.index)
 
     out["ArtikelNr"]        = df[col_art].astype(str)
@@ -189,14 +175,14 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
 # =========================
 # Parsing – Sell-out-Report
 # =========================
-NAME_CANDIDATES_SO = ["Bezeichnung", "Name", "Artikelname", "Bezeichnung_Sales", "Produktname"]
-SALES_QTY_CANDIDATES = ["SalesQty", "Verkauf", "Verkaufte Menge", "Menge verkauft", "Absatz", "Stück", "Menge"]
-BUY_QTY_CANDIDATES   = ["Einkauf", "Einkaufsmenge", "Menge Einkauf"]
+NAME_CANDIDATES_SO = ["Bezeichnung","Name","Artikelname","Bezeichnung_Sales","Produktname"]
+SALES_QTY_CANDIDATES = ["SalesQty","Verkauf","Verkaufte Menge","Menge verkauft","Absatz","Stück","Menge"]
+BUY_QTY_CANDIDATES   = ["Einkauf","Einkaufsmenge","Menge Einkauf"]
 
-DATE_CANDIDATES   = ["Datum", "Date", "Verkaufsdatum", "Bestelldatum", "Belegdatum"]
-START_DATE_CANDS  = ["Von", "Start", "Startdatum", "Period Start", "Zeitraum Start", "Beginn"]
-KW_CANDIDATES     = ["KW", "Kalenderwoche", "Week"]
-YEAR_CANDIDATES   = ["Jahr", "Year"]
+DATE_CANDIDATES   = ["Datum","Date","Verkaufsdatum","Bestelldatum","Belegdatum"]
+START_DATE_CANDS  = ["Von","Start","Startdatum","Period Start","Zeitraum Start","Beginn"]
+KW_CANDIDATES     = ["KW","Kalenderwoche","Week"]
+YEAR_CANDIDATES   = ["Jahr","Year"]
 
 def _first_existing(df: pd.DataFrame, cands: List[str]) -> Optional[str]:
     for c in cands:
@@ -225,7 +211,6 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
     col_kw    = _first_existing(df, KW_CANDIDATES)
     col_year  = _first_existing(df, YEAR_CANDIDATES)
 
-    # Neue DataFrame mit identischem Index
     out = pd.DataFrame(index=df.index)
 
     out["ArtikelNr"]        = df[col_art].astype(str) if col_art else ""
@@ -244,7 +229,6 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
     elif col_start:
         out["Datum"] = parse_date_series(df[col_start])
     elif col_kw and col_year:
-        # Sichere vektorisierte KW/Jahr -> Montag Datum
         kw_raw = pd.to_numeric(df[col_kw], errors="coerce")
         yr_raw = pd.to_numeric(df[col_year], errors="coerce")
         kw_series = kw_raw.fillna(-1).astype(int)
@@ -393,31 +377,35 @@ if raw_sell is not None and raw_price is not None:
             sell_df  = prepare_sell_df(raw_sell)
             price_df = prepare_price_df(raw_price)
 
-        # KW-Filter mit „Gesamten Zeitraum“
+        # KW/Jahr-Filter mit „Gesamten Zeitraum“
         filtered_sell_df = sell_df.copy()
         period_enabled = False
         if "Datum" in sell_df.columns and not sell_df["Datum"].isna().all():
-            iso = sell_df["Datum"].dt.isocalendar()
-            sell_df["KW"] = iso["week"]
-            sell_df["KW_Year"] = iso["year"]
-            sell_df["Period"] = sell_df["KW"].astype(str) + "/" + sell_df["KW_Year"].astype(str)
-            periods = sorted(sell_df["Period"].dropna().unique().tolist())
-            if periods:
-                period_enabled = True
-                st.subheader("Periode wählen")
-                key_period = "period_select"
-                sel = st.selectbox(
-                    "Kalenderwoche (KW/Jahr) oder 'Alle'",
-                    options=["Alle"] + periods,
-                    index=0,
-                    key=key_period
-                )
-                def set_all():
-                    st.session_state[key_period] = "Alle"
-                st.button("Gesamten Zeitraum", on_click=set_all)
-                sel = st.session_state.get(key_period, sel)
-                if sel != "Alle":
-                    filtered_sell_df = sell_df[sell_df["Period"] == sel].copy()
+            try:
+                # Sichere Berechnung von KW/Jahr (pro Zeile)
+                sell_df["KW"] = sell_df["Datum"].apply(lambda d: d.isocalendar()[1] if pd.notna(d) else pd.NA)
+                sell_df["KW_Year"] = sell_df["Datum"].apply(lambda d: d.isocalendar()[0] if pd.notna(d) else pd.NA)
+                sell_df["Period"] = sell_df["KW"].astype("Int64").astype(str) + "/" + sell_df["KW_Year"].astype("Int64").astype(str)
+                periods = sorted(sell_df["Period"].dropna().unique().tolist())
+                if periods:
+                    period_enabled = True
+                    st.subheader("Periode wählen")
+                    key_period = "period_select"
+                    sel = st.selectbox(
+                        "Kalenderwoche (KW/Jahr) oder 'Alle'",
+                        options=["Alle"] + periods,
+                        index=0,
+                        key=key_period
+                    )
+                    def set_all():
+                        st.session_state[key_period] = "Alle"
+                    st.button("Gesamten Zeitraum", on_click=set_all)
+                    sel = st.session_state.get(key_period, sel)
+                    if sel != "Alle":
+                        filtered_sell_df = sell_df[sell_df["Period"] == sel].copy()
+            except Exception:
+                st.warning("Periode konnte nicht berechnet werden – Filter deaktiviert.")
+                period_enabled = False
         if not period_enabled:
             st.info("Hinweis: Keine Datum-/KW-Informationen erkannt – Filter ausgeblendet.")
 
@@ -425,7 +413,7 @@ if raw_sell is not None and raw_price is not None:
         with st.spinner("🔗 Matche & berechne Werte…"):
             detail, totals, unmatched = enrich_and_merge(filtered_sell_df, price_df)
 
-        # Anzeige Summen
+        # Summenanzeige
         st.subheader("Summen pro Artikel")
         t_rounded, t_styler = style_numeric(totals)
         st.dataframe(t_styler, use_container_width=True)
