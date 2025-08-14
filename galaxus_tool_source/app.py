@@ -1,4 +1,6 @@
-# app.py — Galaxus Sell‑out Aggregator (robustes Excel‑Einlesen, US→EU Datumslogik, Zeitraumfilter)
+# app.py — Galaxus Sell‑out Aggregator
+# Robust: Excel-Header-Handling, US→EU Datum (Start=Spalte I, Ende=Spalte J),
+# Zeitraumfilter, Zahlformat, Detailtabelle ausblendbar, Varianten mit Farbe anzeigen.
 
 import re
 import unicodedata
@@ -28,7 +30,6 @@ def _fmt_thousands(x, sep=THOUSANDS_SEP):
 
 def style_numeric(df: pd.DataFrame, num_cols=NUM_COLS_DEFAULT, sep=THOUSANDS_SEP):
     out = df.copy()
-    # Bugfix: kein freies 'c' im Generator
     for c in (col for col in num_cols if col in out.columns):
         out[c] = pd.to_numeric(out[c], errors="coerce").round(0).astype("Int64")
     fmt = {c: (lambda v, s=sep: _fmt_thousands(v, s)) for c in num_cols if c in out.columns}
@@ -39,12 +40,6 @@ def style_numeric(df: pd.DataFrame, num_cols=NUM_COLS_DEFAULT, sep=THOUSANDS_SEP
 # Robust: Excel einlesen & Spalten fixieren
 # =========================
 def read_excel_flat(upload) -> pd.DataFrame:
-    """
-    Liest eine Excel-Tabelle robust ein – auch bei mehrzeiligen/zusammengeführten Headern.
-    - header=None: keine Annahmen über Kopfzeilen
-    - wählt als Header die Zeile mit dem höchsten Anteil nicht-leerer Zellen
-    - garantiert, dass die Spaltenliste exakt df.shape[1] Elemente hat (kein Length mismatch)
-    """
     raw = pd.read_excel(upload, header=None, dtype=object)
     if raw.empty:
         return pd.DataFrame()
@@ -135,12 +130,26 @@ def parse_date_series_us(s: pd.Series) -> pd.Series:
     """US-Format (MM/DD/YYYY) sicher parsen + Excel-Seriennummern."""
     if np.issubdtype(s.dtype, np.datetime64):
         return s
-    # 1) US-Strings
     dt1 = pd.to_datetime(s, errors="coerce", dayfirst=False, infer_datetime_format=True)
-    # 2) Excel-Seriennummern
     nums = pd.to_numeric(s, errors="coerce")
     dt2 = pd.to_datetime(nums, origin="1899-12-30", unit="d", errors="coerce")
     return dt1.combine_first(dt2)
+
+# ——— Farbe extrahieren (Fallback) ———
+_COLOR_REGEXES = [
+    r"\(([^)]+)\)$",                # ... (Weiss)
+    r"[-–—]\s*([A-Za-zäöüÄÖÜß]+)$", # ... – White
+    r"/\s*([A-Za-zäöüÄÖÜß]+)$",     # ... / Black
+]
+
+def extract_color_from_name(name: str) -> str:
+    if not isinstance(name, str):
+        return ""
+    for rgx in _COLOR_REGEXES:
+        m = re.search(rgx, name.strip())
+        if m:
+            return m.group(1).strip()
+    return ""
 
 # =========================
 # Parsing – Preislisten
@@ -157,17 +166,19 @@ EAN_CANDIDATES  = ["EAN", "GTIN", "BarCode", "Barcode"]
 NAME_CANDIDATES_PL = ["Bezeichnung", "Produktname", "Name", "Titel", "Artikelname"]
 CAT_CANDIDATES  = ["Kategorie", "Warengruppe", "Zusatz"]
 STOCK_CANDIDATES= ["Bestand", "Verfügbar", "Lagerbestand"]
+COLOR_CANDIDATES= ["Farbe", "Color", "Colour", "Variante", "Variant", "Farbvariante", "Farbname"]
 
 def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     df = normalize_cols(df)
-    col_art  = find_column(df, ARTNR_CANDIDATES, "Artikelnummer")
-    col_ean  = find_column(df, EAN_CANDIDATES, "EAN/GTIN", required=False)
-    col_name = find_column(df, NAME_CANDIDATES_PL, "Bezeichnung")
-    col_cat  = find_column(df, CAT_CANDIDATES, "Kategorie", required=False)
-    col_stock= find_column(df, STOCK_CANDIDATES, "Bestand/Lager", required=False)
-    col_buy  = find_column(df, BUY_PRICE_CANDIDATES,  "Einkaufspreis", required=False)
-    col_sell = find_column(df, SELL_PRICE_CANDIDATES, "Verkaufspreis", required=False)
-    col_any  = None
+    col_art   = find_column(df, ARTNR_CANDIDATES, "Artikelnummer")
+    col_ean   = find_column(df, EAN_CANDIDATES,   "EAN/GTIN", required=False)
+    col_name  = find_column(df, NAME_CANDIDATES_PL, "Bezeichnung")
+    col_cat   = find_column(df, CAT_CANDIDATES,   "Kategorie", required=False)
+    col_stock = find_column(df, STOCK_CANDIDATES, "Bestand/Lager", required=False)
+    col_buy   = find_column(df, BUY_PRICE_CANDIDATES,  "Einkaufspreis", required=False)
+    col_sell  = find_column(df, SELL_PRICE_CANDIDATES, "Verkaufspreis", required=False)
+    col_color = find_column(df, COLOR_CANDIDATES, "Farbe/Variante", required=False)
+    col_any   = None
     if not col_sell and not col_buy:
         col_any = find_column(df, PRICE_COL_CANDIDATES, "Preis", required=True)
 
@@ -179,6 +190,8 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     out["Bezeichnung"]     = df[col_name].astype(str)
     out["Bezeichnung_key"] = out["Bezeichnung"].map(normalize_key)
     out["Kategorie"]       = df[col_cat].astype(str) if col_cat else ""
+    out["Farbe"]           = df[col_color].astype(str) if col_color else out["Bezeichnung"].map(extract_color_from_name)
+
     if col_stock:
         out["Lagermenge"] = parse_number_series(df[col_stock]).fillna(0).astype("Int64")
     else:
@@ -196,6 +209,15 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
         out["Einkaufspreis"] = out.get("Verkaufspreis", pd.Series([np.nan]*len(out)))
     if "Verkaufspreis" not in out:
         out["Verkaufspreis"] = out.get("Einkaufspreis", pd.Series([np.nan]*len(out)))
+
+    # Anzeige-Name mit Farbe (falls verfügbar)
+    def _name_with_color(row):
+        col = str(row.get("Farbe", "") or "").strip()
+        if col:
+            return f"{row['Bezeichnung']} – {col}"
+        return row["Bezeichnung"]
+    out["Bezeichnung_anzeige"] = out.apply(_name_with_color, axis=1)
+
     return out
 
 # =========================
@@ -249,7 +271,6 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
     if col_end:
         out["EndDatum"]   = parse_date_series_us(df[col_end])
 
-    # falls EndDatum fehlt, mit StartDatum auffüllen
     if "StartDatum" in out and "EndDatum" in out:
         mask = out["EndDatum"].isna()
         out.loc[mask, "EndDatum"] = out.loc[mask, "StartDatum"]
@@ -272,12 +293,12 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> tuple[pd.
     mask_need = merged["Verkaufspreis"].isna() & merged["EAN_key"].astype(bool)
     if mask_need.any():
         tmp = merged.loc[mask_need, ["EAN_key"]].merge(
-            price_df[["EAN_key", "Einkaufspreis", "Verkaufspreis", "Lagermenge", "Bezeichnung", "Kategorie", "ArtikelNr"]],
+            price_df[["EAN_key", "Einkaufspreis", "Verkaufspreis", "Lagermenge", "Bezeichnung", "Bezeichnung_anzeige", "Farbe", "Kategorie", "ArtikelNr"]],
             on="EAN_key", how="left"
         )
         idx = merged.index[mask_need]
         tmp.index = idx
-        for col in ["Einkaufspreis", "Verkaufspreis", "Lagermenge", "Bezeichnung", "Kategorie", "ArtikelNr"]:
+        for col in ["Einkaufspreis", "Verkaufspreis", "Lagermenge", "Bezeichnung", "Bezeichnung_anzeige", "Farbe", "Kategorie", "ArtikelNr"]:
             merged.loc[idx, col] = merged.loc[idx, col].fillna(tmp[col])
 
     # Fallback via normalisierte Bezeichnung
@@ -289,8 +310,8 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> tuple[pd.
         for i, k in zip(idx, keys):
             if k in name_map.index:
                 row = name_map.loc[k]
-                for col in ["Einkaufspreis", "Verkaufspreis", "Lagermenge", "Bezeichnung", "Kategorie", "ArtikelNr"]:
-                    if pd.isna(merged.at[i, col]) or col in ("ArtikelNr", "Bezeichnung", "Kategorie"):
+                for col in ["Einkaufspreis", "Verkaufspreis", "Lagermenge", "Bezeichnung", "Bezeichnung_anzeige", "Farbe", "Kategorie", "ArtikelNr"]:
+                    if pd.isna(merged.at[i, col]) or col in ("ArtikelNr", "Bezeichnung", "Bezeichnung_anzeige", "Kategorie", "Farbe"):
                         merged.at[i, col] = row.get(col, merged.at[i, col])
 
     for pcol in ["Einkaufspreis", "Verkaufspreis"]:
@@ -298,23 +319,37 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> tuple[pd.
 
     merged["Kategorie"]   = merged["Kategorie"].fillna("")
     merged["Bezeichnung"] = merged["Bezeichnung"].fillna("")
+    merged["Bezeichnung_anzeige"] = merged.get("Bezeichnung_anzeige", merged["Bezeichnung"])
+    merged["Farbe"] = merged.get("Farbe", "")
 
+    # Wenn mehrere Zeilen die gleiche Bezeichnung haben, aber unterschiedliche ArtikelNr/EAN:
+    dup_mask = merged.duplicated(subset=["Bezeichnung"], keep=False)
+    merged.loc[dup_mask & (merged["Farbe"].astype(str).str.strip() != ""), "Bezeichnung_anzeige"] = (
+        merged.loc[dup_mask, "Bezeichnung"] + " – " + merged.loc[dup_mask, "Farbe"].astype(str)
+    )
+    # Wenn keine Farbe verfügbar, hänge ArtikelNr zur Unterscheidung an
+    merged.loc[dup_mask & (merged["Farbe"].astype(str).str.strip() == ""), "Bezeichnung_anzeige"] = (
+        merged.loc[dup_mask, "Bezeichnung"] + " – " + merged.loc[dup_mask, "ArtikelNr"].astype(str)
+    )
+
+    # Werte berechnen
     merged["Einkaufswert"] = (merged["Einkaufsmenge"].astype("Int64").fillna(0) * merged["Einkaufspreis"].fillna(0)).astype(float)
     merged["Verkaufswert"] = (merged["Verkaufsmenge"].astype("Int64").fillna(0) * merged["Verkaufspreis"].fillna(0)).astype(float)
     merged["Lagerwert"]    = (merged["Lagermenge"].astype("Int64").fillna(0)    * merged["Verkaufspreis"].fillna(0)).astype(float)
 
+    # Anzeige-Spalten (mit Bezeichnung_anzeige)
     display_cols = [
-        "ArtikelNr", "Bezeichnung", "Kategorie",
+        "ArtikelNr", "Bezeichnung_anzeige", "Kategorie",
         "Einkaufsmenge", "Einkaufswert",
         "Verkaufsmenge", "Verkaufswert",
         "Lagermenge", "Lagerwert"
     ]
     display_cols = [c for c in display_cols if c in merged.columns]
-
     detail = merged[display_cols].copy()
 
+    # Gruppierung: pro sichtbarem Produktnamen (mit Farbe) & Artikel
     totals = (
-        detail.groupby(["ArtikelNr", "Bezeichnung", "Kategorie"], dropna=False, as_index=False)
+        detail.groupby(["ArtikelNr", "Bezeichnung_anzeige", "Kategorie"], dropna=False, as_index=False)
               .agg({
                     "Einkaufsmenge": "sum",
                     "Einkaufswert": "sum",
@@ -330,7 +365,7 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> tuple[pd.
 # UI
 # =========================
 st.title("📦 Galaxus Sell‑out Aggregator")
-st.caption("Summenansicht, robustes Matching (ArtNr → EAN → 1./2. Wort), KW‑Filter (EU‑Datumsformat) und Datenspeicherung.")
+st.caption("Summenansicht, robustes Matching (ArtNr → EAN → 1./2. Wort), KW‑Filter (EU‑Datum), Datenspeicherung. Detailtabelle optional.")
 
 col1, col2 = st.columns(2)
 with col1:
@@ -349,38 +384,26 @@ if sell_file and price_file:
         st.session_state["sell_last"]  = {"name": sell_file.name}
         st.session_state["price_last"] = {"name": price_file.name}
 
-        # robustes Einlesen (fix für Length mismatch)
         raw_sell  = read_excel_flat(sell_file)
         raw_price = read_excel_flat(price_file)
-
-        # Optional für Debug:
-        # st.write("Sell-out Spalten:", list(raw_sell.columns))
-        # st.write("Preisliste Spalten:", list(raw_price.columns))
 
         with st.spinner("📖 Lese & prüfe Spalten…"):
             sell_df  = prepare_sell_df(raw_sell)
             price_df = prepare_price_df(raw_price)
 
-        # --- Zeitraumfilter (Start/Ende aus Spalte I/J, US→EU) ---
+        # — Zeitraumfilter —
         filtered_sell_df = sell_df
         if {"StartDatum", "EndDatum"}.issubset(sell_df.columns) and not sell_df["StartDatum"].isna().all():
             min_date = sell_df["StartDatum"].min().date()
             max_date = (sell_df["EndDatum"].dropna().max() if "EndDatum" in sell_df else sell_df["StartDatum"].max()).date()
 
             st.subheader("Periode wählen")
-            date_value = st.date_input(
-                "Zeitraum (DD.MM.YYYY)",
-                value=(min_date, max_date),
-                min_value=min_date,
-                max_value=max_date,
-            )
-            # Streamlit gibt tuple zurück
+            date_value = st.date_input("Zeitraum (DD.MM.YYYY)", value=(min_date, max_date), min_value=min_date, max_value=max_date)
             if isinstance(date_value, tuple):
                 start_date, end_date = date_value
             else:
                 start_date = end_date = date_value
 
-            # Überschneidung mit gewähltem Zeitraum
             mask = ~(
                 (sell_df["EndDatum"].dt.date < start_date) |
                 (sell_df["StartDatum"].dt.date > end_date)
@@ -390,11 +413,14 @@ if sell_file and price_file:
         with st.spinner("🔗 Matche & berechne Werte…"):
             detail, totals = enrich_and_merge(filtered_sell_df, price_df)
 
-        st.subheader("Detailtabelle")
-        d_rounded, d_styler = style_numeric(detail)
-        st.dataframe(d_styler, use_container_width=True)
+        # Detailtabelle optional
+        show_detail = st.checkbox("Detailtabelle anzeigen", value=False)
+        if show_detail:
+            st.subheader("Detailtabelle")
+            d_rounded, d_styler = style_numeric(detail)
+            st.dataframe(d_styler, use_container_width=True)
 
-        st.subheader("Summen pro Artikel")
+        st.subheader("Summen pro Artikel (mit Farbe)")
         t_rounded, t_styler = style_numeric(totals)
         st.dataframe(t_styler, use_container_width=True)
 
@@ -402,9 +428,10 @@ if sell_file and price_file:
         with c1:
             st.download_button(
                 "⬇️ Detail (CSV)",
-                data=d_rounded.to_csv(index=False).encode("utf-8"),
+                data=(detail if show_detail else pd.DataFrame()).to_csv(index=False).encode("utf-8"),
                 file_name="detail.csv",
                 mime="text/csv",
+                disabled=not show_detail
             )
         with c2:
             st.download_button(
