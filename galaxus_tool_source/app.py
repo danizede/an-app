@@ -20,12 +20,21 @@ def _fmt_thousands(x, sep=THOUSANDS_SEP):
     except: return str(x)
 
 def style_numeric(df: pd.DataFrame, num_cols=NUM_COLS_DEFAULT, sep=THOUSANDS_SEP):
+    """
+    Robuste Formatierung ohne Lambda/Comprehension-Capture.
+    Verhindert: cannot access local variable 'c' ...
+    """
     out = df.copy()
-    for c in [col for col in num_cols if c in out.columns]:
-        out[c] = pd.to_numeric(out[c], errors="coerce").round(0).astype("Int64")
-    def _fmt_func(v, s=sep): return _fmt_thousands(v, s)
-    fmt = {col: _fmt_func for col in num_cols if col in out.columns}
-    return out, out.style.format(fmt)
+    present = [col for col in num_cols if col in out.columns]
+    for col in present:
+        out[col] = pd.to_numeric(out[col], errors="coerce").round(0).astype("Int64")
+
+    def _fmt_func(v, _sep=sep):
+        return _fmt_thousands(v, _sep)
+
+    fmt_map = {col: _fmt_func for col in present}
+    styler = out.style.format(fmt_map)
+    return out, styler
 
 # =========================
 # Robust: Excel einlesen
@@ -41,7 +50,6 @@ def read_excel_flat(upload) -> pd.DataFrame:
     else: headers = headers[:n]
     df = raw.iloc[header_idx+1:].reset_index(drop=True)
     df.columns = headers
-    # doppelte Spalten sicher machen
     seen, newcols = {}, []
     for c in df.columns:
         if c in seen: seen[c]+=1; newcols.append(f"{c}.{seen[c]}")
@@ -237,9 +245,7 @@ DATE_END_CANDS       = ["Ende","Enddatum","End Date","Bis","Period End"]
 def _apply_hints_to_row(name_raw: str) -> dict:
     s = (name_raw or "").lower()
     h = {"hint_kurz":"","hint_color":"","hint_artnr_exact":"","hint_artnr_prefix":""}
-
-    if "tim" in s and "schwarz" in s:  # Tim schwarz → Weiss-Preis
-        h["hint_kurz"]="tim"; h["hint_color"]="weiss"
+    if "tim" in s and "schwarz" in s: h["hint_kurz"]="tim"; h["hint_color"]="weiss"
     for fam in ["finn","theo","robert","peter","julia","albert"]:
         if fam in s: h["hint_kurz"]=fam
     if "finn mobile" in s: h["hint_kurz"]="finn"
@@ -417,7 +423,6 @@ if sell_file and price_file:
             sell_df  = prepare_sell_df(raw_sell)
             price_df = prepare_price_df(raw_price)
 
-        # Zeitraumfilter per Start/Ende (I/J)
         filtered_sell_df = sell_df
         if {"StartDatum","EndDatum"}.issubset(sell_df.columns) and not sell_df["StartDatum"].isna().all():
             min_date = sell_df["StartDatum"].min().date()
