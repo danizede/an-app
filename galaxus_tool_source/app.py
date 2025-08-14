@@ -1,4 +1,7 @@
-# app.py — Galaxus Sellout Analyse (robustes Matching + EU‑Datumsfilter + Charts)
+# app.py — Galaxus Sellout Analyse
+# Robustes Matching (ArtNr → EAN → Name → Familie → Hints → Fuzzy),
+# EU-Datumsfilter + Button „Gesamten Zeitraum“, Detailtabelle optional,
+# + Kurzübersicht: Balken-Chart pro Kategorie (Schnellüberblick).
 
 import re
 import unicodedata
@@ -30,7 +33,7 @@ def style_numeric(df: pd.DataFrame, num_cols=NUM_COLS_DEFAULT, sep=THOUSANDS_SEP
     return out, styler
 
 # =========================
-# Robust: Excel einlesen
+# Robust: Excel einlesen (tolerant ggü. Kopfzeilen)
 # =========================
 def read_excel_flat(upload) -> pd.DataFrame:
     raw = pd.read_excel(upload, header=None, dtype=object)
@@ -105,7 +108,7 @@ def sanitize_numbers(qty: pd.Series, price: pd.Series) -> tuple[pd.Series,pd.Ser
     return q, p
 
 # =========================
-# Farben & Family-Key
+# Farben & Family-Key (für Varianten)
 # =========================
 _COLOR_MAP = {
     "weiss":"Weiss","weiß":"Weiss","white":"White","offwhite":"Off-White","cream":"Cream","ivory":"Ivory",
@@ -132,7 +135,7 @@ def _strip_parens_units(name: str) -> str:
 def make_family_key(name: str) -> str:
     if not isinstance(name,str): return ""
     s = _strip_parens_units(name.lower())
-    s = re.sub(r"\b[o0]-\d+\b"," ", s)                 # Artikelcode wie O-061 entfernen
+    s = re.sub(r"\b[o0]-\d+\b"," ", s)   # Codes wie O-061 entfernen
     s = re.sub(r"[^a-z0-9]+"," ", s)
     toks = [t for t in s.split() if t and (t not in _STOP_TOKENS) and (t not in _COLOR_WORDS)]
     return "".join(toks[:2]) if toks else ""
@@ -190,14 +193,13 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     out["Familie"]         = out["Bezeichnung"].map(make_family_key)
     out["Kategorie"]       = df[col_cat].astype(str) if col_cat else ""
 
-    # Farbe
+    # Farbe (falls vorhanden erkennen)
     if col_color:
         out["Farbe"] = df[col_color].astype(str).map(lambda v: _COLOR_MAP.get(str(v).lower(), str(v)))
     else:
         out["Farbe"] = out["Bezeichnung"].map(extract_color_from_name)
     out["Farbe"] = out["Farbe"].fillna("").astype(str)
 
-    # Lager & Preis
     out["Lagermenge"] = parse_number_series(df[col_stock]).fillna(0).astype("Int64") if col_stock else pd.Series([0]*len(out), dtype="Int64")
     if col_buy:  out["Einkaufspreis"] = parse_number_series(df[col_buy])
     if col_sell: out["Verkaufspreis"] = parse_number_series(df[col_sell])
@@ -220,28 +222,18 @@ BUY_QTY_CANDIDATES   = ["Einkauf","Einkaufsmenge","Menge Einkauf"]
 DATE_START_CANDS     = ["Start","Startdatum","Start Date","Anfangs datum","Anfangsdatum","Von","Period Start"]
 DATE_END_CANDS       = ["Ende","Enddatum","End Date","Bis","Period End"]
 
-# Exakte/Prefix-Äquivalenzen für Artikelnummern
-ART_EXACT_EQUIV = {
-    "e008":"e009",
-    "j031":"j030",
-    "m057":"m051",
-    "s054":"s054",
-}
-ART_PREFIX_EQUIV = {
-    "o061":"o061",  # Oskar little → O-061
-    "o013":"o013",  # Otto
-}
+# Äquivalenzen / Hints
+ART_EXACT_EQUIV = {"e008":"e009","j031":"j030","m057":"m051","s054":"s054"}
+ART_PREFIX_EQUIV = {"o061":"o061","o013":"o013"}
 
 def _apply_hints_to_row(name_raw: str) -> dict:
     s = (name_raw or "").lower()
     h = {"hint_family":"","hint_color":"","hint_art_exact":"","hint_art_prefix":""}
-
     for fam in ["finn mobile","charly little","duftöl","duftoel","duft oil"]:
         if fam in s:
             h["hint_family"] = "finn" if fam=="finn mobile" else ("charly" if "charly" in fam else "duftol")
     for fam in ["finn","theo","robert","peter","julia","albert","roger","mia","simon","otto","oskar","tim","charly"]:
         if fam in s: h["hint_family"] = h["hint_family"] or fam
-
     if "tim" in s and "schwarz" in s: h["hint_color"]="weiss"
     if "mia" in s and "gold" in s:    h["hint_color"]="schwarz"
     if "oskar" in s and "little" in s: h["hint_art_prefix"]="o061"
@@ -357,11 +349,11 @@ def _final_backstops(merged: pd.DataFrame, price_df: pd.DataFrame):
         if idx is not None:
             _assign_from_price_row(merged,i, price_df.loc[idx]); continue
 
+# =========================
+# Merge & Werte berechnen
+# =========================
 @st.cache_data(show_spinner=False)
 def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame):
-    """Gibt (detail, totals, ts_source) zurück.
-       ts_source enthält Datumsfelder zur Chart-Erzeugung.
-    """
     merged = sell_df.merge(price_df, on=["ArtikelNr_key"], how="left", suffixes=("", "_pl"))
 
     need = merged["Verkaufspreis"].isna() & merged["EAN_key"].astype(bool)
@@ -407,25 +399,18 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame):
         merged["Verkaufswert"] = (q_sell*p_sell).astype("float64")
         merged["Lagerwert"]    = (q_stock*p_sell).astype("float64")
 
-    # Für Tabellen
     display_cols = [c for c in ["ArtikelNr","Bezeichnung_anzeige","Kategorie","Einkaufsmenge","Einkaufswert","Verkaufsmenge","Verkaufswert","Lagermenge","Lagerwert"] if c in merged.columns]
     detail = merged[display_cols].copy()
     totals = (detail.groupby(["ArtikelNr","Bezeichnung_anzeige","Kategorie"], dropna=False, as_index=False)
                    .agg({"Einkaufsmenge":"sum","Einkaufswert":"sum","Verkaufsmenge":"sum","Verkaufswert":"sum","Lagermenge":"sum","Lagerwert":"sum"}))
 
-    # Quelle für Zeitreihen-Charts
-    ts_source = merged[[
-        c for c in ["StartDatum","EndDatum","Kategorie","Verkaufsmenge","Einkaufsmenge","Verkaufswert","Einkaufswert"]
-        if c in merged.columns
-    ]].copy()
-
-    return detail, totals, ts_source
+    return detail, totals
 
 # =========================
 # UI
 # =========================
 st.title("📊 Galaxus Sellout Analyse")
-st.caption("Summenansicht, robustes Matching (ArtNr → EAN → Name → Familie → Hints → Fuzzy), EU‑Datumsfilter. Detailtabelle optional. Grafiken pro Kategorie.")
+st.caption("Summenansicht, robustes Matching (ArtNr → EAN → Name → Familie → Hints → Fuzzy), EU‑Datumsfilter. Detailtabelle optional. Kurzübersicht pro Kategorie.")
 
 c1,c2 = st.columns(2)
 with c1:
@@ -490,54 +475,42 @@ if sell_file and price_file:
         # =========================================================================
 
         with st.spinner("🔗 Matche & berechne Werte…"):
-            detail, totals, ts_source = enrich_and_merge(filtered_sell_df, price_df)
+            detail, totals = enrich_and_merge(filtered_sell_df, price_df)
 
-        # =============== Grafiken – Verlauf pro Kategorie ===============
-        st.markdown("### Verlauf Verkäufe & Einkäufe")
-        if not ts_source.empty and "StartDatum" in ts_source:
-            # Zeitauflösung
-            agg_freq = st.selectbox("Aggregation", ["Woche","Monat"], index=0, help="Zeitauflösung der Kurve")
-            if agg_freq == "Woche":
-                ts_source["Periode"] = ts_source["StartDatum"].dt.to_period("W").dt.start_time
-            else:
-                ts_source["Periode"] = ts_source["StartDatum"].dt.to_period("M").dt.start_time
-
-            # Kategorien-Auswahl
-            cats = sorted([c for c in ts_source["Kategorie"].dropna().unique() if str(c).strip()!=""])
-            sel_cats = st.multiselect("Kategorien auswählen", cats, default=cats)
-
-            # Aggregation
-            ts = (ts_source.loc[ts_source["Kategorie"].isin(sel_cats)]
-                          .groupby(["Kategorie","Periode"], as_index=False)
-                          .agg({"Verkaufsmenge":"sum","Einkaufsmenge":"sum","Verkaufswert":"sum","Einkaufswert":"sum"}))
-
-            # Umschalten Menge/Wert
-            mode = st.radio("Anzeigen als", ["Mengen","Werte"], horizontal=True)
-
-            def _chart(df_cat: pd.DataFrame, title: str):
-                if mode == "Mengen":
-                    plot_df = df_cat.melt(id_vars=["Periode"], value_vars=["Verkaufsmenge","Einkaufsmenge"],
-                                          var_name="Typ", value_name="Wert")
-                else:
-                    plot_df = df_cat.melt(id_vars=["Periode"], value_vars=["Verkaufswert","Einkaufswert"],
-                                          var_name="Typ", value_name="Wert")
-                chart = (alt.Chart(plot_df)
-                           .mark_line(point=True)
-                           .encode(
-                               x=alt.X("Periode:T", title="Periode"),
-                               y=alt.Y("Wert:Q", title="{} pro Periode".format("Mengen" if mode=="Mengen" else "Werte")),
-                               color=alt.Color("Typ:N", title=""),
-                               tooltip=[alt.Tooltip("Periode:T","Periode"), alt.Tooltip("Typ:N",""), alt.Tooltip("Wert:Q","Wert")]
-                           ).properties(height=280, title=title))
-                st.altair_chart(chart, use_container_width=True)
-
-            # Ein Chart pro Kategorie (Small Multiples)
-            for k in sel_cats:
-                dfk = ts.loc[ts["Kategorie"]==k].sort_values("Periode")
-                if not dfk.empty:
-                    _chart(dfk[["Periode","Verkaufsmenge","Einkaufsmenge","Verkaufswert","Einkaufswert"]].copy(), f"{k}")
+        # =============== KURZÜBERSICHT: Balken-Chart pro Kategorie ===============
+        st.markdown("### 📊 Kurzübersicht: Verkäufe nach Kategorie")
+        # Aggregation nach Kategorie (für Schnellüberblick)
+        cat_sum = (detail.assign(Kategorie=detail["Kategorie"].replace({"": "— ohne Kategorie —"}))
+                          .groupby("Kategorie", as_index=False)
+                          .agg({"Verkaufswert":"sum","Einkaufswert":"sum","Verkaufsmenge":"sum","Einkaufsmenge":"sum"}))
+        if cat_sum.empty:
+            st.info("Keine Daten für die Kurzübersicht vorhanden.")
         else:
-            st.info("Für die Grafiken werden gültige Datumsangaben (Startdatum) benötigt.")
+            metric = st.radio("Metrik", ["Werte (Verkaufs-/Einkaufswert)","Mengen (Verkaufs-/Einkaufsmenge)"], horizontal=True)
+            top_n = st.slider("Top Kategorien", 3, int(min(20, max(3, len(cat_sum)))), min(10, len(cat_sum)))
+
+            if metric.startswith("Werte"):
+                sort_col = "Verkaufswert"
+                melted = cat_sum.sort_values(sort_col, ascending=False).head(top_n) \
+                                .melt(id_vars=["Kategorie"], value_vars=["Verkaufswert","Einkaufswert"],
+                                      var_name="Typ", value_name="Wert")
+            else:
+                sort_col = "Verkaufsmenge"
+                melted = cat_sum.sort_values(sort_col, ascending=False).head(top_n) \
+                                .melt(id_vars=["Kategorie"], value_vars=["Verkaufsmenge","Einkaufsmenge"],
+                                      var_name="Typ", value_name="Wert")
+
+            order = (melted[melted["Typ"].str.contains("Verkaufs")]
+                     .sort_values("Wert", ascending=False)["Kategorie"].tolist())
+            chart = (alt.Chart(melted)
+                       .mark_bar()
+                       .encode(
+                           y=alt.Y("Kategorie:N", sort=order, title="Kategorie"),
+                           x=alt.X("Wert:Q", title="Wert"),
+                           color=alt.Color("Typ:N", title=""),
+                           tooltip=["Kategorie","Typ","Wert"]
+                       ).properties(height=max(220, 24*len(order))))
+            st.altair_chart(chart, use_container_width=True)
 
         # =============== Tabellen ===============
         show_detail = st.checkbox("Detailtabelle anzeigen", value=False)
