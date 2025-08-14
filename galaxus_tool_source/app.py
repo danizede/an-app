@@ -13,6 +13,12 @@ import altair as alt
 
 st.set_page_config(page_title="Galaxus Sellout Analyse", layout="wide")
 
+# Altair: große Datensätze zulassen (optional robust)
+try:
+    alt.data_transformers.disable_max_rows()
+except Exception:
+    pass
+
 # =========================
 # Anzeige-Helfer
 # =========================
@@ -506,19 +512,21 @@ if sell_file and price_file:
             ts["Kategorie"] = ts["Kategorie"].astype(str)
             ts["Wert"]      = pd.to_numeric(ts["Wert"], errors="coerce").fillna(0.0).astype(float)
 
-            chart = (alt.Chart(ts)
-                       .mark_line(point=True)
-                       .encode(
-                           x=alt.X("Periode:T", title="Periode (Monat)"),
-                           y=alt.Y("Wert:Q", title="Verkaufswert"),
-                           color=alt.Color("Kategorie:N", title="Kategorie"),
-                           tooltip=[
-                               alt.Tooltip("Periode:T",   title="Periode"),
-                               alt.Tooltip("Kategorie:N", title="Kategorie"),
-                               alt.Tooltip("Wert:Q",      title="Verkaufswert"),
-                           ],
-                       )
-                       .properties(height=300))
+            chart = (
+                alt.Chart(ts)
+                  .mark_line(point=True)
+                  .encode(
+                      x=alt.X(field="Periode", type="temporal", title="Periode (Monat)"),
+                      y=alt.Y(field="Wert", type="quantitative", title="Verkaufswert"),
+                      color=alt.Color(field="Kategorie", type="nominal", title="Kategorie"),
+                      tooltip=[
+                          alt.Tooltip(field="Periode", type="temporal", title="Periode"),
+                          alt.Tooltip(field="Kategorie", type="nominal", title="Kategorie"),
+                          alt.Tooltip(field="Wert", type="quantitative", title="Verkaufswert", format=",.0f"),
+                      ],
+                  )
+                  .properties(height=300)
+            )
             st.altair_chart(chart, use_container_width=True)
         else:
             st.info("Für den Verlauf werden gültige Startdaten benötigt.")
