@@ -7,6 +7,7 @@
 # - Farberkennung (Spaltenscan + Synonyme)
 # - Matching-Reihenfolge: ArtNr → EAN → Name → Kurzname (1–2 Hauptwörter)
 # - Overflow-Fix: float64 + Sanity-Clean der Zahlen vor der Multiplikation
+# - FIX: kein lambda in Comprehension (verhindert "cannot access free variable 'c' ...")
 
 import re
 import unicodedata
@@ -38,7 +39,13 @@ def style_numeric(df: pd.DataFrame, num_cols=NUM_COLS_DEFAULT, sep=THOUSANDS_SEP
     out = df.copy()
     for c in (col for col in num_cols if c in out.columns):
         out[c] = pd.to_numeric(out[c], errors="coerce").round(0).astype("Int64")
-    fmt = {c: (lambda v, s=sep: _fmt_thousands(v, s)) for c in num_cols if c in out.columns}
+    # FIX: keinen lambda in der Comprehension erzeugen → feste Funktion zuweisen
+    def _fmt_func(v, s=sep):
+        return _fmt_thousands(v, s)
+    fmt = {}
+    for col in num_cols:
+        if col in out.columns:
+            fmt[col] = _fmt_func
     styler = out.style.format(fmt)
     return out, styler
 
