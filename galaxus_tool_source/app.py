@@ -1,8 +1,7 @@
-# app.py — Galaxus Sellout Analyse
+# app.py — Galaxus Sellout Analyse (Wochenbasis)
 # Robustes Matching (ArtNr → EAN → Name → Familie → Hints → Fuzzy),
 # EU‑Datumsfilter, Detailtabelle optional, Summen pro Artikel,
-# Interaktives Linienchart (Klick‑Highlight, Brush‑Zoom, Monats‑Dropdowns),
-# Overflow‑Fix.
+# Interaktives Linienchart (wochenweise, Klick‑Highlight, Labels).
 
 import re
 import unicodedata
@@ -13,7 +12,7 @@ import altair as alt
 
 st.set_page_config(page_title="Galaxus Sellout Analyse", layout="wide")
 
-# Altair: große Datensätze zulassen (robust)
+# Altair: große Datensätze zulassen
 try:
     alt.data_transformers.disable_max_rows()
 except Exception:
@@ -222,7 +221,7 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     if "Einkaufspreis" not in out: out["Einkaufspreis"]=out.get("Verkaufspreis", pd.Series([np.nan]*len(out)))
     if "Verkaufspreis" not in out: out["Verkaufspreis"]=out.get("Einkaufspreis", pd.Series([np.nan]*len(out)))
 
-    # Dedupliziere nach ArtikelNr_key (bevorzuge mit Preis)
+    # Dedupliziere nach ArtikelNr_key
     out = out.assign(_have=out["Verkaufspreis"].notna()).sort_values(["ArtikelNr_key","_have"], ascending=[True,False])
     out = out.drop_duplicates(subset=["ArtikelNr_key"], keep="first").drop(columns=["_have"])
     return out
@@ -236,7 +235,7 @@ BUY_QTY_CANDIDATES   = ["Einkauf","Einkaufsmenge","Menge Einkauf"]
 DATE_START_CANDS     = ["Start","Startdatum","Start Date","Anfangs datum","Anfangsdatum","Von","Period Start"]
 DATE_END_CANDS       = ["Ende","Enddatum","End Date","Bis","Period End"]
 
-# Einfache Äquivalenzen / Regeln
+# Äquivalenzen / Regeln
 ART_EXACT_EQUIV  = {"e008":"e009","j031":"j030","m057":"m051","s054":"s054"}
 ART_PREFIX_EQUIV = {"o061":"o061","o013":"o013"}
 
@@ -392,7 +391,7 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame):
         for i,f in zip(merged.index[need], merged.loc[need,"Familie"]):
             if f and f in fam_map.index: _assign_from_price_row(merged,i, fam_map.loc[f])
 
-    # Backstops (Äquivalenzen, Familie, Fuzzy)
+    # Backstops
     _final_backstops(merged, price_df)
 
     # Strings & Anzeige
@@ -423,7 +422,7 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame):
     totals = (detail.groupby(["ArtikelNr","Bezeichnung_anzeige","Kategorie"], dropna=False, as_index=False)
                    .agg({"Einkaufsmenge":"sum","Einkaufswert":"sum","Verkaufsmenge":"sum","Verkaufswert":"sum","Lagermenge":"sum","Lagerwert":"sum"}))
 
-    # Zeitquelle für das Linien-Diagramm (Einzelzeilen → Monatsbucket)
+    # Zeitquelle für das Linien-Diagramm (Einzelzeilen → Wochenbucket)
     ts_source = pd.DataFrame()
     if "StartDatum" in merged.columns:
         ts_source = merged[["StartDatum","Kategorie","Verkaufswert"]].copy()
@@ -438,8 +437,8 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame):
 # =========================
 # UI
 # =========================
-st.title("📊 Galaxus Sellout Analyse")
-st.caption("Summenansicht, robustes Matching (ArtNr → EAN → Name → Familie → Hints → Fuzzy), EU‑Datumsfilter. Detailtabelle optional. Interaktiver Linien‑Überblick mit Klick‑Highlight & Brush‑Zoom.")
+st.title("📊 Galaxus Sellout Analyse (Wochenbasis)")
+st.caption("Summenansicht, robustes Matching (ArtNr → EAN → Name → Familie → Hints → Fuzzy), EU‑Datumsfilter. Detailtabelle optional. Interaktiver Wochen‑Überblick pro Kategorie.")
 
 c1,c2 = st.columns(2)
 with c1:
@@ -505,12 +504,13 @@ if sell_file and price_file:
         with st.spinner("🔗 Matche & berechne Werte…"):
             detail, totals, ts_source = enrich_and_merge(filtered_sell_df, price_df)
 
-        # =============== INTERAKTIVES LINIEN-CHART ===============
-        st.markdown("### 📈 Verkaufsverlauf nach Kategorie")
+        # =============== INTERAKTIVES LINIEN-CHART – Wochensummen ===============
+        st.markdown("### 📈 Verkaufsverlauf nach Kategorie (Woche)")
 
         if not ts_source.empty:
             ts = ts_source.dropna(subset=["StartDatum"]).copy()
-            ts["Periode"] = ts["StartDatum"].dt.to_period("M").dt.start_time
+            # Wochen-Bucket
+            ts["Periode"] = ts["StartDatum"].dt.to_period("W").dt.start_time
 
             # Kategorien robust bereinigen (kein 'nan' als String)
             ts["Kategorie"] = (
@@ -526,32 +526,33 @@ if sell_file and price_file:
             if sel_cats:
                 ts = ts[ts["Kategorie"].isin(sel_cats)]
 
-            # Dropdowns Start-/Endmonat (wirken vor dem Brush)
-            all_months = sorted(ts["Periode"].dt.to_period("M").astype(str).unique())
-            if "month_range" not in st.session_state:
-                st.session_state["month_range"] = (all_months[0], all_months[-1])
-
-            col_m1, col_m2, col_reset = st.columns([2,2,1])
-            with col_m1:
-                start_month = st.selectbox("Startmonat", options=all_months,
-                                           index=all_months.index(st.session_state["month_range"][0]))
-            with col_m2:
-                end_options = [m for m in all_months if m >= start_month]
-                end_month = st.selectbox("Endmonat", options=end_options, index=len(end_options)-1)
-            with col_reset:
-                st.write("")
-                if st.button("Alle Monate"):
+            # Dropdowns Start-/Endmonat (wirken vor der Aggregation, obwohl Wochenbuckets)
+            all_months = sorted(ts["StartDatum"].dt.to_period("M").astype(str).unique())
+            if all_months:
+                if "month_range" not in st.session_state:
                     st.session_state["month_range"] = (all_months[0], all_months[-1])
-                    start_month, end_month = st.session_state["month_range"]
 
-            st.session_state["month_range"] = (start_month, end_month)
+                col_m1, col_m2, col_reset = st.columns([2,2,1])
+                with col_m1:
+                    start_month = st.selectbox("Startmonat", options=all_months,
+                                               index=all_months.index(st.session_state["month_range"][0]))
+                with col_m2:
+                    end_options = [m for m in all_months if m >= start_month]
+                    end_month = st.selectbox("Endmonat", options=end_options, index=len(end_options)-1)
+                with col_reset:
+                    st.write("")
+                    if st.button("Alle Monate"):
+                        st.session_state["month_range"] = (all_months[0], all_months[-1])
+                        start_month, end_month = st.session_state["month_range"]
 
-            # Filter nach Monatsspanne (vor Aggregation)
-            start_p = pd.Period(start_month, freq="M")
-            end_p   = pd.Period(end_month,   freq="M")
-            ts = ts[(ts["Periode"].dt.to_period("M") >= start_p) & (ts["Periode"].dt.to_period("M") <= end_p)]
+                st.session_state["month_range"] = (start_month, end_month)
 
-            # Monatswerte je Kategorie summieren (erst NACH Filtern)
+                # Filter nach Monatsspanne (vor Aggregation)
+                start_p = pd.Period(start_month, freq="M")
+                end_p   = pd.Period(end_month,   freq="M")
+                ts = ts[(ts["StartDatum"].dt.to_period("M") >= start_p) & (ts["StartDatum"].dt.to_period("M") <= end_p)]
+
+            # Wochenwerte je Kategorie summieren (erst NACH Filtern)
             ts_agg = (ts.groupby(["Kategorie","Periode"], as_index=False)["Verkaufswert"]
                         .sum()
                         .rename(columns={"Verkaufswert":"Wert"}))
@@ -561,44 +562,54 @@ if sell_file and price_file:
 
             # Selections
             highlight = alt.selection_single(fields=["Kategorie"], on="click", nearest=True, empty="none")
-            brush     = alt.selection_interval(encodings=["x"])  # X-Only
 
             base = alt.Chart(ts_agg)
 
-            # DETAIL (oben): Linien mit Punktmarkern, Fokus hebt Linie hervor
-            detail_chart = (
-                base.mark_line(point=alt.OverlayMarkDef(size=32), interpolate="linear")  # linear statt None
+            # Linien-Chart mit Klick-Hervorhebung
+            lines = (
+                base.mark_line(point=alt.OverlayMarkDef(size=30), interpolate="linear")
                     .encode(
-                        x=alt.X(field="Periode", type="temporal", title="Periode (Monat)"),
-                        y=alt.Y(field="Wert", type="quantitative", title="Verkaufswert (Summe pro Monat)", stack=None),
+                        x=alt.X(field="Periode", type="temporal", title="Woche"),
+                        y=alt.Y(field="Wert", type="quantitative", title="Verkaufswert (Summe pro Woche)", stack=None),
                         color=alt.condition(highlight, alt.Color("Kategorie:N", title="Kategorie"),
                                             alt.value("lightgray")),
                         opacity=alt.condition(highlight, alt.value(1.0), alt.value(0.25)),
                         strokeWidth=alt.condition(highlight, alt.value(3), alt.value(1.5)),
                         tooltip=[
-                            alt.Tooltip(field="Periode", type="temporal", title="Periode"),
+                            alt.Tooltip(field="Periode", type="temporal", title="Woche"),
                             alt.Tooltip(field="Kategorie", type="nominal", title="Kategorie"),
                             alt.Tooltip(field="Wert", type="quantitative", title="Verkaufswert", format=",.0f"),
                         ],
                     )
-                    .transform_filter(brush)
                     .add_selection(highlight)
-                    .properties(height=340)
             )
 
-            # OVERVIEW (unten): geglättete Linien, Brush-Auswahl
-            overview_chart = (
-                base.mark_line(interpolate="monotone")
-                    .encode(
-                        x=alt.X(field="Periode", type="temporal", title="Scroll/Zoom (Monate)"),
-                        y=alt.Y(field="Wert", type="quantitative", title="", stack=None),
-                        color=alt.Color("Kategorie:N", title=None, legend=None),
-                    )
-                    .add_selection(brush)
-                    .properties(height=90)
+            # Labels am Ende jeder Linie (letzte Woche)
+            labels = (
+                base.transform_window(
+                    row_number='row_number()',
+                    sort=[alt.SortField(field='Periode', order='descending')],
+                    groupby=['Kategorie']
+                )
+                .transform_filter(
+                    alt.datum.row_number == 0
+                )
+                .mark_text(
+                    align='left',
+                    dx=4,
+                    dy=-5,
+                    fontSize=11
+                )
+                .encode(
+                    x=alt.X('Periode:T'),
+                    y=alt.Y('Wert:Q'),
+                    text=alt.Text('Kategorie:N'),
+                    color=alt.condition(highlight, alt.Color("Kategorie:N"), alt.value("lightgray")),
+                    opacity=alt.condition(highlight, alt.value(1.0), alt.value(0.25))
+                )
             )
 
-            chart = alt.vconcat(detail_chart, overview_chart).resolve_scale(y="independent")
+            chart = (lines + labels).properties(height=380)
             st.altair_chart(chart, use_container_width=True)
         else:
             st.info("Für den Verlauf werden gültige Startdaten benötigt.")
