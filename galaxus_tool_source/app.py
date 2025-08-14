@@ -1,7 +1,6 @@
 # app.py — Galaxus Sellout Analyse
-# Robustes Matching (ArtNr → EAN → Name → Familie → Hints → Fuzzy),
-# EU-Datumsfilter + Button „Gesamten Zeitraum“, Detailtabelle optional,
-# + Kurzübersicht: Balken-Chart pro Kategorie (Schnellüberblick).
+# Robust: Matching (ArtNr → EAN → Name → Familie → Hints → Fuzzy), EU-Datumsfilter,
+# kleines Linien-Diagramm (eine Linie pro Kategorie) über Verkaufsverlauf, Detail optional.
 
 import re
 import unicodedata
@@ -28,9 +27,8 @@ def style_numeric(df: pd.DataFrame, num_cols=NUM_COLS_DEFAULT, sep=THOUSANDS_SEP
     present = [c for c in num_cols if c in out.columns]
     for c in present:
         out[c] = pd.to_numeric(out[c], errors="coerce").round(0).astype("Int64")
-    def _fmt(v, _sep=sep): return _fmt_thousands(v, _sep)
-    styler = out.style.format({c: _fmt for c in present})
-    return out, styler
+    fmt = {c: (lambda v, s=sep: _fmt_thousands(v, s)) for c in present}
+    return out, out.style.format(fmt)
 
 # =========================
 # Robust: Excel einlesen (tolerant ggü. Kopfzeilen)
@@ -42,16 +40,18 @@ def read_excel_flat(upload) -> pd.DataFrame:
     headers = raw.iloc[header_idx].fillna("").astype(str).tolist()
     headers = [re.sub(r"\s+"," ",h).strip() for h in headers]
     n = raw.shape[1]
-    if len(headers) < n: headers += [f"col_{i}" for i in range(len(headers), n)]
-    else: headers = headers[:n]
+    if len(headers) < n:
+        headers += [f"col_{i}" for i in range(len(headers), n)]
+    else:
+        headers = headers[:n]
     df = raw.iloc[header_idx+1:].reset_index(drop=True)
     df.columns = headers
     # doppelte Spalten entschärfen
-    seen, newcols = {}, []
+    seen, out = {}, []
     for c in df.columns:
-        if c in seen: seen[c]+=1; newcols.append(f"{c}.{seen[c]}")
-        else: seen[c]=0; newcols.append(c)
-    df.columns = newcols
+        if c in seen: seen[c]+=1; out.append(f"{c}.{seen[c]}")
+        else: seen[c]=0; out.append(c)
+    df.columns = out
     return df
 
 # =========================
@@ -100,15 +100,15 @@ def parse_date_series_us(s: pd.Series) -> pd.Series:
     dt2 = pd.to_datetime(nums, origin="1899-12-30", unit="d", errors="coerce")
     return dt1.combine_first(dt2)
 
+# Obergrenzen als Sicherung (Overflow-Fix)
 MAX_QTY, MAX_PRICE = 1_000_000, 1_000_000
 def sanitize_numbers(qty: pd.Series, price: pd.Series) -> tuple[pd.Series,pd.Series]:
-    q = pd.to_numeric(qty, errors="coerce").astype("float64")
-    p = pd.to_numeric(price, errors="coerce").astype("float64")
-    q = q.where((q>=0)&(q<=MAX_QTY)); p = p.where((p>=0)&(p<=MAX_PRICE))
+    q = pd.to_numeric(qty, errors="coerce").astype("float64").clip(lower=0, upper=MAX_QTY)
+    p = pd.to_numeric(price, errors="coerce").astype("float64").clip(lower=0, upper=MAX_PRICE)
     return q, p
 
 # =========================
-# Farben & Family-Key (für Varianten)
+# Farben & Familie
 # =========================
 _COLOR_MAP = {
     "weiss":"Weiss","weiß":"Weiss","white":"White","offwhite":"Off-White","cream":"Cream","ivory":"Ivory",
@@ -135,7 +135,7 @@ def _strip_parens_units(name: str) -> str:
 def make_family_key(name: str) -> str:
     if not isinstance(name,str): return ""
     s = _strip_parens_units(name.lower())
-    s = re.sub(r"\b[o0]-\d+\b"," ", s)   # Codes wie O-061 entfernen
+    s = re.sub(r"\b[o0]-\d+\b"," ", s)
     s = re.sub(r"[^a-z0-9]+"," ", s)
     toks = [t for t in s.split() if t and (t not in _STOP_TOKENS) and (t not in _COLOR_WORDS)]
     return "".join(toks[:2]) if toks else ""
@@ -193,7 +193,6 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     out["Familie"]         = out["Bezeichnung"].map(make_family_key)
     out["Kategorie"]       = df[col_cat].astype(str) if col_cat else ""
 
-    # Farbe (falls vorhanden erkennen)
     if col_color:
         out["Farbe"] = df[col_color].astype(str).map(lambda v: _COLOR_MAP.get(str(v).lower(), str(v)))
     else:
@@ -222,7 +221,6 @@ BUY_QTY_CANDIDATES   = ["Einkauf","Einkaufsmenge","Menge Einkauf"]
 DATE_START_CANDS     = ["Start","Startdatum","Start Date","Anfangs datum","Anfangsdatum","Von","Period Start"]
 DATE_END_CANDS       = ["Ende","Enddatum","End Date","Bis","Period End"]
 
-# Äquivalenzen / Hints
 ART_EXACT_EQUIV = {"e008":"e009","j031":"j030","m057":"m051","s054":"s054"}
 ART_PREFIX_EQUIV = {"o061":"o061","o013":"o013"}
 
@@ -325,8 +323,7 @@ def _family_match(row: pd.Series, price_df: pd.DataFrame, prefer_color: str|None
 
 def _apply_equivalences(hint_art_exact: str, hint_art_pref: str) -> str|None:
     if hint_art_exact:
-        k = ART_EXACT_EQUIV.get(hint_art_exact.lower(), hint_art_exact.lower())
-        return k
+        return ART_EXACT_EQUIV.get(hint_art_exact.lower(), hint_art_exact.lower())
     if hint_art_pref:
         p = hint_art_pref.lower()
         return ART_PREFIX_EQUIV.get(p, p)
@@ -350,12 +347,13 @@ def _final_backstops(merged: pd.DataFrame, price_df: pd.DataFrame):
             _assign_from_price_row(merged,i, price_df.loc[idx]); continue
 
 # =========================
-# Merge & Werte berechnen
+# Merge & Werte berechnen (+ Quelle für Chart)
 # =========================
 @st.cache_data(show_spinner=False)
 def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame):
     merged = sell_df.merge(price_df, on=["ArtikelNr_key"], how="left", suffixes=("", "_pl"))
 
+    # Fallbacks
     need = merged["Verkaufspreis"].isna() & merged["EAN_key"].astype(bool)
     if need.any():
         tmp = merged.loc[need, ["EAN_key"]].merge(
@@ -379,6 +377,7 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame):
 
     _final_backstops(merged, price_df)
 
+    # Strings & Anzeige
     merged["Kategorie"]   = merged["Kategorie"].fillna("")
     merged["Bezeichnung"] = merged["Bezeichnung"].fillna("")
     merged["Farbe"]       = merged.get("Farbe","").fillna("")
@@ -388,6 +387,7 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame):
     valid_color = merged["Farbe"].astype(str).str.strip().map(lambda t: (t!="") and (not _looks_like_not_a_color(t)))
     merged.loc[dup & valid_color, "Bezeichnung_anzeige"] = merged.loc[dup & valid_color,"Bezeichnung"] + " – " + merged.loc[dup & valid_color,"Farbe"].astype(str).str.strip()
 
+    # Zahlen säubern (Fix gegen Overflow)
     q_buy,p_buy   = sanitize_numbers(merged["Einkaufsmenge"], merged["Einkaufspreis"])
     q_sell,p_sell = sanitize_numbers(merged["Verkaufsmenge"], merged["Verkaufspreis"])
     q_stock,_     = sanitize_numbers(merged["Lagermenge"],  merged["Verkaufspreis"])
@@ -399,18 +399,22 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame):
         merged["Verkaufswert"] = (q_sell*p_sell).astype("float64")
         merged["Lagerwert"]    = (q_stock*p_sell).astype("float64")
 
+    # Tabellen
     display_cols = [c for c in ["ArtikelNr","Bezeichnung_anzeige","Kategorie","Einkaufsmenge","Einkaufswert","Verkaufsmenge","Verkaufswert","Lagermenge","Lagerwert"] if c in merged.columns]
     detail = merged[display_cols].copy()
     totals = (detail.groupby(["ArtikelNr","Bezeichnung_anzeige","Kategorie"], dropna=False, as_index=False)
                    .agg({"Einkaufsmenge":"sum","Einkaufswert":"sum","Verkaufsmenge":"sum","Verkaufswert":"sum","Lagermenge":"sum","Lagerwert":"sum"}))
 
-    return detail, totals
+    # Quelle für das Linien-Diagramm (eine Linie je Kategorie)
+    ts_source = merged[["StartDatum","Kategorie","Verkaufswert"]].copy() if "StartDatum" in merged else pd.DataFrame()
+    ts_source["Kategorie"] = ts_source["Kategorie"].replace({"": "— ohne Kategorie —"})
+    return detail, totals, ts_source
 
 # =========================
 # UI
 # =========================
 st.title("📊 Galaxus Sellout Analyse")
-st.caption("Summenansicht, robustes Matching (ArtNr → EAN → Name → Familie → Hints → Fuzzy), EU‑Datumsfilter. Detailtabelle optional. Kurzübersicht pro Kategorie.")
+st.caption("Summenansicht, robustes Matching (ArtNr → EAN → Name → Familie → Hints → Fuzzy), EU‑Datumsfilter. Detailtabelle optional. Linien‑Überblick pro Kategorie.")
 
 c1,c2 = st.columns(2)
 with c1:
@@ -439,11 +443,9 @@ if sell_file and price_file:
         filtered_sell_df = sell_df
         if {"StartDatum","EndDatum"}.issubset(sell_df.columns) and not sell_df["StartDatum"].isna().all():
             st.subheader("Periode wählen")
-
             min_date = sell_df["StartDatum"].min().date()
             max_date = (sell_df["EndDatum"].dropna().max()
                         if "EndDatum" in sell_df else sell_df["StartDatum"].max()).date()
-
             if "date_range" not in st.session_state:
                 st.session_state["date_range"] = (min_date, max_date)
 
@@ -462,11 +464,8 @@ if sell_file and price_file:
                     st.session_state["date_range"] = (min_date, max_date)
                     st.experimental_rerun()
 
-            if isinstance(date_value, tuple):
-                start_date, end_date = date_value
-            else:
-                start_date = end_date = date_value
-
+            if isinstance(date_value, tuple): start_date, end_date = date_value
+            else: start_date = end_date = date_value
             st.session_state["date_range"] = (start_date, end_date)
 
             mask = ~((sell_df["EndDatum"].dt.date < start_date) |
@@ -475,42 +474,32 @@ if sell_file and price_file:
         # =========================================================================
 
         with st.spinner("🔗 Matche & berechne Werte…"):
-            detail, totals = enrich_and_merge(filtered_sell_df, price_df)
+            detail, totals, ts_source = enrich_and_merge(filtered_sell_df, price_df)
 
-        # =============== KURZÜBERSICHT: Balken-Chart pro Kategorie ===============
-        st.markdown("### 📊 Kurzübersicht: Verkäufe nach Kategorie")
-        # Aggregation nach Kategorie (für Schnellüberblick)
-        cat_sum = (detail.assign(Kategorie=detail["Kategorie"].replace({"": "— ohne Kategorie —"}))
-                          .groupby("Kategorie", as_index=False)
-                          .agg({"Verkaufswert":"sum","Einkaufswert":"sum","Verkaufsmenge":"sum","Einkaufsmenge":"sum"}))
-        if cat_sum.empty:
-            st.info("Keine Daten für die Kurzübersicht vorhanden.")
-        else:
-            metric = st.radio("Metrik", ["Werte (Verkaufs-/Einkaufswert)","Mengen (Verkaufs-/Einkaufsmenge)"], horizontal=True)
-            top_n = st.slider("Top Kategorien", 3, int(min(20, max(3, len(cat_sum)))), min(10, len(cat_sum)))
-
-            if metric.startswith("Werte"):
-                sort_col = "Verkaufswert"
-                melted = cat_sum.sort_values(sort_col, ascending=False).head(top_n) \
-                                .melt(id_vars=["Kategorie"], value_vars=["Verkaufswert","Einkaufswert"],
-                                      var_name="Typ", value_name="Wert")
-            else:
-                sort_col = "Verkaufsmenge"
-                melted = cat_sum.sort_values(sort_col, ascending=False).head(top_n) \
-                                .melt(id_vars=["Kategorie"], value_vars=["Verkaufsmenge","Einkaufsmenge"],
-                                      var_name="Typ", value_name="Wert")
-
-            order = (melted[melted["Typ"].str.contains("Verkaufs")]
-                     .sort_values("Wert", ascending=False)["Kategorie"].tolist())
-            chart = (alt.Chart(melted)
-                       .mark_bar()
-                       .encode(
-                           y=alt.Y("Kategorie:N", sort=order, title="Kategorie"),
-                           x=alt.X("Wert:Q", title="Wert"),
-                           color=alt.Color("Typ:N", title=""),
-                           tooltip=["Kategorie","Typ","Wert"]
-                       ).properties(height=max(220, 24*len(order))))
+        # =============== KURZÜBERSICHT: EIN Linien-Diagramm (1 Linie je Kategorie) ===============
+        st.markdown("### 📈 Verkaufsverlauf nach Kategorie")
+        if not ts_source.empty:
+            # Monats-Periode
+            ts_source = ts_source.dropna(subset=["StartDatum"]).copy()
+            ts_source["Periode"] = ts_source["StartDatum"].dt.to_period("M").dt.start_time
+            ts = (ts_source.groupby(["Kategorie","Periode"], as_index=False)["Verkaufswert"].sum()
+                           .sort_values(["Kategorie","Periode"]))
+            chart = (
+                alt.Chart(ts)
+                  .mark_line(point=True)
+                  .encode(
+                      x=alt.X("Periode:T", title="Periode (Monat)"),
+                      y=alt.Y("Verkaufswert:Q", title="Verkaufswert"),
+                      color=alt.Color("Kategorie:N", title="Kategorie"),
+                      tooltip=[alt.Tooltip("Periode:T","Periode"),
+                               alt.Tooltip("Kategorie:N","Kategorie"),
+                               alt.Tooltip("Verkaufswert:Q","Verkaufswert")]
+                  )
+                  .properties(height=300)
+            )
             st.altair_chart(chart, use_container_width=True)
+        else:
+            st.info("Für den Verlauf werden gültige Startdaten benötigt.")
 
         # =============== Tabellen ===============
         show_detail = st.checkbox("Detailtabelle anzeigen", value=False)
@@ -523,12 +512,12 @@ if sell_file and price_file:
         t_rounded, t_styler = style_numeric(totals)
         st.dataframe(t_styler, use_container_width=True)
 
-        dl1, dl2 = st.columns(2)
-        with dl1:
+        cdl1, cdl2 = st.columns(2)
+        with cdl1:
             st.download_button("⬇️ Detail (CSV)",
                 data=(detail if show_detail else pd.DataFrame()).to_csv(index=False).encode("utf-8"),
                 file_name="detail.csv", mime="text/csv", disabled=not show_detail)
-        with dl2:
+        with cdl2:
             st.download_button("⬇️ Summen (CSV)",
                 data=t_rounded.to_csv(index=False).encode("utf-8"),
                 file_name="summen.csv", mime="text/csv")
