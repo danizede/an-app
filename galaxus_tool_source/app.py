@@ -253,8 +253,8 @@ def _apply_hints_to_row(name_raw: str) -> dict:
     if "simon" in s: h["hint_art_exact"]="s054"
     if "otto"  in s: h["hint_art_prefix"]="o013"
     if "eva" in s and "e-008" in s: h["hint_art_exact"]="e008"
-    if "julia" in s and "j-031" in s: h["hint_art_exact"]="j031"
-    if "mia" in s and "m-057" in s: h["hint_art_exact"]="m057"
+    if "julia" in s und "j-031" in s: h["hint_art_exact"]="j031"
+    if "mia" in s und "m-057" in s: h["hint_art_exact"]="m057"
     return h
 
 def _fallback_col_by_index(df: pd.DataFrame, idx0: int) -> str|None:
@@ -427,7 +427,12 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame):
     ts_source = pd.DataFrame()
     if "StartDatum" in merged.columns:
         ts_source = merged[["StartDatum","Kategorie","Verkaufswert"]].copy()
-        ts_source["Kategorie"] = ts_source["Kategorie"].replace({"": "— ohne Kategorie —"})
+        ts_source["Kategorie"] = (
+            ts_source["Kategorie"]
+            .astype("string")
+            .fillna("— ohne Kategorie —")
+            .replace({"": "— ohne Kategorie —"})
+        )
     return detail, totals, ts_source
 
 # =========================
@@ -505,11 +510,18 @@ if sell_file and price_file:
 
         if not ts_source.empty:
             ts = ts_source.dropna(subset=["StartDatum"]).copy()
-            # Monats-Bucket (aus EINZELZEILEN)
             ts["Periode"] = ts["StartDatum"].dt.to_period("M").dt.start_time
 
+            # Kategorien robust bereinigen (kein 'nan' als String)
+            ts["Kategorie"] = (
+                ts["Kategorie"]
+                .astype("string")
+                .fillna("— ohne Kategorie —")
+                .replace({"": "— ohne Kategorie —"})
+            )
+
             # Kategorien-Auswahl
-            all_cats = sorted(ts["Kategorie"].astype(str).unique())
+            all_cats = sorted(ts["Kategorie"].unique())
             sel_cats = st.multiselect("Kategorien filtern", options=all_cats, default=all_cats)
             if sel_cats:
                 ts = ts[ts["Kategorie"].isin(sel_cats)]
@@ -521,7 +533,8 @@ if sell_file and price_file:
 
             col_m1, col_m2, col_reset = st.columns([2,2,1])
             with col_m1:
-                start_month = st.selectbox("Startmonat", options=all_months, index=all_months.index(st.session_state["month_range"][0]))
+                start_month = st.selectbox("Startmonat", options=all_months,
+                                           index=all_months.index(st.session_state["month_range"][0]))
             with col_m2:
                 end_options = [m for m in all_months if m >= start_month]
                 end_month = st.selectbox("Endmonat", options=end_options, index=len(end_options)-1)
@@ -538,7 +551,7 @@ if sell_file and price_file:
             end_p   = pd.Period(end_month,   freq="M")
             ts = ts[(ts["Periode"].dt.to_period("M") >= start_p) & (ts["Periode"].dt.to_period("M") <= end_p)]
 
-            # Monatswerte je Kategorie summieren (Aggregation erst NACH Filtern)
+            # Monatswerte je Kategorie summieren (erst NACH Filtern)
             ts_agg = (ts.groupby(["Kategorie","Periode"], as_index=False)["Verkaufswert"]
                         .sum()
                         .rename(columns={"Verkaufswert":"Wert"}))
@@ -546,15 +559,15 @@ if sell_file and price_file:
             ts_agg["Kategorie"] = ts_agg["Kategorie"].astype(str)
             ts_agg["Wert"]      = pd.to_numeric(ts_agg["Wert"], errors="coerce").fillna(0.0).astype(float)
 
-            # Selections: Klick-Highlight + Brush
+            # Selections
             highlight = alt.selection_single(fields=["Kategorie"], on="click", nearest=True, empty="none")
             brush     = alt.selection_interval(encodings=["x"])  # X-Only
 
             base = alt.Chart(ts_agg)
 
-            # DETAIL (oben): Linien mit Punktmarkern, dicker & volle Farbe bei Auswahl
+            # DETAIL (oben): Linien mit Punktmarkern, Fokus hebt Linie hervor
             detail_chart = (
-                base.mark_line(point=alt.OverlayMarkDef(size=32), interpolate=None)
+                base.mark_line(point=alt.OverlayMarkDef(size=32), interpolate="linear")  # FIX hier
                     .encode(
                         x=alt.X(field="Periode", type="temporal", title="Periode (Monat)"),
                         y=alt.Y(field="Wert", type="quantitative", title="Verkaufswert (Summe pro Monat)", stack=None),
