@@ -4,8 +4,9 @@
 # - Zahlformat (0 Nachkommastellen, ’ als Tausender)
 # - Detailtabelle standardmäßig ausgeblendet
 # - Varianten: Farbe NUR bei Dubletten an den Namen anhängen (kein EU/Art.-Nr.-Fallback)
-# - Bessere Farberkennung: explizite Spalten, Bezeichnung-Heuristik + Spaltenscan mit Synonym-Mapping
+# - Bessere Farberkennung (Spaltenscan + Synonyme)
 # - Overflow-Fix: Berechnungen in float64
+# - NEU: Zusatz-Matching über "Kurzname" (1–2 Hauptwörter aus Bezeichnung) => ArtNr → EAN → Name → Kurzname
 
 import re
 import unicodedata
@@ -150,30 +151,19 @@ def _looks_like_not_a_color(token: str) -> bool:
     if re.search(r"\d", t): return True
     return False
 
-# Synonyme & Mapping auf Kanon
 _COLOR_MAP = {
-    # weiss / weiß
     "weiss":"Weiss","weiß":"Weiss","white":"White","offwhite":"Off-White","cream":"Cream","ivory":"Ivory",
-    # schwarz
     "schwarz":"Schwarz","black":"Black","jet black":"Black",
-    # grau
     "grau":"Grau","gray":"Grau","anthrazit":"Anthrazit","charcoal":"Anthrazit","graphite":"Graphit","silver":"Silber",
-    # blau
     "blau":"Blau","blue":"Blau","navy":"Dunkelblau","sky blue":"Hellblau","light blue":"Hellblau","dark blue":"Dunkelblau",
-    # rot / rosa / violett
     "rot":"Rot","red":"Rot","bordeaux":"Bordeaux","burgundy":"Bordeaux","pink":"Pink","magenta":"Magenta",
     "lila":"Lila","violett":"Violett","purple":"Violett","fuchsia":"Fuchsia",
-    # grün
     "grün":"Grün","gruen":"Grün","green":"Grün","mint":"Mint","türkis":"Türkis","tuerkis":"Türkis","turquoise":"Türkis",
     "petrol":"Petrol","olive":"Olivgrün",
-    # gelb / orange / braun / beige
     "gelb":"Gelb","yellow":"Gelb","orange":"Orange","braun":"Braun","brown":"Braun","beige":"Beige","sand":"Sand",
-    # metallic / speziell
     "gold":"Gold","rose gold":"Roségold","rosegold":"Roségold","kupfer":"Kupfer","copper":"Kupfer","bronze":"Bronze",
     "transparent":"Transparent","clear":"Transparent"
 }
-
-# für Regex eine Liste der Keys, längere zuerst (damit 'rose gold' vor 'gold' matched)
 _COLOR_KEYS_SORTED = sorted(_COLOR_MAP.keys(), key=len, reverse=True)
 _COLOR_PATTERN = re.compile(r"\b(" + "|".join(map(re.escape, _COLOR_KEYS_SORTED)) + r")\b", re.IGNORECASE)
 
@@ -187,17 +177,16 @@ def _canon_color_from_text(text: str) -> str:
     return ""
 
 def extract_color_from_name(name: str) -> str:
-    """Heuristik: Farbe am Ende der Bezeichnung (in Klammern, nach Strich, nach Slash)."""
+    """Heuristik: Farbe am Ende der Bezeichnung (in Klammern, nach Strich, nach Slash) oder irgendwo im Text."""
     if not isinstance(name, str): return ""
     for rgx in _COLOR_REGEXES:
         m = re.search(rgx, name.strip())
         if m:
             cand = m.group(1).strip()
             if not _looks_like_not_a_color(cand):
-                # auch hier Synonyme normalisieren
                 canon = _canon_color_from_text(cand)
                 return canon or cand
-    # falls nicht am Ende, versuche irgendwo im Text via Vokabular
+    # irgendwo im Text
     canon = _canon_color_from_text(name)
     if canon and not _looks_like_not_a_color(canon):
         return canon
@@ -205,14 +194,12 @@ def extract_color_from_name(name: str) -> str:
 
 def guess_color_from_row(row: pd.Series, all_columns: list[str]) -> str:
     """Durchsucht mehrere Textspalten (Bezeichnung, Kategorie, Zusatz, etc.) nach Farbworten."""
-    # Bevorzugt dedizierte Farbfelder
     for col in all_columns:
         if re.search(r"(farb|color|colour|varian)", col, re.IGNORECASE):
             val = row.get(col, "")
             canon = _canon_color_from_text(str(val))
             if canon and not _looks_like_not_a_color(canon):
                 return canon
-    # Allgemeiner Scan über typische Textspalten
     candidates = []
     for col in all_columns:
         if col.lower() in {"ean","gtin","barcode","artikelnummer","artikelnr","artnr","produkt id"}:
@@ -220,14 +207,25 @@ def guess_color_from_row(row: pd.Series, all_columns: list[str]) -> str:
         val = str(row.get(col, "") or "").strip()
         if not val:
             continue
-        # nur in Textspalten suchen (keine reinen Zahlen-/Mengenfelder)
         if re.fullmatch(r"[0-9 .,'’-]+", val):
             continue
         c = extract_color_from_name(val) or _canon_color_from_text(val)
         if c and not _looks_like_not_a_color(c):
             candidates.append(c)
-    # wähle die erste gefundene
     return candidates[0] if candidates else ""
+
+# ===== Kurzname (1–2 Hauptwörter) für robustes Matching =====
+_STOP_TOKENS = {"eu","ch","us","uk","mobile","little"}
+def _make_short_key(name: str) -> str:
+    if not isinstance(name, str): return ""
+    s = name.lower()
+    s = re.sub(r"\([^)]*\)", " ", s)          # Klammerninhalt weg
+    s = re.sub(r"\b[o0]-\d+\b", " ", s)       # Codes wie O-009
+    s = re.sub(r"\b\d+([.,]\d+)?\s*(ml|db|m²|m2)\b", " ", s)  # Einheiten
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    toks = [t for t in s.split() if t and t not in _STOP_TOKENS]
+    if not toks: return ""
+    return "".join(toks[:2])  # 1–2 Tokens zusammengezogen (normalized)
 
 # =========================
 # Parsing – Preislisten
@@ -267,17 +265,15 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     out["EAN_key"]         = out["EAN"].map(lambda x: re.sub(r"[^0-9]+", "", str(x)))
     out["Bezeichnung"]     = df[col_name].astype(str)
     out["Bezeichnung_key"] = out["Bezeichnung"].map(normalize_key)
+    out["Kurz_key"]        = out["Bezeichnung"].map(_make_short_key)
     out["Kategorie"]       = df[col_cat].astype(str) if col_cat else ""
 
-    # --- Farbe bestimmen ---
+    # Farbe
     if col_color:
         out["Farbe"] = df[col_color].astype(str).map(lambda x: _canon_color_from_text(str(x)) or str(x))
     else:
-        # erst Bezeichnung-Heuristik …
         out["Farbe"] = out["Bezeichnung"].map(extract_color_from_name)
-        # … dann Spaltenscan, falls noch leer
         if out["Farbe"].isna().any() or (out["Farbe"].astype(str).str.strip() == "").any():
-            # zeilenweiser Scan
             all_cols = list(df.columns)
             out["Farbe"] = out.apply(
                 lambda r: r["Farbe"] if str(r.get("Farbe","")).strip() else guess_color_from_row(df.loc[r.name], all_cols),
@@ -303,7 +299,7 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 # =========================
-# Parsing – Sell‑out‑Report (Spalte I/J für Start/Ende, US-Format)
+# Parsing – Sell‑out‑Report
 # =========================
 NAME_CANDIDATES_SO   = ["Bezeichnung", "Name", "Artikelname", "Bezeichnung_Sales", "Produktname"]
 SALES_QTY_CANDIDATES = ["SalesQty", "Verkauf", "Verkaufte Menge", "Menge verkauft", "Absatz", "Stück", "Menge"]
@@ -338,6 +334,7 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
     out["EAN_key"] = out["EAN"].map(lambda x: re.sub(r"[^0-9]+", "", str(x)))
     out["Bezeichnung"] = df[col_name].astype(str) if col_name else ""
     out["Bezeichnung_key"] = out["Bezeichnung"].map(normalize_key)
+    out["Kurz_key"] = out["Bezeichnung"].map(_make_short_key)
 
     out["Verkaufsmenge"] = parse_number_series(df[col_sales]).fillna(0).astype("Int64")
     out["Einkaufsmenge"] = (parse_number_series(df[col_buy]).fillna(0).astype("Int64")
@@ -366,19 +363,19 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> tuple[pd.
         suffixes=("", "_pl")
     )
 
-    # Fallback via EAN
+    # 1) Fallback via EAN
     mask_need = merged["Verkaufspreis"].isna() & merged["EAN_key"].astype(bool)
     if mask_need.any():
         tmp = merged.loc[mask_need, ["EAN_key"]].merge(
-            price_df[["EAN_key", "Einkaufspreis", "Verkaufspreis", "Lagermenge", "Bezeichnung", "Farbe", "Kategorie", "ArtikelNr"]],
+            price_df[["EAN_key", "Einkaufspreis", "Verkaufspreis", "Lagermenge", "Bezeichnung", "Kurz_key", "Farbe", "Kategorie", "ArtikelNr"]],
             on="EAN_key", how="left"
         )
         idx = merged.index[mask_need]
         tmp.index = idx
-        for col in ["Einkaufspreis", "Verkaufspreis", "Lagermenge", "Bezeichnung", "Farbe", "Kategorie", "ArtikelNr"]:
+        for col in ["Einkaufspreis", "Verkaufspreis", "Lagermenge", "Bezeichnung", "Kurz_key", "Farbe", "Kategorie", "ArtikelNr"]:
             merged.loc[idx, col] = merged.loc[idx, col].fillna(tmp[col])
 
-    # Fallback via normalisierte Bezeichnung
+    # 2) Fallback via ganze Bezeichnung (normalisiert)
     mask_need = merged["Verkaufspreis"].isna()
     if mask_need.any():
         name_map = price_df.drop_duplicates("Bezeichnung_key").set_index("Bezeichnung_key")
@@ -387,26 +384,39 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> tuple[pd.
         for i, k in zip(idx, keys):
             if k in name_map.index:
                 row = name_map.loc[k]
-                for col in ["Einkaufspreis", "Verkaufspreis", "Lagermenge", "Bezeichnung", "Farbe", "Kategorie", "ArtikelNr"]:
-                    if pd.isna(merged.at[i, col]) or col in ("ArtikelNr", "Bezeichnung", "Kategorie", "Farbe"):
+                for col in ["Einkaufspreis", "Verkaufspreis", "Lagermenge", "Bezeichnung", "Kurz_key", "Farbe", "Kategorie", "ArtikelNr"]:
+                    if pd.isna(merged.at[i, col]) or col in ("ArtikelNr", "Bezeichnung", "Kurz_key", "Kategorie", "Farbe"):
+                        merged.at[i, col] = row.get(col, merged.at[i, col])
+
+    # 3) NEU: Fallback via Kurzname (1–2 Hauptwörter)
+    mask_need = merged["Verkaufspreis"].isna()
+    if mask_need.any():
+        kmap = price_df.drop_duplicates("Kurz_key").set_index("Kurz_key")
+        idx = merged.index[mask_need]
+        keys = merged.loc[idx, "Kurz_key"]
+        for i, k in zip(idx, keys):
+            if k and k in kmap.index:
+                row = kmap.loc[k]
+                for col in ["Einkaufspreis", "Verkaufspreis", "Lagermenge", "Bezeichnung", "Kurz_key", "Farbe", "Kategorie", "ArtikelNr"]:
+                    if pd.isna(merged.at[i, col]) or col in ("ArtikelNr", "Bezeichnung", "Kurz_key", "Kategorie", "Farbe"):
                         merged.at[i, col] = row.get(col, merged.at[i, col])
 
     # numerisch säubern
     merged["Kategorie"]   = merged["Kategorie"].fillna("")
     merged["Bezeichnung"] = merged["Bezeichnung"].fillna("")
-    merged["Farbe"] = merged.get("Farbe", "").fillna("")
+    merged["Farbe"]       = merged.get("Farbe", "").fillna("")
 
-    # Sichtbarer Name: standardmäßig Bezeichnung
+    # sichtbarer Name
     merged["Bezeichnung_anzeige"] = merged["Bezeichnung"]
 
-    # Nur bei Dubletten Farbe anhängen (wenn valide Farbe vorhanden)
+    # Farbe NUR bei Dubletten anfügen
     dup = merged.duplicated(subset=["Bezeichnung"], keep=False)
     valid_color = merged["Farbe"].astype(str).str.strip().map(lambda t: (t != "") and (not _looks_like_not_a_color(t)))
     merged.loc[dup & valid_color, "Bezeichnung_anzeige"] = (
         merged.loc[dup & valid_color, "Bezeichnung"] + " – " + merged.loc[dup & valid_color, "Farbe"].astype(str).str.strip()
     )
 
-    # Overflow-sicher: alles in float64 berechnen
+    # Float64-Berechnungen
     qty_buy   = _f64(merged["Einkaufsmenge"]).fillna(0.0)
     qty_sell  = _f64(merged["Verkaufsmenge"]).fillna(0.0)
     qty_stock = _f64(merged["Lagermenge"]).fillna(0.0)
@@ -445,7 +455,7 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> tuple[pd.
 # UI
 # =========================
 st.title("📦 Galaxus Sell‑out Aggregator")
-st.caption("Summenansicht, robustes Matching (ArtNr → EAN → 1./2. Wort), EU‑Datumsfilter. Detailtabelle optional.")
+st.caption("Summenansicht, robustes Matching (ArtNr → EAN → Name → Kurzname), EU‑Datumsfilter. Detailtabelle optional.")
 
 col1, col2 = st.columns(2)
 with col1:
