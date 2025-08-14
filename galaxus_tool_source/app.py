@@ -1,6 +1,7 @@
 # app.py — Galaxus Sell‑out Aggregator
 # Robust: Excel-Header-Handling, US→EU Datum (Start=Spalte I, Ende=Spalte J),
-# Zeitraumfilter, Zahlformat, Detailtabelle ausblendbar, Varianten mit Farbe anzeigen.
+# Zeitraumfilter, Zahlformat, Detailtabelle ausblendbar,
+# Varianten-Anzeige: nur bei Dubletten Farbe anhängen (kein EU/ArtNr).
 
 import re
 import unicodedata
@@ -40,6 +41,10 @@ def style_numeric(df: pd.DataFrame, num_cols=NUM_COLS_DEFAULT, sep=THOUSANDS_SEP
 # Robust: Excel einlesen & Spalten fixieren
 # =========================
 def read_excel_flat(upload) -> pd.DataFrame:
+    """
+    Liest eine Excel-Tabelle robust ein – auch bei mehrzeiligen/zusammengeführten Headern.
+    Verhindert 'Length mismatch' sicher.
+    """
     raw = pd.read_excel(upload, header=None, dtype=object)
     if raw.empty:
         return pd.DataFrame()
@@ -60,8 +65,7 @@ def read_excel_flat(upload) -> pd.DataFrame:
     df.columns = header_vals
 
     # Duplikate eindeutig machen
-    seen = {}
-    newcols = []
+    seen, newcols = {}, []
     for c in df.columns:
         if c in seen:
             seen[c] += 1
@@ -93,11 +97,9 @@ def normalize_key(s: str) -> str:
 
 def find_column(df: pd.DataFrame, candidates, purpose: str, required=True) -> str | None:
     cols = list(df.columns)
-    # 1) exakter Treffer
     for cand in candidates:
         if cand in cols:
             return cand
-    # 2) kanonische Suche
     canon = {re.sub(r"[\s\-_/\.]+", "", c).lower(): c for c in cols}
     for cand in candidates:
         key = re.sub(r"[\s\-_/\.]+", "", cand).lower()
@@ -135,20 +137,30 @@ def parse_date_series_us(s: pd.Series) -> pd.Series:
     dt2 = pd.to_datetime(nums, origin="1899-12-30", unit="d", errors="coerce")
     return dt1.combine_first(dt2)
 
-# ——— Farbe extrahieren (Fallback) ———
+# ===== Farb-Logik (Heuristik nur als Fallback; ignoriert irrelevante Endungen) =====
 _COLOR_REGEXES = [
     r"\(([^)]+)\)$",                # ... (Weiss)
     r"[-–—]\s*([A-Za-zäöüÄÖÜß]+)$", # ... – White
     r"/\s*([A-Za-zäöüÄÖÜß]+)$",     # ... / Black
 ]
+def _looks_like_not_a_color(token: str) -> bool:
+    t = token.strip().lower()
+    if not t: return True
+    # Ausschlüsse: Regionen/Kürzel/Einheiten/Kennzahlen
+    bad = {"eu","ch","us","uk"}
+    if t in bad: return True
+    if any(x in t for x in ["ml","dB".lower(),"m²","m2","db"]): return True
+    if re.search(r"\d", t): return True          # enthält Ziffern (z.B. O-009, 100 ml, 58 dB)
+    return False
 
 def extract_color_from_name(name: str) -> str:
-    if not isinstance(name, str):
-        return ""
+    if not isinstance(name, str): return ""
     for rgx in _COLOR_REGEXES:
         m = re.search(rgx, name.strip())
         if m:
-            return m.group(1).strip()
+            cand = m.group(1).strip()
+            if not _looks_like_not_a_color(cand):
+                return cand
     return ""
 
 # =========================
@@ -190,7 +202,11 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     out["Bezeichnung"]     = df[col_name].astype(str)
     out["Bezeichnung_key"] = out["Bezeichnung"].map(normalize_key)
     out["Kategorie"]       = df[col_cat].astype(str) if col_cat else ""
-    out["Farbe"]           = df[col_color].astype(str) if col_color else out["Bezeichnung"].map(extract_color_from_name)
+    # Farbe: echte Spalte bevorzugen, sonst aus Bezeichnung heuristisch (ignoriert EU/O-009/Einheiten)
+    if col_color:
+        out["Farbe"] = df[col_color].astype(str)
+    else:
+        out["Farbe"] = out["Bezeichnung"].map(extract_color_from_name)
 
     if col_stock:
         out["Lagermenge"] = parse_number_series(df[col_stock]).fillna(0).astype("Int64")
@@ -209,15 +225,6 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
         out["Einkaufspreis"] = out.get("Verkaufspreis", pd.Series([np.nan]*len(out)))
     if "Verkaufspreis" not in out:
         out["Verkaufspreis"] = out.get("Einkaufspreis", pd.Series([np.nan]*len(out)))
-
-    # Anzeige-Name mit Farbe (falls verfügbar)
-    def _name_with_color(row):
-        col = str(row.get("Farbe", "") or "").strip()
-        if col:
-            return f"{row['Bezeichnung']} – {col}"
-        return row["Bezeichnung"]
-    out["Bezeichnung_anzeige"] = out.apply(_name_with_color, axis=1)
-
     return out
 
 # =========================
@@ -244,13 +251,10 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
     col_sales = find_column(df, SALES_QTY_CANDIDATES, "Verkaufsmenge", required=True)
     col_buy   = find_column(df, BUY_QTY_CANDIDATES,   "Einkaufsmenge", required=False)
 
-    # Start/Ende (erst benannte Spalten, sonst Positionsfallback I/J)
     col_start = find_column(df, DATE_START_CANDS, "Startdatum (Spalte I)", required=False)
     col_end   = find_column(df, DATE_END_CANDS,   "Enddatum (Spalte J)",   required=False)
-    if not col_start and df.shape[1] >= 9:
-        col_start = _fallback_col_by_index(df, 8)   # I
-    if not col_end and df.shape[1] >= 10:
-        col_end   = _fallback_col_by_index(df, 9)   # J
+    if not col_start and df.shape[1] >= 9:  col_start = _fallback_col_by_index(df, 8)   # I
+    if not col_end   and df.shape[1] >= 10: col_end   = _fallback_col_by_index(df, 9)   # J
 
     out = pd.DataFrame()
     out["ArtikelNr"] = df[col_art].astype(str) if col_art else ""
@@ -266,15 +270,11 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
     else:
         out["Einkaufsmenge"] = pd.Series([0]*len(df), dtype="Int64")
 
-    if col_start:
-        out["StartDatum"] = parse_date_series_us(df[col_start])
-    if col_end:
-        out["EndDatum"]   = parse_date_series_us(df[col_end])
-
+    if col_start: out["StartDatum"] = parse_date_series_us(df[col_start])
+    if col_end:   out["EndDatum"]   = parse_date_series_us(df[col_end])
     if "StartDatum" in out and "EndDatum" in out:
         mask = out["EndDatum"].isna()
         out.loc[mask, "EndDatum"] = out.loc[mask, "StartDatum"]
-
     return out
 
 # =========================
@@ -293,12 +293,12 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> tuple[pd.
     mask_need = merged["Verkaufspreis"].isna() & merged["EAN_key"].astype(bool)
     if mask_need.any():
         tmp = merged.loc[mask_need, ["EAN_key"]].merge(
-            price_df[["EAN_key", "Einkaufspreis", "Verkaufspreis", "Lagermenge", "Bezeichnung", "Bezeichnung_anzeige", "Farbe", "Kategorie", "ArtikelNr"]],
+            price_df[["EAN_key", "Einkaufspreis", "Verkaufspreis", "Lagermenge", "Bezeichnung", "Farbe", "Kategorie", "ArtikelNr"]],
             on="EAN_key", how="left"
         )
         idx = merged.index[mask_need]
         tmp.index = idx
-        for col in ["Einkaufspreis", "Verkaufspreis", "Lagermenge", "Bezeichnung", "Bezeichnung_anzeige", "Farbe", "Kategorie", "ArtikelNr"]:
+        for col in ["Einkaufspreis", "Verkaufspreis", "Lagermenge", "Bezeichnung", "Farbe", "Kategorie", "ArtikelNr"]:
             merged.loc[idx, col] = merged.loc[idx, col].fillna(tmp[col])
 
     # Fallback via normalisierte Bezeichnung
@@ -310,8 +310,8 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> tuple[pd.
         for i, k in zip(idx, keys):
             if k in name_map.index:
                 row = name_map.loc[k]
-                for col in ["Einkaufspreis", "Verkaufspreis", "Lagermenge", "Bezeichnung", "Bezeichnung_anzeige", "Farbe", "Kategorie", "ArtikelNr"]:
-                    if pd.isna(merged.at[i, col]) or col in ("ArtikelNr", "Bezeichnung", "Bezeichnung_anzeige", "Kategorie", "Farbe"):
+                for col in ["Einkaufspreis", "Verkaufspreis", "Lagermenge", "Bezeichnung", "Farbe", "Kategorie", "ArtikelNr"]:
+                    if pd.isna(merged.at[i, col]) or col in ("ArtikelNr", "Bezeichnung", "Kategorie", "Farbe"):
                         merged.at[i, col] = row.get(col, merged.at[i, col])
 
     for pcol in ["Einkaufspreis", "Verkaufspreis"]:
@@ -319,25 +319,24 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> tuple[pd.
 
     merged["Kategorie"]   = merged["Kategorie"].fillna("")
     merged["Bezeichnung"] = merged["Bezeichnung"].fillna("")
-    merged["Bezeichnung_anzeige"] = merged.get("Bezeichnung_anzeige", merged["Bezeichnung"])
-    merged["Farbe"] = merged.get("Farbe", "")
+    merged["Farbe"] = merged.get("Farbe", "").fillna("")
 
-    # Wenn mehrere Zeilen die gleiche Bezeichnung haben, aber unterschiedliche ArtikelNr/EAN:
-    dup_mask = merged.duplicated(subset=["Bezeichnung"], keep=False)
-    merged.loc[dup_mask & (merged["Farbe"].astype(str).str.strip() != ""), "Bezeichnung_anzeige"] = (
-        merged.loc[dup_mask, "Bezeichnung"] + " – " + merged.loc[dup_mask, "Farbe"].astype(str)
+    # Sichtbarer Name: standardmäßig Bezeichnung
+    merged["Bezeichnung_anzeige"] = merged["Bezeichnung"]
+
+    # Nur bei Dubletten (gleiche Bezeichnung) Farbe anhängen – aber nur, wenn Farbe vorhanden UND sinnvoll
+    dup = merged.duplicated(subset=["Bezeichnung"], keep=False)
+    valid_color = merged["Farbe"].astype(str).str.strip().map(lambda t: (t != "") and (not _looks_like_not_a_color(t)))
+    merged.loc[dup & valid_color, "Bezeichnung_anzeige"] = (
+        merged.loc[dup & valid_color, "Bezeichnung"] + " – " + merged.loc[dup & valid_color, "Farbe"].astype(str).str.strip()
     )
-    # Wenn keine Farbe verfügbar, hänge ArtikelNr zur Unterscheidung an
-    merged.loc[dup_mask & (merged["Farbe"].astype(str).str.strip() == ""), "Bezeichnung_anzeige"] = (
-        merged.loc[dup_mask, "Bezeichnung"] + " – " + merged.loc[dup_mask, "ArtikelNr"].astype(str)
-    )
+    # Wichtig: KEIN Fallback mehr auf ArtikelNr oder "EU"!
 
     # Werte berechnen
     merged["Einkaufswert"] = (merged["Einkaufsmenge"].astype("Int64").fillna(0) * merged["Einkaufspreis"].fillna(0)).astype(float)
     merged["Verkaufswert"] = (merged["Verkaufsmenge"].astype("Int64").fillna(0) * merged["Verkaufspreis"].fillna(0)).astype(float)
     merged["Lagerwert"]    = (merged["Lagermenge"].astype("Int64").fillna(0)    * merged["Verkaufspreis"].fillna(0)).astype(float)
 
-    # Anzeige-Spalten (mit Bezeichnung_anzeige)
     display_cols = [
         "ArtikelNr", "Bezeichnung_anzeige", "Kategorie",
         "Einkaufsmenge", "Einkaufswert",
@@ -347,7 +346,6 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> tuple[pd.
     display_cols = [c for c in display_cols if c in merged.columns]
     detail = merged[display_cols].copy()
 
-    # Gruppierung: pro sichtbarem Produktnamen (mit Farbe) & Artikel
     totals = (
         detail.groupby(["ArtikelNr", "Bezeichnung_anzeige", "Kategorie"], dropna=False, as_index=False)
               .agg({
@@ -365,7 +363,7 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> tuple[pd.
 # UI
 # =========================
 st.title("📦 Galaxus Sell‑out Aggregator")
-st.caption("Summenansicht, robustes Matching (ArtNr → EAN → 1./2. Wort), KW‑Filter (EU‑Datum), Datenspeicherung. Detailtabelle optional.")
+st.caption("Summenansicht, robustes Matching (ArtNr → EAN → 1./2. Wort), EU‑Datumsfilter. Detailtabelle optional.")
 
 col1, col2 = st.columns(2)
 with col1:
@@ -391,7 +389,7 @@ if sell_file and price_file:
             sell_df  = prepare_sell_df(raw_sell)
             price_df = prepare_price_df(raw_price)
 
-        # — Zeitraumfilter —
+        # Zeitraumfilter (Start/Ende aus I/J)
         filtered_sell_df = sell_df
         if {"StartDatum", "EndDatum"}.issubset(sell_df.columns) and not sell_df["StartDatum"].isna().all():
             min_date = sell_df["StartDatum"].min().date()
@@ -413,14 +411,14 @@ if sell_file and price_file:
         with st.spinner("🔗 Matche & berechne Werte…"):
             detail, totals = enrich_and_merge(filtered_sell_df, price_df)
 
-        # Detailtabelle optional
+        # Detailtabelle standardmäßig ausblenden
         show_detail = st.checkbox("Detailtabelle anzeigen", value=False)
         if show_detail:
             st.subheader("Detailtabelle")
             d_rounded, d_styler = style_numeric(detail)
             st.dataframe(d_styler, use_container_width=True)
 
-        st.subheader("Summen pro Artikel (mit Farbe)")
+        st.subheader("Summen pro Artikel (Varianten mit Farbe bei Dubletten)")
         t_rounded, t_styler = style_numeric(totals)
         st.dataframe(t_styler, use_container_width=True)
 
