@@ -4,9 +4,9 @@
 # - Zahlformat (0 Nachkommastellen, ’ als Tausender)
 # - Detailtabelle standardmäßig ausgeblendet
 # - Varianten: Farbe NUR bei Dubletten an den Namen anhängen (kein EU/Art.-Nr.-Fallback)
-# - Bessere Farberkennung (Spaltenscan + Synonyme)
-# - Overflow-Fix: Berechnungen in float64
-# - NEU: Zusatz-Matching über "Kurzname" (1–2 Hauptwörter aus Bezeichnung) => ArtNr → EAN → Name → Kurzname
+# - Farberkennung (Spaltenscan + Synonyme)
+# - Matching-Reihenfolge: ArtNr → EAN → Name → Kurzname (1–2 Hauptwörter)
+# - Overflow-Fix: float64 + Sanity-Clean der Zahlen vor der Multiplikation
 
 import re
 import unicodedata
@@ -36,7 +36,7 @@ def _fmt_thousands(x, sep=THOUSANDS_SEP):
 
 def style_numeric(df: pd.DataFrame, num_cols=NUM_COLS_DEFAULT, sep=THOUSANDS_SEP):
     out = df.copy()
-    for c in (col for col in num_cols if col in out.columns):
+    for c in (col for col in num_cols if c in out.columns):
         out[c] = pd.to_numeric(out[c], errors="coerce").round(0).astype("Int64")
     fmt = {c: (lambda v, s=sep: _fmt_thousands(v, s)) for c in num_cols if c in out.columns}
     styler = out.style.format(fmt)
@@ -137,11 +137,22 @@ def parse_date_series_us(s: pd.Series) -> pd.Series:
     dt2 = pd.to_datetime(nums, origin="1899-12-30", unit="d", errors="coerce")
     return dt1.combine_first(dt2)
 
+# ===== Sanity-Clean vor Multiplikation =====
+MAX_QTY   = 1_000_000
+MAX_PRICE = 1_000_000
+
+def sanitize_numbers(qty: pd.Series, price: pd.Series) -> tuple[pd.Series, pd.Series]:
+    q = pd.to_numeric(qty, errors="coerce").astype("float64")
+    p = pd.to_numeric(price, errors="coerce").astype("float64")
+    q = q.where((q >= 0) & (q <= MAX_QTY))
+    p = p.where((p >= 0) & (p <= MAX_PRICE))
+    return q, p
+
 # ===== Farb-Logik (Heuristik + Vokabular) =====
 _COLOR_REGEXES = [
-    r"\(([^)]+)\)$",                # ... (Weiss)
-    r"[-–—]\s*([A-Za-zäöüÄÖÜß]+)$", # ... – White
-    r"/\s*([A-Za-zäöüÄÖÜß]+)$",     # ... / Black
+    r"\(([^)]+)\)$",
+    r"[-–—]\s*([A-Za-zäöüÄÖÜß]+)$",
+    r"/\s*([A-Za-zäöüÄÖÜß]+)$",
 ]
 def _looks_like_not_a_color(token: str) -> bool:
     t = (token or "").strip().lower()
@@ -153,7 +164,7 @@ def _looks_like_not_a_color(token: str) -> bool:
 
 _COLOR_MAP = {
     "weiss":"Weiss","weiß":"Weiss","white":"White","offwhite":"Off-White","cream":"Cream","ivory":"Ivory",
-    "schwarz":"Schwarz","black":"Black","jet black":"Black",
+    "schwarz":"Schwarz","black":"Black",
     "grau":"Grau","gray":"Grau","anthrazit":"Anthrazit","charcoal":"Anthrazit","graphite":"Graphit","silver":"Silber",
     "blau":"Blau","blue":"Blau","navy":"Dunkelblau","sky blue":"Hellblau","light blue":"Hellblau","dark blue":"Dunkelblau",
     "rot":"Rot","red":"Rot","bordeaux":"Bordeaux","burgundy":"Bordeaux","pink":"Pink","magenta":"Magenta",
@@ -177,7 +188,6 @@ def _canon_color_from_text(text: str) -> str:
     return ""
 
 def extract_color_from_name(name: str) -> str:
-    """Heuristik: Farbe am Ende der Bezeichnung (in Klammern, nach Strich, nach Slash) oder irgendwo im Text."""
     if not isinstance(name, str): return ""
     for rgx in _COLOR_REGEXES:
         m = re.search(rgx, name.strip())
@@ -186,14 +196,12 @@ def extract_color_from_name(name: str) -> str:
             if not _looks_like_not_a_color(cand):
                 canon = _canon_color_from_text(cand)
                 return canon or cand
-    # irgendwo im Text
     canon = _canon_color_from_text(name)
     if canon and not _looks_like_not_a_color(canon):
         return canon
     return ""
 
 def guess_color_from_row(row: pd.Series, all_columns: list[str]) -> str:
-    """Durchsucht mehrere Textspalten (Bezeichnung, Kategorie, Zusatz, etc.) nach Farbworten."""
     for col in all_columns:
         if re.search(r"(farb|color|colour|varian)", col, re.IGNORECASE):
             val = row.get(col, "")
@@ -214,18 +222,18 @@ def guess_color_from_row(row: pd.Series, all_columns: list[str]) -> str:
             candidates.append(c)
     return candidates[0] if candidates else ""
 
-# ===== Kurzname (1–2 Hauptwörter) für robustes Matching =====
+# ===== Kurzname (1–2 Hauptwörter) =====
 _STOP_TOKENS = {"eu","ch","us","uk","mobile","little"}
 def _make_short_key(name: str) -> str:
     if not isinstance(name, str): return ""
     s = name.lower()
-    s = re.sub(r"\([^)]*\)", " ", s)          # Klammerninhalt weg
-    s = re.sub(r"\b[o0]-\d+\b", " ", s)       # Codes wie O-009
-    s = re.sub(r"\b\d+([.,]\d+)?\s*(ml|db|m²|m2)\b", " ", s)  # Einheiten
+    s = re.sub(r"\([^)]*\)", " ", s)
+    s = re.sub(r"\b[o0]-\d+\b", " ", s)
+    s = re.sub(r"\b\d+([.,]\d+)?\s*(ml|db|m²|m2)\b", " ", s)
     s = re.sub(r"[^a-z0-9]+", " ", s)
     toks = [t for t in s.split() if t and t not in _STOP_TOKENS]
     if not toks: return ""
-    return "".join(toks[:2])  # 1–2 Tokens zusammengezogen (normalized)
+    return "".join(toks[:2])
 
 # =========================
 # Parsing – Preislisten
@@ -268,7 +276,6 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     out["Kurz_key"]        = out["Bezeichnung"].map(_make_short_key)
     out["Kategorie"]       = df[col_cat].astype(str) if col_cat else ""
 
-    # Farbe
     if col_color:
         out["Farbe"] = df[col_color].astype(str).map(lambda x: _canon_color_from_text(str(x)) or str(x))
     else:
@@ -281,7 +288,6 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
             )
     out["Farbe"] = out["Farbe"].fillna("").astype(str)
 
-    # Lager & Preise
     out["Lagermenge"] = (parse_number_series(df[col_stock]).fillna(0).astype("Int64")
                          if col_stock else pd.Series([0]*len(df), dtype="Int64"))
     if col_buy:
@@ -351,7 +357,7 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
 # Merge & Berechnung
 # =========================
 def _f64(s: pd.Series) -> pd.Series:
-    """Sicher zu float64 konvertieren (gegen Integer-Overflow)."""
+    """Sicher zu float64 konvertieren."""
     return pd.to_numeric(s, errors="coerce").astype("float64")
 
 @st.cache_data(show_spinner=False)
@@ -370,17 +376,15 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> tuple[pd.
             price_df[["EAN_key", "Einkaufspreis", "Verkaufspreis", "Lagermenge", "Bezeichnung", "Kurz_key", "Farbe", "Kategorie", "ArtikelNr"]],
             on="EAN_key", how="left"
         )
-        idx = merged.index[mask_need]
-        tmp.index = idx
+        idx = merged.index[mask_need]; tmp.index = idx
         for col in ["Einkaufspreis", "Verkaufspreis", "Lagermenge", "Bezeichnung", "Kurz_key", "Farbe", "Kategorie", "ArtikelNr"]:
             merged.loc[idx, col] = merged.loc[idx, col].fillna(tmp[col])
 
-    # 2) Fallback via ganze Bezeichnung (normalisiert)
+    # 2) Fallback via Name
     mask_need = merged["Verkaufspreis"].isna()
     if mask_need.any():
         name_map = price_df.drop_duplicates("Bezeichnung_key").set_index("Bezeichnung_key")
-        idx = merged.index[mask_need]
-        keys = merged.loc[idx, "Bezeichnung_key"]
+        idx = merged.index[mask_need]; keys = merged.loc[idx, "Bezeichnung_key"]
         for i, k in zip(idx, keys):
             if k in name_map.index:
                 row = name_map.loc[k]
@@ -388,12 +392,11 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> tuple[pd.
                     if pd.isna(merged.at[i, col]) or col in ("ArtikelNr", "Bezeichnung", "Kurz_key", "Kategorie", "Farbe"):
                         merged.at[i, col] = row.get(col, merged.at[i, col])
 
-    # 3) NEU: Fallback via Kurzname (1–2 Hauptwörter)
+    # 3) Fallback via Kurzname
     mask_need = merged["Verkaufspreis"].isna()
     if mask_need.any():
         kmap = price_df.drop_duplicates("Kurz_key").set_index("Kurz_key")
-        idx = merged.index[mask_need]
-        keys = merged.loc[idx, "Kurz_key"]
+        idx = merged.index[mask_need]; keys = merged.loc[idx, "Kurz_key"]
         for i, k in zip(idx, keys):
             if k and k in kmap.index:
                 row = kmap.loc[k]
@@ -401,33 +404,32 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> tuple[pd.
                     if pd.isna(merged.at[i, col]) or col in ("ArtikelNr", "Bezeichnung", "Kurz_key", "Kategorie", "Farbe"):
                         merged.at[i, col] = row.get(col, merged.at[i, col])
 
-    # numerisch säubern
+    # Strings auffüllen
     merged["Kategorie"]   = merged["Kategorie"].fillna("")
     merged["Bezeichnung"] = merged["Bezeichnung"].fillna("")
     merged["Farbe"]       = merged.get("Farbe", "").fillna("")
-
-    # sichtbarer Name
     merged["Bezeichnung_anzeige"] = merged["Bezeichnung"]
 
-    # Farbe NUR bei Dubletten anfügen
+    # Farbe NUR bei Dubletten anhängen
     dup = merged.duplicated(subset=["Bezeichnung"], keep=False)
     valid_color = merged["Farbe"].astype(str).str.strip().map(lambda t: (t != "") and (not _looks_like_not_a_color(t)))
     merged.loc[dup & valid_color, "Bezeichnung_anzeige"] = (
         merged.loc[dup & valid_color, "Bezeichnung"] + " – " + merged.loc[dup & valid_color, "Farbe"].astype(str).str.strip()
     )
 
-    # Float64-Berechnungen
-    qty_buy   = _f64(merged["Einkaufsmenge"]).fillna(0.0)
-    qty_sell  = _f64(merged["Verkaufsmenge"]).fillna(0.0)
-    qty_stock = _f64(merged["Lagermenge"]).fillna(0.0)
-    pr_buy    = _f64(merged["Einkaufspreis"]).fillna(0.0)
-    pr_sell   = _f64(merged["Verkaufspreis"]).fillna(0.0)
-    pr_buy  = pr_buy.mask(pr_buy.abs()  > 1e6, np.nan).fillna(0.0)
-    pr_sell = pr_sell.mask(pr_sell.abs() > 1e6, np.nan).fillna(0.0)
+    # ===== sichere Berechnung: Clean + float64 =====
+    qty_buy,  pr_buy  = sanitize_numbers(merged["Einkaufsmenge"], merged["Einkaufspreis"])
+    qty_sell, pr_sell = sanitize_numbers(merged["Verkaufsmenge"], merged["Verkaufspreis"])
+    qty_stock, _      = sanitize_numbers(merged["Lagermenge"], merged["Verkaufspreis"])
 
-    merged["Einkaufswert"] = qty_buy   * pr_buy
-    merged["Verkaufswert"] = qty_sell  * pr_sell
-    merged["Lagerwert"]    = qty_stock * pr_sell
+    qty_buy   = qty_buy.fillna(0.0);  pr_buy  = pr_buy.fillna(0.0)
+    qty_sell  = qty_sell.fillna(0.0); pr_sell = pr_sell.fillna(0.0)
+    qty_stock = qty_stock.fillna(0.0)
+
+    with np.errstate(over='ignore', invalid='ignore'):
+        merged["Einkaufswert"] = (qty_buy   * pr_buy).astype("float64")
+        merged["Verkaufswert"] = (qty_sell  * pr_sell).astype("float64")
+        merged["Lagerwert"]    = (qty_stock * pr_sell).astype("float64")
 
     display_cols = [
         "ArtikelNr", "Bezeichnung_anzeige", "Kategorie",
