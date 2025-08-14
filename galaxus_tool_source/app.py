@@ -1,12 +1,13 @@
-# app.py — Galaxus Sell‑out Aggregator (robustes Matching + EU‑Datumsfilter mit Button)
+# app.py — Galaxus Sellout Analyse (robustes Matching + EU‑Datumsfilter + Charts)
 
 import re
 import unicodedata
 import numpy as np
 import pandas as pd
 import streamlit as st
+import altair as alt
 
-st.set_page_config(page_title="Galaxus Sell‑out Aggregator", layout="wide")
+st.set_page_config(page_title="Galaxus Sellout Analyse", layout="wide")
 
 # =========================
 # Anzeige-Helfer
@@ -357,7 +358,10 @@ def _final_backstops(merged: pd.DataFrame, price_df: pd.DataFrame):
             _assign_from_price_row(merged,i, price_df.loc[idx]); continue
 
 @st.cache_data(show_spinner=False)
-def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> tuple[pd.DataFrame,pd.DataFrame]:
+def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame):
+    """Gibt (detail, totals, ts_source) zurück.
+       ts_source enthält Datumsfelder zur Chart-Erzeugung.
+    """
     merged = sell_df.merge(price_df, on=["ArtikelNr_key"], how="left", suffixes=("", "_pl"))
 
     need = merged["Verkaufspreis"].isna() & merged["EAN_key"].astype(bool)
@@ -403,17 +407,25 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> tuple[pd.
         merged["Verkaufswert"] = (q_sell*p_sell).astype("float64")
         merged["Lagerwert"]    = (q_stock*p_sell).astype("float64")
 
+    # Für Tabellen
     display_cols = [c for c in ["ArtikelNr","Bezeichnung_anzeige","Kategorie","Einkaufsmenge","Einkaufswert","Verkaufsmenge","Verkaufswert","Lagermenge","Lagerwert"] if c in merged.columns]
     detail = merged[display_cols].copy()
     totals = (detail.groupby(["ArtikelNr","Bezeichnung_anzeige","Kategorie"], dropna=False, as_index=False)
                    .agg({"Einkaufsmenge":"sum","Einkaufswert":"sum","Verkaufsmenge":"sum","Verkaufswert":"sum","Lagermenge":"sum","Lagerwert":"sum"}))
-    return detail, totals
+
+    # Quelle für Zeitreihen-Charts
+    ts_source = merged[[
+        c for c in ["StartDatum","EndDatum","Kategorie","Verkaufsmenge","Einkaufsmenge","Verkaufswert","Einkaufswert"]
+        if c in merged.columns
+    ]].copy()
+
+    return detail, totals, ts_source
 
 # =========================
 # UI
 # =========================
-st.title("📦 Galaxus Sell‑out Aggregator")
-st.caption("Summenansicht, robustes Matching (ArtNr → EAN → Name → Familie → Hints → Fuzzy), EU‑Datumsfilter. Detailtabelle optional.")
+st.title("📊 Galaxus Sellout Analyse")
+st.caption("Summenansicht, robustes Matching (ArtNr → EAN → Name → Familie → Hints → Fuzzy), EU‑Datumsfilter. Detailtabelle optional. Grafiken pro Kategorie.")
 
 c1,c2 = st.columns(2)
 with c1:
@@ -478,8 +490,56 @@ if sell_file and price_file:
         # =========================================================================
 
         with st.spinner("🔗 Matche & berechne Werte…"):
-            detail, totals = enrich_and_merge(filtered_sell_df, price_df)
+            detail, totals, ts_source = enrich_and_merge(filtered_sell_df, price_df)
 
+        # =============== Grafiken – Verlauf pro Kategorie ===============
+        st.markdown("### Verlauf Verkäufe & Einkäufe")
+        if not ts_source.empty and "StartDatum" in ts_source:
+            # Zeitauflösung
+            agg_freq = st.selectbox("Aggregation", ["Woche","Monat"], index=0, help="Zeitauflösung der Kurve")
+            if agg_freq == "Woche":
+                ts_source["Periode"] = ts_source["StartDatum"].dt.to_period("W").dt.start_time
+            else:
+                ts_source["Periode"] = ts_source["StartDatum"].dt.to_period("M").dt.start_time
+
+            # Kategorien-Auswahl
+            cats = sorted([c for c in ts_source["Kategorie"].dropna().unique() if str(c).strip()!=""])
+            sel_cats = st.multiselect("Kategorien auswählen", cats, default=cats)
+
+            # Aggregation
+            ts = (ts_source.loc[ts_source["Kategorie"].isin(sel_cats)]
+                          .groupby(["Kategorie","Periode"], as_index=False)
+                          .agg({"Verkaufsmenge":"sum","Einkaufsmenge":"sum","Verkaufswert":"sum","Einkaufswert":"sum"}))
+
+            # Umschalten Menge/Wert
+            mode = st.radio("Anzeigen als", ["Mengen","Werte"], horizontal=True)
+
+            def _chart(df_cat: pd.DataFrame, title: str):
+                if mode == "Mengen":
+                    plot_df = df_cat.melt(id_vars=["Periode"], value_vars=["Verkaufsmenge","Einkaufsmenge"],
+                                          var_name="Typ", value_name="Wert")
+                else:
+                    plot_df = df_cat.melt(id_vars=["Periode"], value_vars=["Verkaufswert","Einkaufswert"],
+                                          var_name="Typ", value_name="Wert")
+                chart = (alt.Chart(plot_df)
+                           .mark_line(point=True)
+                           .encode(
+                               x=alt.X("Periode:T", title="Periode"),
+                               y=alt.Y("Wert:Q", title="{} pro Periode".format("Mengen" if mode=="Mengen" else "Werte")),
+                               color=alt.Color("Typ:N", title=""),
+                               tooltip=[alt.Tooltip("Periode:T","Periode"), alt.Tooltip("Typ:N",""), alt.Tooltip("Wert:Q","Wert")]
+                           ).properties(height=280, title=title))
+                st.altair_chart(chart, use_container_width=True)
+
+            # Ein Chart pro Kategorie (Small Multiples)
+            for k in sel_cats:
+                dfk = ts.loc[ts["Kategorie"]==k].sort_values("Periode")
+                if not dfk.empty:
+                    _chart(dfk[["Periode","Verkaufsmenge","Einkaufsmenge","Verkaufswert","Einkaufswert"]].copy(), f"{k}")
+        else:
+            st.info("Für die Grafiken werden gültige Datumsangaben (Startdatum) benötigt.")
+
+        # =============== Tabellen ===============
         show_detail = st.checkbox("Detailtabelle anzeigen", value=False)
         if show_detail:
             st.subheader("Detailtabelle")
