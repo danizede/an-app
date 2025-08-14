@@ -31,7 +31,6 @@ def _fmt_thousands(x, sep=THOUSANDS_SEP):
 
 def style_numeric(df: pd.DataFrame, num_cols=NUM_COLS_DEFAULT, sep=THOUSANDS_SEP):
     out = df.copy()
-    # FIX: kein Scope-Fehler; keine freie Variable in Comprehensions
     for c in [col for col in num_cols if col in out.columns]:
         out[c] = pd.to_numeric(out[c], errors="coerce").round(0).astype("Int64")
     def _fmt_func(v, s=sep):
@@ -147,14 +146,14 @@ def sanitize_numbers(qty: pd.Series, price: pd.Series) -> tuple[pd.Series, pd.Se
 # =========================
 _COLOR_MAP = {
     "weiss":"Weiss","weiß":"Weiss","white":"White","offwhite":"Off-White","cream":"Cream","ivory":"Ivory",
-    "schwarz":"Schwarz","black":"Black","graphite":"Graphit","gray":"Grau","grau":"Grau",
-    "anthrazit":"Anthrazit","charcoal":"Anthrazit","silver":"Silber",
+    "schwarz":"Schwarz","black":"Black",
+    "grau":"Grau","gray":"Grau","anthrazit":"Anthrazit","charcoal":"Anthrazit","graphite":"Graphit","silver":"Silber",
     "blau":"Blau","blue":"Blau","navy":"Dunkelblau","light blue":"Hellblau","dark blue":"Dunkelblau","sky blue":"Hellblau",
     "rot":"Rot","red":"Rot","bordeaux":"Bordeaux","burgundy":"Bordeaux","pink":"Pink","magenta":"Magenta",
     "lila":"Lila","violett":"Violett","purple":"Violett","fuchsia":"Fuchsia",
     "grün":"Grün","gruen":"Grün","green":"Grün","mint":"Mint","türkis":"Türkis","tuerkis":"Türkis","turquoise":"Türkis",
-    "petrol":"Petrol","olive":"Olivgrün","gelb":"Gelb","yellow":"Gelb","orange":"Orange",
-    "braun":"Braun","brown":"Braun","beige":"Beige","sand":"Sand",
+    "petrol":"Petrol","olive":"Olivgrün",
+    "gelb":"Gelb","yellow":"Gelb","orange":"Orange","braun":"Braun","brown":"Braun","beige":"Beige","sand":"Sand",
     "gold":"Gold","rose gold":"Roségold","rosegold":"Roségold","kupfer":"Kupfer","copper":"Kupfer","bronze":"Bronze",
     "transparent":"Transparent","clear":"Transparent",
 }
@@ -220,8 +219,8 @@ BUY_PRICE_CANDIDATES  = ["Einkaufspreis","Einkauf"]
 SELL_PRICE_CANDIDATES = ["Verkaufspreis","VK","Preis"]
 
 ARTNR_CANDIDATES = [
-    "Artikelnummer","Artikelnr","ArtikelNr","Artikel-Nr.",
-    "Hersteller-Nr.","Produkt ID","ProdNr","ArtNr","ArtikelNr.","Artikel"
+    "Artikelnummer","Artikelnr","ArtikelNr","Artikel-Nr.","Hersteller-Nr.","Produkt ID",
+    "ProdNr","ArtNr","ArtikelNr.","Artikel"
 ]
 EAN_CANDIDATES  = ["EAN","GTIN","BarCode","Barcode"]
 NAME_CANDIDATES_PL = ["Bezeichnung","Produktname","Name","Titel","Artikelname"]
@@ -253,6 +252,7 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     out["Kurz_key"]        = out["Bezeichnung"].map(_make_short_key)
     out["Kategorie"]       = df[col_cat].astype(str) if col_cat else ""
 
+    # Farbe
     if col_color:
         out["Farbe"] = df[col_color].astype(str).map(lambda v: _canon_color_from_text(str(v)) or str(v))
     else:
@@ -266,6 +266,7 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
             )
     out["Farbe"] = out["Farbe"].fillna("").astype(str)
 
+    # Lager & Preise
     out["Lagermenge"] = (parse_number_series(df[col_stock]).fillna(0).astype("Int64")
                          if col_stock else pd.Series([0]*len(df), dtype="Int64"))
     if col_buy:
@@ -280,6 +281,12 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
         out["Einkaufspreis"] = out.get("Verkaufspreis", pd.Series([np.nan]*len(out)))
     if "Verkaufspreis" not in out:
         out["Verkaufspreis"] = out.get("Einkaufspreis", pd.Series([np.nan]*len(out)))
+
+    # NEU: Doppelzeilen (gleiche ArtikelNr) entfernen – behalte Variante mit Preis (falls vorhanden)
+    out = out.assign(_have_price=out["Verkaufspreis"].notna())
+    out = out.sort_values(["ArtikelNr_key", "_have_price"], ascending=[True, False])
+    out = out.drop_duplicates(subset=["ArtikelNr_key"], keep="first").drop(columns=["_have_price"])
+
     return out
 
 # =========================
@@ -291,39 +298,24 @@ BUY_QTY_CANDIDATES   = ["Einkauf","Einkaufsmenge","Menge Einkauf"]
 DATE_START_CANDS     = ["Start","Startdatum","Start Date","Anfangs datum","Anfangsdatum","Von","Period Start"]
 DATE_END_CANDS       = ["Ende","Enddatum","End Date","Bis","Period End"]
 
-def _fallback_col_by_index(df: pd.DataFrame, idx0: int) -> str | None:
-    try:
-        return df.columns[idx0]
-    except Exception:
-        return None
-
 def _apply_hints_to_row(name_raw: str) -> dict:
-    """
-    Deine Regeln, um Varianten zuverlässig auf einen Preislisteintrag abzubilden.
-    Rückgabe-Kandidaten:
-      - hint_artnr_exact: exakte ArtikelNr (z.B. 's054')
-      - hint_artnr_prefix: ArtikelNr-Präfix (z.B. 'o013' → 'O-013*')
-      - hint_kurz: Familienname/Kurzname für Gruppensuche
-      - hint_color: gewünschte Farbe (bevorzugte Variante)
-    """
     s = (name_raw or "").lower()
     h = {"hint_kurz":"", "hint_color":"", "hint_artnr_exact":"", "hint_artnr_prefix":""}
 
-    # Sonderfälle/Familien laut Vorgabe:
-    # Tim schwarz = Tim weiss Preis
+    # Tim schwarz → Preis von Tim weiss
     if "tim" in s and "schwarz" in s:
         h["hint_kurz"]  = "tim"
         h["hint_color"] = "weiss"
 
-    # Finn, Finn mobile, Theo, Robert, Peter, Julia, Albert – per Namen matchen
+    # Finn, Finn mobile, Theo, Robert, Peter, Julia, Albert per Kurzname
     for fam in ["finn", "theo", "robert", "peter", "julia", "albert"]:
         if fam in s:
             h["hint_kurz"] = fam
     if "finn mobile" in s:
         h["hint_kurz"] = "finn"
 
-    # Roger/Peter/Robert: auf Roger (schwarz) normalisieren
-    if any(x in s for x in ["roger", "peter", "robert"]):
+    # Roger: falls nur Roger – bleib bei Roger
+    if "roger" in s:
         h["hint_kurz"]  = "roger"
         h["hint_color"] = h["hint_color"] or "schwarz"
 
@@ -331,7 +323,7 @@ def _apply_hints_to_row(name_raw: str) -> dict:
     if "oskar" in s and "little" in s:
         h["hint_artnr_prefix"] = "o061"
 
-    # Mia Gold → gleicher Preis wie Schwarz
+    # Mia Gold → Preis wie Schwarze Variante
     if "mia" in s and "gold" in s:
         h["hint_kurz"]  = "mia"
         h["hint_color"] = "schwarz"
@@ -340,13 +332,25 @@ def _apply_hints_to_row(name_raw: str) -> dict:
     if "simon" in s: h["hint_artnr_exact"] = "s054"
     if "otto"  in s: h["hint_artnr_prefix"] = "o013"
 
-    # Charly little zusammenführen (selber Artikel)
+    # Charly little zusammenführen
     if "charly" in s:
         h["hint_kurz"] = "charly"
 
-    # Duftöle: alle gleicher Netto-Netto (familienweit)
+    # Duftöle: alle gleicher Netto-Netto
     if ("duftöl" in s) or ("duftoel" in s) or ("duft oil" in s):
-        h["hint_kurz"] = "duftol"  # vereinheitlichter Kurzkey
+        h["hint_kurz"] = "duftol"
+
+    # Eva E-008 → Preis wie E-009
+    if "eva" in s and "e-008" in s:
+        h["hint_artnr_exact"] = "e009"
+
+    # Julia J-031 → Preis wie J-030
+    if "julia" in s and "j-031" in s:
+        h["hint_artnr_exact"] = "j030"
+
+    # Mia M-057 → Preis wie M-051
+    if "mia" in s and "m-057" in s:
+        h["hint_artnr_exact"] = "m051"
 
     return h
 
@@ -360,8 +364,10 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
 
     col_start = find_column(df, DATE_START_CANDS, "Startdatum (Spalte I)", required=False)
     col_end   = find_column(df, DATE_END_CANDS,   "Enddatum (Spalte J)",   required=False)
-    if not col_start and df.shape[1] >= 9:  col_start = _fallback_col_by_index(df, 8)
-    if not col_end   and df.shape[1] >= 10: col_end   = _fallback_col_by_index(df, 9)
+    if not col_start and df.shape[1] >= 9:
+        col_start = _fallback_col_by_index(df, 8)
+    if not col_end and df.shape[1] >= 10:
+        col_end = _fallback_col_by_index(df, 9)
 
     out = pd.DataFrame()
     out["ArtikelNr"]     = df[col_art].astype(str) if col_art else ""
@@ -369,7 +375,7 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
     out["EAN"]           = df[col_ean].astype(str) if col_ean else ""
     out["EAN_key"]       = out["EAN"].map(lambda x: re.sub(r"[^0-9]+", "", str(x)))
     out["Bezeichnung"]   = df[col_name].astype(str) if col_name else ""
-    out["Bezeichnung_key"]=out["Bezeichnung"].map(normalize_key)
+    out["Bezeichnung_key"]= out["Bezeichnung"].map(normalize_key)
     out["Kurz_key"]      = out["Bezeichnung"].map(_make_short_key)
 
     # Hints je Zeile
@@ -383,8 +389,10 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
     out["Einkaufsmenge"] = (parse_number_series(df[col_buy]).fillna(0).astype("Int64")
                             if col_buy else pd.Series([0]*len(df), dtype="Int64"))
 
-    if col_start: out["StartDatum"] = parse_date_series_us(df[col_start])
-    if col_end:   out["EndDatum"]   = parse_date_series_us(df[col_end])
+    if col_start:
+        out["StartDatum"] = parse_date_series_us(df[col_start])
+    if col_end:
+        out["EndDatum"]   = parse_date_series_us(df[col_end])
     if "StartDatum" in out and "EndDatum" in out:
         mask = out["EndDatum"].isna()
         out.loc[mask, "EndDatum"] = out.loc[mask, "StartDatum"]
@@ -399,18 +407,19 @@ def _assign_from_price_row(merged: pd.DataFrame, i, row: pd.Series):
 
 def _match_with_hints(merged: pd.DataFrame, price_df: pd.DataFrame):
     need = merged["Verkaufspreis"].isna()
-    if not need.any(): return
+    if not need.any():
+        return
 
     idxs = merged.index[need]
     price_by_kurz = price_df.groupby("Kurz_key")
 
     for i in idxs:
-        hint_artnr = str(merged.at[i,"Hint_ArtNr"] or "")
-        hint_pref  = str(merged.at[i,"Hint_ArtNr_Pre"] or "")
-        hint_kurz  = (merged.at[i,"Hint_Kurz"] or "").strip()
-        hint_color = (merged.at[i,"Hint_Color"] or "").strip()
+        hint_artnr = str(merged.at[i, "Hint_ArtNr"] or "")
+        hint_pref  = str(merged.at[i, "Hint_ArtNr_Pre"] or "")
+        hint_kurz  = (merged.at[i, "Hint_Kurz"] or "").strip()
+        hint_color = (merged.at[i, "Hint_Color"] or "").strip()
 
-        # 1) Exakte ArtNr
+        # 1) Exakte ArtikelNr
         if hint_artnr:
             ak = normalize_key(hint_artnr)
             hit = price_df.loc[price_df["ArtikelNr_key"] == ak]
@@ -418,7 +427,7 @@ def _match_with_hints(merged: pd.DataFrame, price_df: pd.DataFrame):
                 _assign_from_price_row(merged, i, hit.iloc[0])
                 continue
 
-        # 2) Präfix ArtNr
+        # 2) Präfix ArtikelNr
         if hint_pref:
             pref = hint_pref.lower()
             hit = price_df.loc[price_df["ArtikelNr_key"].str.startswith(pref, na=False)]
@@ -434,11 +443,11 @@ def _match_with_hints(merged: pd.DataFrame, price_df: pd.DataFrame):
         if hint_kurz:
             grp = price_by_kurz.get_group(hint_kurz) if hint_kurz in price_by_kurz.groups else pd.DataFrame()
             if not grp.empty:
-                # Duftöle: alle gleicher Netto – nimm erste Zeile
-                if hint_kurz in {"duftol"}:
+                # Duftöle: gleicher Netto – nimm erste Zeile
+                if hint_kurz == "duftol":
                     _assign_from_price_row(merged, i, grp.iloc[0])
                     continue
-                # Sonst Farbe bevorzugen
+                # Bevorzugte Farbe
                 if hint_color:
                     g2 = grp.loc[grp["Farbe"].str.lower() == hint_color.lower()]
                     if not g2.empty:
@@ -450,7 +459,7 @@ def _match_with_hints(merged: pd.DataFrame, price_df: pd.DataFrame):
 def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     merged = sell_df.merge(price_df, on=["ArtikelNr_key"], how="left", suffixes=("", "_pl"))
 
-    # 1) EAN-Fallback
+    # 1) Fallback via EAN
     need = merged["Verkaufspreis"].isna() & merged["EAN_key"].astype(bool)
     if need.any():
         tmp = merged.loc[need, ["EAN_key"]].merge(
@@ -477,7 +486,7 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> tuple[pd.
             if k and k in short_map.index:
                 _assign_from_price_row(merged, i, short_map.loc[k])
 
-    # 4) Deine Hints
+    # 4) Deine Hints (Sonderregeln)
     _match_with_hints(merged, price_df)
 
     # Strings + Anzeige
@@ -497,18 +506,20 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> tuple[pd.
     qty_buy,  pr_buy  = sanitize_numbers(merged["Einkaufsmenge"], merged["Einkaufspreis"])
     qty_sell, pr_sell = sanitize_numbers(merged["Verkaufsmenge"], merged["Verkaufspreis"])
     qty_stock, _      = sanitize_numbers(merged["Lagermenge"], merged["Verkaufspreis"])
-    qty_buy = qty_buy.fillna(0.0);  pr_buy  = pr_buy.fillna(0.0)
-    qty_sell= qty_sell.fillna(0.0); pr_sell = pr_sell.fillna(0.0)
-    qty_stock=qty_stock.fillna(0.0)
+    qty_buy   = qty_buy.fillna(0.0); pr_buy  = pr_buy.fillna(0.0)
+    qty_sell  = qty_sell.fillna(0.0); pr_sell = pr_sell.fillna(0.0)
+    qty_stock = qty_stock.fillna(0.0)
 
     with np.errstate(over='ignore', invalid='ignore'):
-        merged["Einkaufswert"] = (qty_buy   * pr_buy).astype("float64")
+        merged["Einkaufswert"] = (qty_buy   * pr_buy ).astype("float64")
         merged["Verkaufswert"] = (qty_sell  * pr_sell).astype("float64")
         merged["Lagerwert"]    = (qty_stock * pr_sell).astype("float64")
 
     display_cols = [
         "ArtikelNr", "Bezeichnung_anzeige", "Kategorie",
-        "Einkaufsmenge","Einkaufswert","Verkaufsmenge","Verkaufswert","Lagermenge","Lagerwert"
+        "Einkaufsmenge", "Einkaufswert",
+        "Verkaufsmenge", "Verkaufswert",
+        "Lagermenge", "Lagerwert"
     ]
     display_cols = [c for c in display_cols if c in merged.columns]
     detail = merged[display_cols].copy()
@@ -560,11 +571,17 @@ if sell_file and price_file:
         filtered_sell_df = sell_df
         if {"StartDatum", "EndDatum"}.issubset(sell_df.columns) and not sell_df["StartDatum"].isna().all():
             min_date = sell_df["StartDatum"].min().date()
-            max_date = (sell_df["EndDatum"].dropna().max() if "EndDatum" in sell_df else sell_df["StartDatum"].max()).date()
+            max_date = (sell_df["EndDatum"].dropna().max()
+                        if "EndDatum" in sell_df
+                        else sell_df["StartDatum"].max()).date()
 
             st.subheader("Periode wählen")
-            date_value = st.date_input("Zeitraum (DD.MM.YYYY)", value=(min_date, max_date),
-                                       min_value=min_date, max_value=max_date)
+            date_value = st.date_input(
+                "Zeitraum (DD.MM.YYYY)",
+                value=(min_date, max_date),
+                min_value=min_date,
+                max_value=max_date,
+            )
             if isinstance(date_value, tuple):
                 start_date, end_date = date_value
             else:
@@ -579,7 +596,6 @@ if sell_file and price_file:
         with st.spinner("🔗 Matche & berechne Werte…"):
             detail, totals = enrich_and_merge(filtered_sell_df, price_df)
 
-        # Detailtabelle optional
         show_detail = st.checkbox("Detailtabelle anzeigen", value=False)
         if show_detail:
             st.subheader("Detailtabelle")
@@ -597,7 +613,7 @@ if sell_file and price_file:
                 data=(detail if show_detail else pd.DataFrame()).to_csv(index=False).encode("utf-8"),
                 file_name="detail.csv",
                 mime="text/csv",
-                disabled=not show_detail
+                disabled=not show_detail,
             )
         with c2:
             st.download_button(
