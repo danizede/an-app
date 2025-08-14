@@ -1,7 +1,7 @@
 # app.py — Galaxus Sellout Analyse (Wochenbasis)
 # Robustes Matching (ArtNr → EAN → Name → Familie → Hints → Fuzzy),
 # EU‑Datumsfilter, Detailtabelle optional, Summen pro Artikel,
-# Interaktives Linienchart (wochenweise, Klick‑Highlight, Labels).
+# Interaktives Linienchart (wochenweise, Hover‑Highlight, Labels).
 
 import re
 import unicodedata
@@ -12,7 +12,7 @@ import altair as alt
 
 st.set_page_config(page_title="Galaxus Sellout Analyse", layout="wide")
 
-# Altair: große Datensätze zulassen
+# Altair: große Datensätze zulassen (robust)
 try:
     alt.data_transformers.disable_max_rows()
 except Exception:
@@ -221,7 +221,7 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     if "Einkaufspreis" not in out: out["Einkaufspreis"]=out.get("Verkaufspreis", pd.Series([np.nan]*len(out)))
     if "Verkaufspreis" not in out: out["Verkaufspreis"]=out.get("Einkaufspreis", pd.Series([np.nan]*len(out)))
 
-    # Dedupliziere nach ArtikelNr_key
+    # Dedupliziere nach ArtikelNr_key (bevorzuge mit Preis)
     out = out.assign(_have=out["Verkaufspreis"].notna()).sort_values(["ArtikelNr_key","_have"], ascending=[True,False])
     out = out.drop_duplicates(subset=["ArtikelNr_key"], keep="first").drop(columns=["_have"])
     return out
@@ -235,7 +235,7 @@ BUY_QTY_CANDIDATES   = ["Einkauf","Einkaufsmenge","Menge Einkauf"]
 DATE_START_CANDS     = ["Start","Startdatum","Start Date","Anfangs datum","Anfangsdatum","Von","Period Start"]
 DATE_END_CANDS       = ["Ende","Enddatum","End Date","Bis","Period End"]
 
-# Äquivalenzen / Regeln
+# Einfache Äquivalenzen / Regeln
 ART_EXACT_EQUIV  = {"e008":"e009","j031":"j030","m057":"m051","s054":"s054"}
 ART_PREFIX_EQUIV = {"o061":"o061","o013":"o013"}
 
@@ -391,7 +391,7 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame):
         for i,f in zip(merged.index[need], merged.loc[need,"Familie"]):
             if f and f in fam_map.index: _assign_from_price_row(merged,i, fam_map.loc[f])
 
-    # Backstops
+    # Backstops (Äquivalenzen, Familie, Fuzzy)
     _final_backstops(merged, price_df)
 
     # Strings & Anzeige
@@ -504,7 +504,7 @@ if sell_file and price_file:
         with st.spinner("🔗 Matche & berechne Werte…"):
             detail, totals, ts_source = enrich_and_merge(filtered_sell_df, price_df)
 
-        # =============== INTERAKTIVES LINIEN-CHART – Wochensummen ===============
+        # =============== INTERAKTIVES LINIEN-CHART – Wochenbasis ===============
         st.markdown("### 📈 Verkaufsverlauf nach Kategorie (Woche)")
 
         if not ts_source.empty:
@@ -526,7 +526,7 @@ if sell_file and price_file:
             if sel_cats:
                 ts = ts[ts["Kategorie"].isin(sel_cats)]
 
-            # Dropdowns Start-/Endmonat (wirken vor der Aggregation, obwohl Wochenbuckets)
+            # Dropdowns Start-/Endmonat (wirken vor Aggregation; optional)
             all_months = sorted(ts["StartDatum"].dt.to_period("M").astype(str).unique())
             if all_months:
                 if "month_range" not in st.session_state:
@@ -560,51 +560,43 @@ if sell_file and price_file:
             ts_agg["Kategorie"] = ts_agg["Kategorie"].astype(str)
             ts_agg["Wert"]      = pd.to_numeric(ts_agg["Wert"], errors="coerce").fillna(0.0).astype(float)
 
-            # Selections
-            highlight = alt.selection_single(fields=["Kategorie"], on="click", nearest=True, empty="none")
+            # Hover-Highlight (mit Mausbewegung)
+            highlight = alt.selection_single(fields=["Kategorie"], on="mouseover", nearest=True, empty="none")
 
             base = alt.Chart(ts_agg)
 
-            # Linien-Chart mit Klick-Hervorhebung
+            # Linienchart mit Hover-Highlight
             lines = (
                 base.mark_line(point=alt.OverlayMarkDef(size=30), interpolate="linear")
                     .encode(
-                        x=alt.X(field="Periode", type="temporal", title="Woche"),
-                        y=alt.Y(field="Wert", type="quantitative", title="Verkaufswert (Summe pro Woche)", stack=None),
-                        color=alt.condition(highlight, alt.Color("Kategorie:N", title="Kategorie"),
-                                            alt.value("lightgray")),
+                        x=alt.X("Periode:T", title="Woche"),
+                        y=alt.Y("Wert:Q", title="Verkaufswert (Summe pro Woche)", stack=None),
+                        color=alt.Color("Kategorie:N", title="Kategorie"),
                         opacity=alt.condition(highlight, alt.value(1.0), alt.value(0.25)),
                         strokeWidth=alt.condition(highlight, alt.value(3), alt.value(1.5)),
                         tooltip=[
-                            alt.Tooltip(field="Periode", type="temporal", title="Woche"),
-                            alt.Tooltip(field="Kategorie", type="nominal", title="Kategorie"),
-                            alt.Tooltip(field="Wert", type="quantitative", title="Verkaufswert", format=",.0f"),
+                            alt.Tooltip("Periode:T", title="Woche"),
+                            alt.Tooltip("Kategorie:N", title="Kategorie"),
+                            alt.Tooltip("Wert:Q", title="Verkaufswert", format=",.0f"),
                         ],
                     )
                     .add_selection(highlight)
             )
 
-            # Labels am Ende jeder Linie (letzte Woche)
+            # Labels am Ende jeder Linie
             labels = (
                 base.transform_window(
                     row_number='row_number()',
                     sort=[alt.SortField(field='Periode', order='descending')],
                     groupby=['Kategorie']
                 )
-                .transform_filter(
-                    alt.datum.row_number == 0
-                )
-                .mark_text(
-                    align='left',
-                    dx=4,
-                    dy=-5,
-                    fontSize=11
-                )
+                .transform_filter(alt.datum.row_number == 0)
+                .mark_text(align='left', dx=4, dy=-5, fontSize=11)
                 .encode(
-                    x=alt.X('Periode:T'),
-                    y=alt.Y('Wert:Q'),
-                    text=alt.Text('Kategorie:N'),
-                    color=alt.condition(highlight, alt.Color("Kategorie:N"), alt.value("lightgray")),
+                    x='Periode:T',
+                    y='Wert:Q',
+                    text='Kategorie:N',
+                    color=alt.Color('Kategorie:N'),
                     opacity=alt.condition(highlight, alt.value(1.0), alt.value(0.25))
                 )
             )
