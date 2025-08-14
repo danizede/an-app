@@ -2,7 +2,7 @@
 # Robustes Matching (ArtNr → EAN → Name → Familie → Hints → Fuzzy),
 # EU‑Datumsfilter, Detailtabelle optional, Summen pro Artikel,
 # EIN Linienchart (eine Linie je Kategorie) – Verkaufswert-Verlauf (Monat),
-# Overflow‑Fix.
+# Overflow‑Fix & interaktive Visualisierung.
 
 import re
 import unicodedata
@@ -207,7 +207,7 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     out["Familie"]         = out["Bezeichnung"].map(make_family_key)
     out["Kategorie"]       = df[col_cat].astype(str) if col_cat else ""
 
-    # Farbe falls vorhanden, sonst aus Name extrahieren
+    # Farbe
     if col_color:
         out["Farbe"] = df[col_color].astype(str).map(lambda v: _COLOR_MAP.get(str(v).lower(), str(v)))
     else:
@@ -423,7 +423,7 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame):
     totals = (detail.groupby(["ArtikelNr","Bezeichnung_anzeige","Kategorie"], dropna=False, as_index=False)
                    .agg({"Einkaufsmenge":"sum","Einkaufswert":"sum","Verkaufsmenge":"sum","Verkaufswert":"sum","Lagermenge":"sum","Lagerwert":"sum"}))
 
-    # Zeitquelle für das Linien-Diagramm
+    # Zeitquelle für das Linien-Diagramm (EINZELZEILEN als Basis)
     ts_source = pd.DataFrame()
     if "StartDatum" in merged.columns:
         ts_source = merged[["StartDatum","Kategorie","Verkaufswert"]].copy()
@@ -434,7 +434,7 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame):
 # UI
 # =========================
 st.title("📊 Galaxus Sellout Analyse")
-st.caption("Summenansicht, robustes Matching (ArtNr → EAN → Name → Familie → Hints → Fuzzy), EU‑Datumsfilter. Detailtabelle optional. Linien‑Überblick pro Kategorie.")
+st.caption("Summenansicht, robustes Matching (ArtNr → EAN → Name → Familie → Hints → Fuzzy), EU‑Datumsfilter. Detailtabelle optional. Interaktiver Linien‑Überblick pro Kategorie.")
 
 c1,c2 = st.columns(2)
 with c1:
@@ -500,33 +500,67 @@ if sell_file and price_file:
         with st.spinner("🔗 Matche & berechne Werte…"):
             detail, totals, ts_source = enrich_and_merge(filtered_sell_df, price_df)
 
-        # =============== EIN LINIEN-CHART (eine Linie je Kategorie) ===============
+        # =============== INTERAKTIVES LINIEN-CHART (Einzelzeilen → Monatswerte) ===============
         st.markdown("### 📈 Verkaufsverlauf nach Kategorie")
+
         if not ts_source.empty:
             ts = ts_source.dropna(subset=["StartDatum"]).copy()
-            ts["Periode"] = ts["StartDatum"].dt.to_period("M").dt.start_time  # für Woche: .dt.to_period("W")
-            ts = (ts.groupby(["Kategorie","Periode"], as_index=False)["Verkaufswert"]
-                    .sum()
-                    .rename(columns={"Verkaufswert":"Wert"}))
-            ts["Periode"]   = pd.to_datetime(ts["Periode"])
-            ts["Kategorie"] = ts["Kategorie"].astype(str)
-            ts["Wert"]      = pd.to_numeric(ts["Wert"], errors="coerce").fillna(0.0).astype(float)
+            # Monats-Bucket (aus EINZELZEILEN, nicht aus Summen-Tabelle)
+            ts["Periode"] = ts["StartDatum"].dt.to_period("M").dt.start_time
 
-            chart = (
-                alt.Chart(ts)
-                  .mark_line(point=True)
-                  .encode(
-                      x=alt.X(field="Periode", type="temporal", title="Periode (Monat)"),
-                      y=alt.Y(field="Wert", type="quantitative", title="Verkaufswert"),
-                      color=alt.Color(field="Kategorie", type="nominal", title="Kategorie"),
-                      tooltip=[
-                          alt.Tooltip(field="Periode", type="temporal", title="Periode"),
-                          alt.Tooltip(field="Kategorie", type="nominal", title="Kategorie"),
-                          alt.Tooltip(field="Wert", type="quantitative", title="Verkaufswert", format=",.0f"),
-                      ],
-                  )
-                  .properties(height=300)
+            # Widgets: Kategorien & Monate
+            all_cats = sorted(ts["Kategorie"].astype(str).unique())
+            sel_cats = st.multiselect("Kategorien filtern", options=all_cats, default=all_cats)
+            if sel_cats:
+                ts = ts[ts["Kategorie"].isin(sel_cats)]
+
+            all_months = sorted(ts["Periode"].dt.to_period("M").astype(str).unique())
+            sel_months = st.multiselect("Monate (optional)", options=all_months, placeholder="z.B. 2025-05, 2025-06")
+            if sel_months:
+                ts = ts[ts["Periode"].dt.to_period("M").astype(str).isin(sel_months)]
+
+            # Monatswerte je Kategorie summieren (Aggregation erst hier, nach Filtern)
+            ts_agg = (ts.groupby(["Kategorie","Periode"], as_index=False)["Verkaufswert"]
+                        .sum()
+                        .rename(columns={"Verkaufswert":"Wert"}))
+            ts_agg["Periode"]   = pd.to_datetime(ts_agg["Periode"])
+            ts_agg["Kategorie"] = ts_agg["Kategorie"].astype(str)
+            ts_agg["Wert"]      = pd.to_numeric(ts_agg["Wert"], errors="coerce").fillna(0.0).astype(float)
+
+            # Brush (Zoom/Scroll) – Overview + Detail
+            brush = alt.selection_interval(encodings=["x"])
+
+            base = alt.Chart(ts_agg)
+
+            line_kwargs = dict(point=alt.OverlayMarkDef(size=30), interpolate="monotone")  # leichte Glättung
+            upper = (
+                base.mark_line(**line_kwargs)
+                    .encode(
+                        x=alt.X(field="Periode", type="temporal", title="Periode (Monat)"),
+                        y=alt.Y(field="Wert", type="quantitative", title="Verkaufswert (Summe pro Monat)", stack=None),
+                        color=alt.Color(field="Kategorie", type="nominal", title="Kategorie", legend=alt.Legend(labelLimit=250)),
+                        tooltip=[
+                            alt.Tooltip(field="Periode", type="temporal", title="Periode"),
+                            alt.Tooltip(field="Kategorie", type="nominal", title="Kategorie"),
+                            alt.Tooltip(field="Wert", type="quantitative", title="Verkaufswert", format=",.0f"),
+                        ],
+                    )
+                    .transform_filter(brush)
+                    .properties(height=320)
             )
+
+            lower = (
+                base.mark_area(opacity=0.35)
+                    .encode(
+                        x=alt.X(field="Periode", type="temporal", title="Scroll/Zoom (Monate)"),
+                        y=alt.Y(field="Wert", type="quantitative", title="", stack=None),
+                        color=alt.Color(field="Kategorie", type="nominal", title=None, legend=None),
+                    )
+                    .add_selection(brush)
+                    .properties(height=70)
+            )
+
+            chart = alt.vconcat(upper, lower).resolve_scale(y="independent")
             st.altair_chart(chart, use_container_width=True)
         else:
             st.info("Für den Verlauf werden gültige Startdaten benötigt.")
