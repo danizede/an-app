@@ -1,4 +1,4 @@
-# app.py — Galaxus Sell‑out Aggregator (robustes Netto‑Netto‑Matching)
+# app.py — Galaxus Sell‑out Aggregator (robustes Matching + EU‑Datumsfilter mit Button)
 
 import re
 import unicodedata
@@ -134,12 +134,10 @@ def make_family_key(name: str) -> str:
     s = re.sub(r"\b[o0]-\d+\b"," ", s)                 # Artikelcode wie O-061 entfernen
     s = re.sub(r"[^a-z0-9]+"," ", s)
     toks = [t for t in s.split() if t and (t not in _STOP_TOKENS) and (t not in _COLOR_WORDS)]
-    # 1–2 Kernwörter reichen
     return "".join(toks[:2]) if toks else ""
 
 def extract_color_from_name(name: str) -> str:
     if not isinstance(name,str): return ""
-    # Suche nach Farbe am Ende "(...)" oder " – Farbe"
     m = re.search(r"\(([^)]+)\)$", name.strip())
     if not m: m = re.search(r"[-–—]\s*([A-Za-zäöüÄÖÜß]+)$", name.strip())
     if not m: m = re.search(r"/\s*([A-Za-zäöüÄÖÜß]+)$", name.strip())
@@ -147,7 +145,6 @@ def extract_color_from_name(name: str) -> str:
         cand = m.group(1).strip().lower()
         if not _looks_like_not_a_color(cand):
             return _COLOR_MAP.get(cand, cand.title())
-    # sonst: erste Farbreferenz im Text
     for w in sorted(_COLOR_WORDS, key=len, reverse=True):
         if re.search(rf"\b{re.escape(w)}\b", name, flags=re.I):
             if not _looks_like_not_a_color(w):
@@ -238,14 +235,12 @@ def _apply_hints_to_row(name_raw: str) -> dict:
     s = (name_raw or "").lower()
     h = {"hint_family":"","hint_color":"","hint_art_exact":"","hint_art_prefix":""}
 
-    # Familien-Namen
     for fam in ["finn mobile","charly little","duftöl","duftoel","duft oil"]:
         if fam in s:
             h["hint_family"] = "finn" if fam=="finn mobile" else ("charly" if "charly" in fam else "duftol")
     for fam in ["finn","theo","robert","peter","julia","albert","roger","mia","simon","otto","oskar","tim","charly"]:
         if fam in s: h["hint_family"] = h["hint_family"] or fam
 
-    # Farben/Hinweise
     if "tim" in s and "schwarz" in s: h["hint_color"]="weiss"
     if "mia" in s and "gold" in s:    h["hint_color"]="schwarz"
     if "oskar" in s and "little" in s: h["hint_art_prefix"]="o061"
@@ -310,7 +305,6 @@ def _token_set(s: str) -> set:
     return set(toks)
 
 def _best_fuzzy_in_candidates(name: str, cand_series: pd.Series) -> int|None:
-    """Gibt Index des besten Treffers zurück (Jaccard-Overlap), sonst None."""
     base = _token_set(name)
     if not len(base): return None
     best_idx, best_score = None, 0.0
@@ -329,7 +323,6 @@ def _family_match(row: pd.Series, price_df: pd.DataFrame, prefer_color: str|None
     if not fam: return None
     grp = price_df.loc[price_df["Familie"]==fam]
     if grp.empty:
-        # fallback: contains
         grp = price_df.loc[price_df["Familie"].str.contains(re.escape(fam), na=False)]
     if grp.empty: return None
     if prefer_color:
@@ -349,22 +342,16 @@ def _apply_equivalences(hint_art_exact: str, hint_art_pref: str) -> str|None:
 def _final_backstops(merged: pd.DataFrame, price_df: pd.DataFrame):
     need = merged["Verkaufspreis"].isna()
     if not need.any(): return
-
     for i in merged.index[need]:
-        # 1) Exakte/Prefix Äquivalenz auf ArtikelNr
         art_key = _apply_equivalences(str(merged.at[i,"Hint_ArtExact"] or ""), str(merged.at[i,"Hint_ArtPref"] or ""))
         if art_key:
             hit = price_df.loc[price_df["ArtikelNr_key"].str.startswith(art_key, na=False)]
             if not hit.empty:
                 _assign_from_price_row(merged,i,hit.iloc[0]); continue
-
-        # 2) Familienmatch (egal welche Farbe)
         pref_color = str(merged.at[i,"Hint_Color"] or "")
         hit = _family_match(merged.loc[i], price_df, pref_color if pref_color else None)
         if hit is not None:
             _assign_from_price_row(merged,i,hit); continue
-
-        # 3) Fuzzy innerhalb ganzer PL (letzte Chance)
         idx = _best_fuzzy_in_candidates(str(merged.at[i,"Bezeichnung"]), price_df["Bezeichnung"])
         if idx is not None:
             _assign_from_price_row(merged,i, price_df.loc[idx]); continue
@@ -373,7 +360,6 @@ def _final_backstops(merged: pd.DataFrame, price_df: pd.DataFrame):
 def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> tuple[pd.DataFrame,pd.DataFrame]:
     merged = sell_df.merge(price_df, on=["ArtikelNr_key"], how="left", suffixes=("", "_pl"))
 
-    # 1) EAN‑Fallback
     need = merged["Verkaufspreis"].isna() & merged["EAN_key"].astype(bool)
     if need.any():
         tmp = merged.loc[need, ["EAN_key"]].merge(
@@ -383,24 +369,20 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> tuple[pd.
         for c in ["Einkaufspreis","Verkaufspreis","Lagermenge","Bezeichnung","Familie","Farbe","Kategorie","ArtikelNr","ArtikelNr_key"]:
             merged.loc[idx,c] = merged.loc[idx,c].fillna(tmp[c])
 
-    # 2) Name‑Fallback
     need = merged["Verkaufspreis"].isna()
     if need.any():
         name_map = price_df.drop_duplicates("Bezeichnung_key").set_index("Bezeichnung_key")
         for i,k in zip(merged.index[need], merged.loc[need,"Bezeichnung_key"]):
             if k in name_map.index: _assign_from_price_row(merged,i,name_map.loc[k])
 
-    # 3) Familien‑Fallback (genauer Key)
     need = merged["Verkaufspreis"].isna()
     if need.any():
         fam_map = price_df.drop_duplicates("Familie").set_index("Familie")
         for i,f in zip(merged.index[need], merged.loc[need,"Familie"]):
             if f and f in fam_map.index: _assign_from_price_row(merged,i,fam_map.loc[f])
 
-    # 4) Erweiterte Hints & Fuzzy
     _final_backstops(merged, price_df)
 
-    # Anzeige
     merged["Kategorie"]   = merged["Kategorie"].fillna("")
     merged["Bezeichnung"] = merged["Bezeichnung"].fillna("")
     merged["Farbe"]       = merged.get("Farbe","").fillna("")
@@ -410,7 +392,6 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> tuple[pd.
     valid_color = merged["Farbe"].astype(str).str.strip().map(lambda t: (t!="") and (not _looks_like_not_a_color(t)))
     merged.loc[dup & valid_color, "Bezeichnung_anzeige"] = merged.loc[dup & valid_color,"Bezeichnung"] + " – " + merged.loc[dup & valid_color,"Farbe"].astype(str).str.strip()
 
-    # Werte sicher berechnen
     q_buy,p_buy   = sanitize_numbers(merged["Einkaufsmenge"], merged["Einkaufspreis"])
     q_sell,p_sell = sanitize_numbers(merged["Verkaufsmenge"], merged["Verkaufspreis"])
     q_stock,_     = sanitize_numbers(merged["Lagermenge"],  merged["Verkaufspreis"])
@@ -418,7 +399,7 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> tuple[pd.
     q_sell=q_sell.fillna(0.0); p_sell=p_sell.fillna(0.0)
     q_stock=q_stock.fillna(0.0)
     with np.errstate(over='ignore', invalid='ignore'):
-        merged["Einkaufswert"] = (q_buy*q_buy.map(lambda _:1)*p_buy).astype("float64")
+        merged["Einkaufswert"] = (q_buy*p_buy).astype("float64")
         merged["Verkaufswert"] = (q_sell*p_sell).astype("float64")
         merged["Lagerwert"]    = (q_stock*p_sell).astype("float64")
 
@@ -457,17 +438,44 @@ if sell_file and price_file:
             sell_df  = prepare_sell_df(raw_sell)
             price_df = prepare_price_df(raw_price)
 
-        # Zeitraumfilter (I/J → US→EU geparst)
+        # ========= Zeitraumfilter mit Button „Gesamten Zeitraum“ (EU-Format) =========
         filtered_sell_df = sell_df
         if {"StartDatum","EndDatum"}.issubset(sell_df.columns) and not sell_df["StartDatum"].isna().all():
-            min_date = sell_df["StartDatum"].min().date()
-            max_date = (sell_df["EndDatum"].dropna().max() if "EndDatum" in sell_df else sell_df["StartDatum"].max()).date()
             st.subheader("Periode wählen")
-            date_value = st.date_input("Zeitraum (DD.MM.YYYY)", value=(min_date,max_date), min_value=min_date, max_value=max_date)
-            if isinstance(date_value, tuple): start_date, end_date = date_value
-            else: start_date = end_date = date_value
-            mask = ~((sell_df["EndDatum"].dt.date < start_date) | (sell_df["StartDatum"].dt.date > end_date))
+
+            min_date = sell_df["StartDatum"].min().date()
+            max_date = (sell_df["EndDatum"].dropna().max()
+                        if "EndDatum" in sell_df else sell_df["StartDatum"].max()).date()
+
+            if "date_range" not in st.session_state:
+                st.session_state["date_range"] = (min_date, max_date)
+
+            col_range, col_btn = st.columns([3,1])
+            with col_range:
+                date_value = st.date_input(
+                    "Zeitraum (DD.MM.YYYY)",
+                    value=st.session_state["date_range"],
+                    min_value=min_date,
+                    max_value=max_date,
+                    format="DD.MM.YYYY",
+                )
+            with col_btn:
+                st.write(""); st.write("")
+                if st.button("Gesamten Zeitraum"):
+                    st.session_state["date_range"] = (min_date, max_date)
+                    st.experimental_rerun()
+
+            if isinstance(date_value, tuple):
+                start_date, end_date = date_value
+            else:
+                start_date = end_date = date_value
+
+            st.session_state["date_range"] = (start_date, end_date)
+
+            mask = ~((sell_df["EndDatum"].dt.date < start_date) |
+                     (sell_df["StartDatum"].dt.date > end_date))
             filtered_sell_df = sell_df.loc[mask].copy()
+        # =========================================================================
 
         with st.spinner("🔗 Matche & berechne Werte…"):
             detail, totals = enrich_and_merge(filtered_sell_df, price_df)
