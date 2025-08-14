@@ -253,8 +253,8 @@ def _apply_hints_to_row(name_raw: str) -> dict:
     if "simon" in s: h["hint_art_exact"]="s054"
     if "otto"  in s: h["hint_art_prefix"]="o013"
     if "eva" in s and "e-008" in s: h["hint_art_exact"]="e008"
-    if "julia" in s und "j-031" in s: h["hint_art_exact"]="j031"
-    if "mia" in s und "m-057" in s: h["hint_art_exact"]="m057"
+    if "julia" in s and "j-031" in s: h["hint_art_exact"]="j031"
+    if "mia" in s and "m-057" in s: h["hint_art_exact"]="m057"
     return h
 
 def _fallback_col_by_index(df: pd.DataFrame, idx0: int) -> str|None:
@@ -567,7 +567,7 @@ if sell_file and price_file:
 
             # DETAIL (oben): Linien mit Punktmarkern, Fokus hebt Linie hervor
             detail_chart = (
-                base.mark_line(point=alt.OverlayMarkDef(size=32), interpolate="linear")  # FIX hier
+                base.mark_line(point=alt.OverlayMarkDef(size=32), interpolate="linear")  # linear statt None
                     .encode(
                         x=alt.X(field="Periode", type="temporal", title="Periode (Monat)"),
                         y=alt.Y(field="Wert", type="quantitative", title="Verkaufswert (Summe pro Monat)", stack=None),
