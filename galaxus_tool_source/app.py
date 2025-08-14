@@ -1,7 +1,10 @@
 # app.py — Galaxus Sell‑out Aggregator
-# Robust: Excel-Header-Handling, US→EU Datum (Start=Spalte I, Ende=Spalte J),
-# Zeitraumfilter, Zahlformat, Detailtabelle ausblendbar,
-# Varianten-Anzeige: nur bei Dubletten Farbe anhängen (kein EU/ArtNr).
+# - Robustes Excel-Header-Handling (kein Length-mismatch)
+# - US→EU Datum (Start=Spalte I, Ende=Spalte J), Zeitraumfilter (Überschneidung)
+# - Zahlformat (0 Nachkommastellen, ’ als Tausender)
+# - Detailtabelle standardmäßig ausgeblendet
+# - Varianten: Farbe nur bei Dubletten an den Namen anhängen (kein EU/Art.-Nr.-Fallback)
+# - Overflow-Fix: Berechnungen konsequent in float64
 
 import re
 import unicodedata
@@ -146,11 +149,10 @@ _COLOR_REGEXES = [
 def _looks_like_not_a_color(token: str) -> bool:
     t = token.strip().lower()
     if not t: return True
-    # Ausschlüsse: Regionen/Kürzel/Einheiten/Kennzahlen
     bad = {"eu","ch","us","uk"}
     if t in bad: return True
-    if any(x in t for x in ["ml","dB".lower(),"m²","m2","db"]): return True
-    if re.search(r"\d", t): return True          # enthält Ziffern (z.B. O-009, 100 ml, 58 dB)
+    if any(x in t for x in ["ml","db","m²","m2"]): return True
+    if re.search(r"\d", t): return True
     return False
 
 def extract_color_from_name(name: str) -> str:
@@ -202,16 +204,11 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     out["Bezeichnung"]     = df[col_name].astype(str)
     out["Bezeichnung_key"] = out["Bezeichnung"].map(normalize_key)
     out["Kategorie"]       = df[col_cat].astype(str) if col_cat else ""
-    # Farbe: echte Spalte bevorzugen, sonst aus Bezeichnung heuristisch (ignoriert EU/O-009/Einheiten)
-    if col_color:
-        out["Farbe"] = df[col_color].astype(str)
-    else:
-        out["Farbe"] = out["Bezeichnung"].map(extract_color_from_name)
+    out["Farbe"]           = (df[col_color].astype(str) if col_color
+                              else out["Bezeichnung"].map(extract_color_from_name))
 
-    if col_stock:
-        out["Lagermenge"] = parse_number_series(df[col_stock]).fillna(0).astype("Int64")
-    else:
-        out["Lagermenge"] = pd.Series([0]*len(df), dtype="Int64")
+    out["Lagermenge"] = (parse_number_series(df[col_stock]).fillna(0).astype("Int64")
+                         if col_stock else pd.Series([0]*len(df), dtype="Int64"))
 
     if col_buy:
         out["Einkaufspreis"] = parse_number_series(df[col_buy])
@@ -265,10 +262,8 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
     out["Bezeichnung_key"] = out["Bezeichnung"].map(normalize_key)
 
     out["Verkaufsmenge"] = parse_number_series(df[col_sales]).fillna(0).astype("Int64")
-    if col_buy:
-        out["Einkaufsmenge"] = parse_number_series(df[col_buy]).fillna(0).astype("Int64")
-    else:
-        out["Einkaufsmenge"] = pd.Series([0]*len(df), dtype="Int64")
+    out["Einkaufsmenge"] = (parse_number_series(df[col_buy]).fillna(0).astype("Int64")
+                            if col_buy else pd.Series([0]*len(df), dtype="Int64"))
 
     if col_start: out["StartDatum"] = parse_date_series_us(df[col_start])
     if col_end:   out["EndDatum"]   = parse_date_series_us(df[col_end])
@@ -280,6 +275,10 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
 # =========================
 # Merge & Berechnung
 # =========================
+def _f64(s: pd.Series) -> pd.Series:
+    """Sicher zu float64 konvertieren (gegen Integer-Overflow)."""
+    return pd.to_numeric(s, errors="coerce").astype("float64")
+
 @st.cache_data(show_spinner=False)
 def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     merged = sell_df.merge(
@@ -314,9 +313,7 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> tuple[pd.
                     if pd.isna(merged.at[i, col]) or col in ("ArtikelNr", "Bezeichnung", "Kategorie", "Farbe"):
                         merged.at[i, col] = row.get(col, merged.at[i, col])
 
-    for pcol in ["Einkaufspreis", "Verkaufspreis"]:
-        merged[pcol] = pd.to_numeric(merged[pcol], errors="coerce")
-
+    # numerisch säubern
     merged["Kategorie"]   = merged["Kategorie"].fillna("")
     merged["Bezeichnung"] = merged["Bezeichnung"].fillna("")
     merged["Farbe"] = merged.get("Farbe", "").fillna("")
@@ -324,18 +321,29 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> tuple[pd.
     # Sichtbarer Name: standardmäßig Bezeichnung
     merged["Bezeichnung_anzeige"] = merged["Bezeichnung"]
 
-    # Nur bei Dubletten (gleiche Bezeichnung) Farbe anhängen – aber nur, wenn Farbe vorhanden UND sinnvoll
+    # Nur bei Dubletten Farbe anhängen (wenn valide Farbe vorhanden)
     dup = merged.duplicated(subset=["Bezeichnung"], keep=False)
     valid_color = merged["Farbe"].astype(str).str.strip().map(lambda t: (t != "") and (not _looks_like_not_a_color(t)))
     merged.loc[dup & valid_color, "Bezeichnung_anzeige"] = (
         merged.loc[dup & valid_color, "Bezeichnung"] + " – " + merged.loc[dup & valid_color, "Farbe"].astype(str).str.strip()
     )
-    # Wichtig: KEIN Fallback mehr auf ArtikelNr oder "EU"!
 
-    # Werte berechnen
-    merged["Einkaufswert"] = (merged["Einkaufsmenge"].astype("Int64").fillna(0) * merged["Einkaufspreis"].fillna(0)).astype(float)
-    merged["Verkaufswert"] = (merged["Verkaufsmenge"].astype("Int64").fillna(0) * merged["Verkaufspreis"].fillna(0)).astype(float)
-    merged["Lagerwert"]    = (merged["Lagermenge"].astype("Int64").fillna(0)    * merged["Verkaufspreis"].fillna(0)).astype(float)
+    # -------- Overflow-sicher: alles in float64 berechnen --------
+    qty_buy   = _f64(merged["Einkaufsmenge"]).fillna(0.0)
+    qty_sell  = _f64(merged["Verkaufsmenge"]).fillna(0.0)
+    qty_stock = _f64(merged["Lagermenge"]).fillna(0.0)
+
+    pr_buy    = _f64(merged["Einkaufspreis"]).fillna(0.0)
+    pr_sell   = _f64(merged["Verkaufspreis"]).fillna(0.0)
+
+    # Optional: absurde Preise kappen (falls mal Datum als Zahl reinrutscht)
+    pr_buy  = pr_buy.mask(pr_buy.abs()  > 1e6, np.nan).fillna(0.0)
+    pr_sell = pr_sell.mask(pr_sell.abs() > 1e6, np.nan).fillna(0.0)
+
+    merged["Einkaufswert"] = qty_buy   * pr_buy
+    merged["Verkaufswert"] = qty_sell  * pr_sell
+    merged["Lagerwert"]    = qty_stock * pr_sell
+    # -------------------------------------------------------------
 
     display_cols = [
         "ArtikelNr", "Bezeichnung_anzeige", "Kategorie",
