@@ -3,8 +3,9 @@
 # - US→EU Datum (Start=Spalte I, Ende=Spalte J), Zeitraumfilter (Überschneidung)
 # - Zahlformat (0 Nachkommastellen, ’ als Tausender)
 # - Detailtabelle standardmäßig ausgeblendet
-# - Varianten: Farbe nur bei Dubletten an den Namen anhängen (kein EU/Art.-Nr.-Fallback)
-# - Overflow-Fix: Berechnungen konsequent in float64
+# - Varianten: Farbe NUR bei Dubletten an den Namen anhängen (kein EU/Art.-Nr.-Fallback)
+# - Bessere Farberkennung: explizite Spalten, Bezeichnung-Heuristik + Spaltenscan mit Synonym-Mapping
+# - Overflow-Fix: Berechnungen in float64
 
 import re
 import unicodedata
@@ -44,20 +45,15 @@ def style_numeric(df: pd.DataFrame, num_cols=NUM_COLS_DEFAULT, sep=THOUSANDS_SEP
 # Robust: Excel einlesen & Spalten fixieren
 # =========================
 def read_excel_flat(upload) -> pd.DataFrame:
-    """
-    Liest eine Excel-Tabelle robust ein – auch bei mehrzeiligen/zusammengeführten Headern.
-    Verhindert 'Length mismatch' sicher.
-    """
+    """Robustes Einlesen – verhindert 'Length mismatch' auch bei mehrzeiligen Headern."""
     raw = pd.read_excel(upload, header=None, dtype=object)
     if raw.empty:
         return pd.DataFrame()
-
     non_empty_ratio = raw.notna().mean(axis=1)
     header_idx = int(non_empty_ratio.idxmax())
 
     header_vals = raw.iloc[header_idx].fillna("").astype(str).tolist()
     header_vals = [re.sub(r"\s+", " ", h).strip() for h in header_vals]
-
     n_cols = raw.shape[1]
     if len(header_vals) < n_cols:
         header_vals += [f"col_{i}" for i in range(len(header_vals), n_cols)]
@@ -140,30 +136,98 @@ def parse_date_series_us(s: pd.Series) -> pd.Series:
     dt2 = pd.to_datetime(nums, origin="1899-12-30", unit="d", errors="coerce")
     return dt1.combine_first(dt2)
 
-# ===== Farb-Logik (Heuristik nur als Fallback; ignoriert irrelevante Endungen) =====
+# ===== Farb-Logik (Heuristik + Vokabular) =====
 _COLOR_REGEXES = [
     r"\(([^)]+)\)$",                # ... (Weiss)
     r"[-–—]\s*([A-Za-zäöüÄÖÜß]+)$", # ... – White
     r"/\s*([A-Za-zäöüÄÖÜß]+)$",     # ... / Black
 ]
 def _looks_like_not_a_color(token: str) -> bool:
-    t = token.strip().lower()
+    t = (token or "").strip().lower()
     if not t: return True
-    bad = {"eu","ch","us","uk"}
-    if t in bad: return True
+    if t in {"eu","ch","us","uk"}: return True
     if any(x in t for x in ["ml","db","m²","m2"]): return True
     if re.search(r"\d", t): return True
     return False
 
+# Synonyme & Mapping auf Kanon
+_COLOR_MAP = {
+    # weiss / weiß
+    "weiss":"Weiss","weiß":"Weiss","white":"White","offwhite":"Off-White","cream":"Cream","ivory":"Ivory",
+    # schwarz
+    "schwarz":"Schwarz","black":"Black","jet black":"Black",
+    # grau
+    "grau":"Grau","gray":"Grau","anthrazit":"Anthrazit","charcoal":"Anthrazit","graphite":"Graphit","silver":"Silber",
+    # blau
+    "blau":"Blau","blue":"Blau","navy":"Dunkelblau","sky blue":"Hellblau","light blue":"Hellblau","dark blue":"Dunkelblau",
+    # rot / rosa / violett
+    "rot":"Rot","red":"Rot","bordeaux":"Bordeaux","burgundy":"Bordeaux","pink":"Pink","magenta":"Magenta",
+    "lila":"Lila","violett":"Violett","purple":"Violett","fuchsia":"Fuchsia",
+    # grün
+    "grün":"Grün","gruen":"Grün","green":"Grün","mint":"Mint","türkis":"Türkis","tuerkis":"Türkis","turquoise":"Türkis",
+    "petrol":"Petrol","olive":"Olivgrün",
+    # gelb / orange / braun / beige
+    "gelb":"Gelb","yellow":"Gelb","orange":"Orange","braun":"Braun","brown":"Braun","beige":"Beige","sand":"Sand",
+    # metallic / speziell
+    "gold":"Gold","rose gold":"Roségold","rosegold":"Roségold","kupfer":"Kupfer","copper":"Kupfer","bronze":"Bronze",
+    "transparent":"Transparent","clear":"Transparent"
+}
+
+# für Regex eine Liste der Keys, längere zuerst (damit 'rose gold' vor 'gold' matched)
+_COLOR_KEYS_SORTED = sorted(_COLOR_MAP.keys(), key=len, reverse=True)
+_COLOR_PATTERN = re.compile(r"\b(" + "|".join(map(re.escape, _COLOR_KEYS_SORTED)) + r")\b", re.IGNORECASE)
+
+def _canon_color_from_text(text: str) -> str:
+    if not isinstance(text, str) or not text.strip():
+        return ""
+    m = _COLOR_PATTERN.search(text.lower())
+    if m:
+        key = m.group(1).lower()
+        return _COLOR_MAP.get(key, key.title())
+    return ""
+
 def extract_color_from_name(name: str) -> str:
+    """Heuristik: Farbe am Ende der Bezeichnung (in Klammern, nach Strich, nach Slash)."""
     if not isinstance(name, str): return ""
     for rgx in _COLOR_REGEXES:
         m = re.search(rgx, name.strip())
         if m:
             cand = m.group(1).strip()
             if not _looks_like_not_a_color(cand):
-                return cand
+                # auch hier Synonyme normalisieren
+                canon = _canon_color_from_text(cand)
+                return canon or cand
+    # falls nicht am Ende, versuche irgendwo im Text via Vokabular
+    canon = _canon_color_from_text(name)
+    if canon and not _looks_like_not_a_color(canon):
+        return canon
     return ""
+
+def guess_color_from_row(row: pd.Series, all_columns: list[str]) -> str:
+    """Durchsucht mehrere Textspalten (Bezeichnung, Kategorie, Zusatz, etc.) nach Farbworten."""
+    # Bevorzugt dedizierte Farbfelder
+    for col in all_columns:
+        if re.search(r"(farb|color|colour|varian)", col, re.IGNORECASE):
+            val = row.get(col, "")
+            canon = _canon_color_from_text(str(val))
+            if canon and not _looks_like_not_a_color(canon):
+                return canon
+    # Allgemeiner Scan über typische Textspalten
+    candidates = []
+    for col in all_columns:
+        if col.lower() in {"ean","gtin","barcode","artikelnummer","artikelnr","artnr","produkt id"}:
+            continue
+        val = str(row.get(col, "") or "").strip()
+        if not val:
+            continue
+        # nur in Textspalten suchen (keine reinen Zahlen-/Mengenfelder)
+        if re.fullmatch(r"[0-9 .,'’-]+", val):
+            continue
+        c = extract_color_from_name(val) or _canon_color_from_text(val)
+        if c and not _looks_like_not_a_color(c):
+            candidates.append(c)
+    # wähle die erste gefundene
+    return candidates[0] if candidates else ""
 
 # =========================
 # Parsing – Preislisten
@@ -204,12 +268,26 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     out["Bezeichnung"]     = df[col_name].astype(str)
     out["Bezeichnung_key"] = out["Bezeichnung"].map(normalize_key)
     out["Kategorie"]       = df[col_cat].astype(str) if col_cat else ""
-    out["Farbe"]           = (df[col_color].astype(str) if col_color
-                              else out["Bezeichnung"].map(extract_color_from_name))
 
+    # --- Farbe bestimmen ---
+    if col_color:
+        out["Farbe"] = df[col_color].astype(str).map(lambda x: _canon_color_from_text(str(x)) or str(x))
+    else:
+        # erst Bezeichnung-Heuristik …
+        out["Farbe"] = out["Bezeichnung"].map(extract_color_from_name)
+        # … dann Spaltenscan, falls noch leer
+        if out["Farbe"].isna().any() or (out["Farbe"].astype(str).str.strip() == "").any():
+            # zeilenweiser Scan
+            all_cols = list(df.columns)
+            out["Farbe"] = out.apply(
+                lambda r: r["Farbe"] if str(r.get("Farbe","")).strip() else guess_color_from_row(df.loc[r.name], all_cols),
+                axis=1
+            )
+    out["Farbe"] = out["Farbe"].fillna("").astype(str)
+
+    # Lager & Preise
     out["Lagermenge"] = (parse_number_series(df[col_stock]).fillna(0).astype("Int64")
                          if col_stock else pd.Series([0]*len(df), dtype="Int64"))
-
     if col_buy:
         out["Einkaufspreis"] = parse_number_series(df[col_buy])
     if col_sell:
@@ -328,22 +406,18 @@ def enrich_and_merge(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> tuple[pd.
         merged.loc[dup & valid_color, "Bezeichnung"] + " – " + merged.loc[dup & valid_color, "Farbe"].astype(str).str.strip()
     )
 
-    # -------- Overflow-sicher: alles in float64 berechnen --------
+    # Overflow-sicher: alles in float64 berechnen
     qty_buy   = _f64(merged["Einkaufsmenge"]).fillna(0.0)
     qty_sell  = _f64(merged["Verkaufsmenge"]).fillna(0.0)
     qty_stock = _f64(merged["Lagermenge"]).fillna(0.0)
-
     pr_buy    = _f64(merged["Einkaufspreis"]).fillna(0.0)
     pr_sell   = _f64(merged["Verkaufspreis"]).fillna(0.0)
-
-    # Optional: absurde Preise kappen (falls mal Datum als Zahl reinrutscht)
     pr_buy  = pr_buy.mask(pr_buy.abs()  > 1e6, np.nan).fillna(0.0)
     pr_sell = pr_sell.mask(pr_sell.abs() > 1e6, np.nan).fillna(0.0)
 
     merged["Einkaufswert"] = qty_buy   * pr_buy
     merged["Verkaufswert"] = qty_sell  * pr_sell
     merged["Lagerwert"]    = qty_stock * pr_sell
-    # -------------------------------------------------------------
 
     display_cols = [
         "ArtikelNr", "Bezeichnung_anzeige", "Kategorie",
@@ -426,7 +500,7 @@ if sell_file and price_file:
             d_rounded, d_styler = style_numeric(detail)
             st.dataframe(d_styler, use_container_width=True)
 
-        st.subheader("Summen pro Artikel (Varianten mit Farbe bei Dubletten)")
+        st.subheader("Summen pro Artikel (Varianten: Farbe bei Dubletten)")
         t_rounded, t_styler = style_numeric(totals)
         st.dataframe(t_styler, use_container_width=True)
 
