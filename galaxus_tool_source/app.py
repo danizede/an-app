@@ -1,9 +1,8 @@
-# app.py — Galaxus Sellout Analyse (Woche + korrekter "letzter" Lagerstand aus Sell-out Spalte G)
-# - Lagermenge ausschliesslich aus Sell-out (Spalte G), neueste Periode via I/J
-# - Robustes Matching (ArtNr → EAN → Name → Familie → Hints → Fuzzy)
-# - EU-Datumsfilter, Detailtabelle optional
-# - Summen pro Artikel (Lagerwert = letzter Stand, NICHT Summe)
-# - Interaktives Linienchart (Woche) mit Hover-Highlight & Pop-up-Label
+# app.py — Galaxus Sellout Analyse (Woche + korrekter letzter Lagerwert aus Sell-out Spalte G)
+# - Lagermenge ausschliesslich aus Sell-out (Spalte G), letzter Stand = jüngste I/J-Periode
+# - Overflow-Schutz (Clipping) für Mengen/Preise/Produkte
+# - Interaktives Wochen-Chart mit Hover-Highlight & Pop-up
+# - Kontrolltabelle "welche G/I/J-Zeile wurde genommen?"
 
 import re
 import unicodedata
@@ -14,6 +13,7 @@ import altair as alt
 
 st.set_page_config(page_title="Galaxus Sellout Analyse", layout="wide")
 
+# Altair: große Datensätze erlauben
 try:
     alt.data_transformers.disable_max_rows()
 except Exception:
@@ -23,6 +23,8 @@ except Exception:
 # Anzeige-Helfer
 # =========================
 THOUSANDS_SEP = "'"
+MAX_QTY, MAX_PRICE = 1_000_000, 1_000_000  # Obergrenzen für Clip
+
 NUM_COLS_DEFAULT = [
     "Einkaufsmenge","Einkaufswert",
     "Verkaufsmenge","Verkaufswert",
@@ -43,7 +45,7 @@ def style_numeric(df: pd.DataFrame, num_cols=NUM_COLS_DEFAULT, sep=THOUSANDS_SEP
     return out, out.style.format(fmt)
 
 # =========================
-# Robust: Excel einlesen
+# Datei robust einlesen
 # =========================
 def read_excel_flat(upload) -> pd.DataFrame:
     raw = pd.read_excel(upload, header=None, dtype=object)
@@ -58,7 +60,7 @@ def read_excel_flat(upload) -> pd.DataFrame:
         headers = headers[:n]
     df = raw.iloc[header_idx+1:].reset_index(drop=True)
     df.columns = headers
-    # Doppelte Spalten entschärfen
+    # doppelte Spalten entschärfen
     seen, newcols = {}, []
     for c in df.columns:
         if c in seen:
@@ -114,46 +116,13 @@ def parse_date_series_us(s: pd.Series) -> pd.Series:
     dt2 = pd.to_datetime(nums, origin="1899-12-30", unit="d", errors="coerce")
     return dt1.combine_first(dt2)
 
-MAX_QTY, MAX_PRICE = 1_000_000, 1_000_000
 def sanitize_numbers(qty: pd.Series, price: pd.Series) -> tuple[pd.Series,pd.Series]:
     q = pd.to_numeric(qty, errors="coerce").astype("float64").clip(lower=0, upper=MAX_QTY)
     p = pd.to_numeric(price, errors="coerce").astype("float64").clip(lower=0, upper=MAX_PRICE)
     return q, p
 
 # =========================
-# Farben & Familie
-# =========================
-_COLOR_MAP = {
-    "weiss":"Weiss","weiß":"Weiss","white":"White","offwhite":"Off-White","cream":"Cream","ivory":"Ivory",
-    "schwarz":"Schwarz","black":"Black","grau":"Grau","gray":"Grau","anthrazit":"Anthrazit","charcoal":"Anthrazit","graphite":"Graphit","silver":"Silber",
-    "blau":"Blau","blue":"Blau","navy":"Dunkelblau","light blue":"Hellblau","dark blue":"Dunkelblau","sky blue":"Hellblau",
-    "rot":"Rot","red":"Rot","bordeaux":"Bordeaux","burgundy":"Bordeaux","pink":"Pink","magenta":"Magenta",
-    "lila":"Lila","violett":"Violett","purple":"Violett","fuchsia":"Fuchsia",
-    "grün":"Grün","gruen":"Grün","green":"Grün","mint":"Mint","türkis":"Türkis","tuerkis":"Türkis","turquoise":"Türkis",
-    "petrol":"Petrol","olive":"Olivgrün","gelb":"Gelb","yellow":"Gelb","orange":"Orange","braun":"Braun","brown":"Braun","beige":"Beige","sand":"Sand",
-    "gold":"Gold","rose gold":"Roségold","rosegold":"Roségold","kupfer":"Kupfer","copper":"Kupfer","bronze":"Bronze","transparent":"Transparent","clear":"Transparent",
-}
-_COLOR_WORDS = set(_COLOR_MAP.keys()) | set(map(str.lower, _COLOR_MAP.values()))
-_STOP_TOKENS = {"eu","ch","us","uk","mobile","little","bundle","set","kit"}
-
-def _looks_like_not_a_color(token: str) -> bool:
-    t=(token or "").strip().lower()
-    return (not t) or (t in {"eu","ch","us","uk"}) or any(x in t for x in ["ml","db","m²","m2"]) or bool(re.search(r"\d",t))
-
-def _strip_parens_units(name: str) -> str:
-    s = re.sub(r"\([^)]*\)"," ", name)
-    s = re.sub(r"\b\d+([.,]\d+)?\s*(ml|db|m²|m2)\b"," ", s, flags=re.I)
-    return s
-
-def make_family_key(name: str) -> str:
-    if not isinstance(name,str): return ""
-    s = _strip_parens_units(name.lower())
-    s = re.sub(r"[^a-z0-9]+"," ", s)
-    toks = [t for t in s.split() if t and (t not in _STOP_TOKENS) and (t not in _COLOR_WORDS)]
-    return "".join(toks[:2]) if toks else ""
-
-# =========================
-# Parsing – Preislisten
+# Parsing – Preisliste
 # =========================
 PRICE_COL_CANDIDATES = ["Preis","VK","Netto","NETTO","Einkaufspreis","Verkaufspreis","NETTO NETTO","Einkauf"]
 BUY_PRICE_CANDIDATES  = ["Einkaufspreis","Einkauf"]
@@ -163,8 +132,6 @@ ARTNR_CANDIDATES = ["Artikelnummer","Artikelnr","ArtikelNr","Artikel-Nr.","Herst
 EAN_CANDIDATES  = ["EAN","GTIN","BarCode","Barcode"]
 NAME_CANDIDATES_PL = ["Bezeichnung","Produktname","Name","Titel","Artikelname"]
 CAT_CANDIDATES  = ["Kategorie","Warengruppe","Zusatz"]
-STOCK_CANDIDATES= ["Bestand","Verfügbar","Lagerbestand"]
-COLOR_CANDIDATES= ["Farbe","Color","Colour","Variante","Variant","Farbvariante","Farbname"]
 
 def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     df = normalize_cols(df)
@@ -172,10 +139,8 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     col_ean   = find_column(df, EAN_CANDIDATES,  "EAN/GTIN", required=False)
     col_name  = find_column(df, NAME_CANDIDATES_PL, "Bezeichnung")
     col_cat   = find_column(df, CAT_CANDIDATES,  "Kategorie", required=False)
-    col_stock = find_column(df, STOCK_CANDIDATES, "Bestand/Lager", required=False)
     col_buy   = find_column(df, BUY_PRICE_CANDIDATES,  "Einkaufspreis", required=False)
     col_sell  = find_column(df, SELL_PRICE_CANDIDATES, "Verkaufspreis", required=False)
-    col_color = find_column(df, COLOR_CANDIDATES, "Farbe/Variante", required=False)
     col_any=None
     if not col_sell and not col_buy:
         col_any = find_column(df, PRICE_COL_CANDIDATES, "Preis", required=True)
@@ -187,15 +152,8 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     out["EAN_key"]         = out["EAN"].map(lambda x: re.sub(r"[^0-9]+","",str(x)))
     out["Bezeichnung"]     = df[col_name].astype(str)
     out["Bezeichnung_key"] = out["Bezeichnung"].map(normalize_key)
-    out["Familie"]         = out["Bezeichnung"].map(make_family_key)
     out["Kategorie"]       = df[col_cat].astype(str) if col_cat else ""
 
-    if col_color:
-        out["Farbe"] = df[col_color].astype(str).map(lambda v: str(v))
-    else:
-        out["Farbe"] = ""
-
-    out["Lagermenge"] = parse_number_series(df[col_stock]).fillna(0).astype("Int64") if col_stock else pd.Series([0]*len(out), dtype="Int64")
     if col_buy:  out["Einkaufspreis"] = parse_number_series(df[col_buy])
     if col_sell: out["Verkaufspreis"] = parse_number_series(df[col_sell])
     if not col_buy and not col_sell and col_any:
@@ -203,26 +161,20 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     if "Einkaufspreis" not in out: out["Einkaufspreis"]=out.get("Verkaufspreis", pd.Series([np.nan]*len(out)))
     if "Verkaufspreis" not in out: out["Verkaufspreis"]=out.get("Einkaufspreis", pd.Series([np.nan]*len(out)))
 
-    out = out.assign(_have=out["Verkaufspreis"].notna()).sort_values(
-        ["ArtikelNr_key","_have"], ascending=[True,False])
+    # Dedupliziere nach ArtikelNr_key (bevorzuge mit Preis)
+    out = out.assign(_have=out["Verkaufspreis"].notna()).sort_values(["ArtikelNr_key","_have"], ascending=[True,False])
     out = out.drop_duplicates(subset=["ArtikelNr_key"], keep="first").drop(columns=["_have"])
     return out
 
 # =========================
-# Parsing – Sell-out (+ Hints)
+# Parsing – Sell-out (G/I/J)
 # =========================
 NAME_CANDIDATES_SO   = ["Bezeichnung","Name","Artikelname","Bezeichnung_Sales","Produktname"]
 SALES_QTY_CANDIDATES = ["SalesQty","Verkauf","Verkaufte Menge","Menge verkauft","Absatz","Stück","Menge"]
 BUY_QTY_CANDIDATES   = ["Einkauf","Einkaufsmenge","Menge Einkauf"]
 DATE_START_CANDS     = ["Start","Startdatum","Start Date","Anfangs datum","Anfangsdatum","Von","Period Start"]
 DATE_END_CANDS       = ["Ende","Enddatum","End Date","Bis","Period End"]
-# WICHTIG: Lagermenge im Sell-out (Spalte G); wir erkennen per Namen und notfalls per Index
-STOCK_SO_CANDIDATES  = ["Lagermenge","Lagerbestand","Bestand"]
-
-def _apply_hints_to_row(name_raw: str) -> dict:
-    s = (name_raw or "").lower()
-    h = {"hint_family":"","hint_color":"","hint_art_exact":"","hint_art_prefix":""}
-    return h
+STOCK_SO_CANDIDATES  = ["Lagermenge","Lagerbestand","Bestand"]  # Spalte G
 
 def _fallback_col_by_index(df: pd.DataFrame, idx0: int) -> str|None:
     try: return df.columns[idx0]
@@ -236,15 +188,15 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
     col_sales = find_column(df, SALES_QTY_CANDIDATES, "Verkaufsmenge", required=True)
     col_buy   = find_column(df, BUY_QTY_CANDIDATES,   "Einkaufsmenge", required=False)
 
-    # Spalte G (Lagermenge Sell-out) – per Name oder Fallback Index 6
+    # G (Index 6): Lagermenge im Sell-out
     col_stock_so = find_column(df, STOCK_SO_CANDIDATES, "Lagermenge (Sell-out: Spalte G)", required=False)
     if not col_stock_so and df.shape[1] >= 7:
-        col_stock_so = _fallback_col_by_index(df, 6)  # G = Index 6
+        col_stock_so = _fallback_col_by_index(df, 6)  # G
 
-    # Spalten I/J (Start/Enddatum) – per Name oder Fallback Index 8/9
+    # I/J (Indizes 8/9): Start/Ende
     col_start = find_column(df, DATE_START_CANDS, "Startdatum (Spalte I)", required=False)
     col_end   = find_column(df, DATE_END_CANDS,   "Enddatum (Spalte J)",   required=False)
-    if not col_start and df.shape[1] >= 9: col_start = _fallback_col_by_index(df, 8)  # I
+    if not col_start and df.shape[1] >= 9:  col_start = _fallback_col_by_index(df, 8)  # I
     if not col_end   and df.shape[1] >= 10: col_end   = _fallback_col_by_index(df, 9)  # J
 
     out = pd.DataFrame()
@@ -255,13 +207,16 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
     out["Bezeichnung"]     = df[col_name].astype(str) if col_name else ""
     out["Bezeichnung_key"] = out["Bezeichnung"].map(normalize_key)
 
-    # Mengen
     out["Verkaufsmenge"] = parse_number_series(df[col_sales]).fillna(0).astype("Int64")
     out["Einkaufsmenge"] = parse_number_series(df[col_buy]).fillna(0).astype("Int64") if col_buy else pd.Series([0]*len(df), dtype="Int64")
 
-    # Lagermenge nur aus Sell-out (Spalte G)
+    # Lagermenge NUR aus Sell-out (Spalte G) – sicher parsen + clippen
     if col_stock_so:
-        out["SellLagermenge"] = parse_number_series(df[col_stock_so]).astype(float)
+        out["SellLagermenge"] = (
+            parse_number_series(df[col_stock_so])
+            .astype(float)
+            .clip(lower=0, upper=MAX_QTY)
+        )
 
     # Datumsperioden (I/J)
     if col_start: out["StartDatum"] = parse_date_series_us(df[col_start])
@@ -271,30 +226,33 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 # =========================
-# Matching-Backstops (verkürzt, da hier nicht relevant für Lagerstand)
-# =========================
-def _assign_from_price_row(merged: pd.DataFrame, i, row: pd.Series):
-    for col in ["Einkaufspreis","Verkaufspreis","Bezeichnung","ArtikelNr","ArtikelNr_key"]:
-        merged.at[i, col] = row.get(col, merged.at[i, col])
-
-def _final_backstops(merged: pd.DataFrame, price_df: pd.DataFrame):
-    pass
-
-# =========================
-# Merge & Werte (+ Quelle für Chart)
+# Merge & Werte (+ Kontrolltabelle)
 # =========================
 @st.cache_data(show_spinner=False)
 def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, latest_stock_baseline_df: pd.DataFrame|None=None):
     """
-    - Lagermenge/-wert: ausschliesslich aus Sell-out-Spalte G, je Artikel der jüngste Stand nach I/J.
-    - Umsatz/Erlöse: gefilterter Zeitraum + Preise aus Preisliste.
+    - Lagermenge/-wert: ausschliesslich aus Sell-out-Spalte G, je Artikel jüngste I/J-Zeile (UNGEFILTERT)
+    - Umsatz/Erlöse: gefilterter Zeitraum + Preise aus Preisliste
     """
     sell_for_stock = latest_stock_baseline_df if latest_stock_baseline_df is not None else filtered_sell_df
 
     # Merge für Umsätze
     merged = filtered_sell_df.merge(price_df, on=["ArtikelNr_key"], how="left", suffixes=("", "_pl"))
 
-    # Hilfsdatum je Zeile
+    # --- Umsatzwerte (overflow-sicher) ---
+    q_buy,p_buy   = sanitize_numbers(merged.get("Einkaufsmenge",0), merged.get("Einkaufspreis",np.nan))
+    q_sell,p_sell = sanitize_numbers(merged.get("Verkaufsmenge",0), merged.get("Verkaufspreis",np.nan))
+    with np.errstate(over="ignore", invalid="ignore"):
+        einkaufswert  = (q_buy.fillna(0.0)  * p_buy.fillna(0.0)).astype("float64")
+        verkaufswert  = (q_sell.fillna(0.0) * p_sell.fillna(0.0)).astype("float64")
+    einkaufswert[~np.isfinite(einkaufswert)] = 0.0
+    verkaufswert[~np.isfinite(verkaufswert)] = 0.0
+    merged["Einkaufswert"] = einkaufswert
+    merged["Verkaufswert"] = verkaufswert
+
+    # === Letzter Lagerstand aus Sell-out (G) nach jüngster I/J ===
+    stock_df = sell_for_stock.copy()
+
     def _row_date(df):
         if ("EndDatum" in df.columns) and ("StartDatum" in df.columns):
             d = df["EndDatum"].fillna(df["StartDatum"])
@@ -306,49 +264,42 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
             d = pd.NaT
         return pd.to_datetime(d, errors="coerce")
 
-    merged["_rowdate"] = _row_date(merged)
-
-    # --- Umsatzwerte (gefiltert) ---
-    q_buy,p_buy   = sanitize_numbers(merged.get("Einkaufsmenge",0), merged.get("Einkaufspreis",np.nan))
-    q_sell,p_sell = sanitize_numbers(merged.get("Verkaufsmenge",0), merged.get("Verkaufspreis",np.nan))
-    with np.errstate(over='ignore', invalid='ignore'):
-        merged["Einkaufswert"] = (q_buy.fillna(0)*p_buy.fillna(0)).astype("float64")
-        merged["Verkaufswert"] = (q_sell.fillna(0)*p_sell.fillna(0)).astype("float64")
-
-    # === Letzter Lagerstand pro Artikel aus Sell-out (Spalte G) nach jüngster I/J ===
-    stock_df = sell_for_stock.copy()
     stock_df["_rowdate"] = _row_date(stock_df)
 
-    # Nur Zeilen mit echter SellLagermenge berücksichtigen
     if "SellLagermenge" in stock_df.columns:
         stock_df = stock_df[~stock_df["SellLagermenge"].isna()].copy()
+        stock_df["SellLagermenge"] = pd.to_numeric(stock_df["SellLagermenge"], errors="coerce").clip(0, MAX_QTY)
     else:
-        # Wenn die Spalte fehlt, dann kein Lagerstand verfügbar
         stock_df = stock_df.iloc[0:0].copy()
         stock_df["SellLagermenge"] = np.nan
 
-    # Pro Artikel jünsteste Zeile wählen (nach _rowdate)
     stock_df = stock_df.sort_values(["ArtikelNr_key","_rowdate"], ascending=[True, True])
     last_rows = stock_df.groupby("ArtikelNr_key", as_index=False).tail(1)
 
     latest_qty_map = last_rows.set_index("ArtikelNr_key")["SellLagermenge"].to_dict()
 
-    # Preis für den Lagerwert: aktueller Verkaufspreis aus Preisliste (falls vorhanden)
-    price_map = price_df.drop_duplicates("ArtikelNr_key").set_index("ArtikelNr_key")["Verkaufspreis"].to_dict()
+    # Preis aus Preisliste – clippen
+    price_map = (
+        price_df.drop_duplicates("ArtikelNr_key")
+                .assign(Verkaufspreis=lambda d: pd.to_numeric(d["Verkaufspreis"], errors="coerce").clip(0, MAX_PRICE))
+                .set_index("ArtikelNr_key")["Verkaufspreis"]
+                .to_dict()
+    )
 
-    # Auf das (gefilterte) Umsatz-DF projizieren
-    merged["Lagermenge_latest"] = merged["ArtikelNr_key"].map(latest_qty_map).astype(float)
-    merged["Verkaufspreis_latest"] = pd.to_numeric(merged["ArtikelNr_key"].map(price_map), errors="coerce")
-    merged["Lagerwert_latest"] = (merged["Lagermenge_latest"].fillna(0.0) * merged["Verkaufspreis_latest"].fillna(0.0)).astype("float64")
+    merged["Lagermenge_latest"]     = pd.to_numeric(merged["ArtikelNr_key"].map(latest_qty_map), errors="coerce").fillna(0.0).astype("float64").clip(0, MAX_QTY)
+    merged["Verkaufspreis_latest"]  = pd.to_numeric(merged["ArtikelNr_key"].map(price_map), errors="coerce").fillna(0.0).astype("float64").clip(0, MAX_PRICE)
 
-    # === Tabellen ===
-    # Detail: nutzt latest-Werte (identisch je Artikel in allen Zeilen)
+    with np.errstate(over="ignore", invalid="ignore"):
+        lagerwert = merged["Lagermenge_latest"] * merged["Verkaufspreis_latest"]
+    lagerwert[~np.isfinite(lagerwert)] = 0.0
+    merged["Lagerwert_latest"] = lagerwert
+
+    # --- Tabellen (Lagermenge/-wert = letzter Stand, nicht Summe) ---
     detail = merged[["ArtikelNr","Bezeichnung","Kategorie","Einkaufsmenge","Einkaufswert","Verkaufsmenge","Verkaufswert"]].copy()
     detail.rename(columns={"Bezeichnung":"Bezeichnung_anzeige"}, inplace=True)
     detail["Lagermenge"] = merged["Lagermenge_latest"]
     detail["Lagerwert"]  = merged["Lagerwert_latest"]
 
-    # Summen je Artikel: Lager* = letzter Stand (max), nicht Summe
     totals = (detail.groupby(["ArtikelNr","Bezeichnung_anzeige","Kategorie"], dropna=False, as_index=False)
               .agg({
                   "Einkaufsmenge":"sum",
@@ -359,20 +310,32 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
                   "Lagerwert":"max",
               }))
 
-    # Datenquelle fürs Chart (nur Umsätze)
+    # Kontrolltabelle: von welcher Zeile stammt der letzte Lagerstand?
+    latest_stock_view = (last_rows[["ArtikelNr_key","ArtikelNr","Bezeichnung","SellLagermenge","StartDatum","EndDatum"]]
+                         .rename(columns={
+                             "SellLagermenge":"Lagermenge (G)",
+                             "StartDatum":"Start (I)",
+                             "EndDatum":"Ende (J)",
+                         }))
+    latest_stock_view["Preis (PL)"] = latest_stock_view["ArtikelNr_key"].map(price_map).astype(float)
+    latest_stock_view["Lagerwert"]  = latest_stock_view["Lagermenge (G)"].astype(float) * latest_stock_view["Preis (PL)"].astype(float)
+
+    # Quelle fürs Chart (nur Umsätze)
     ts_source = pd.DataFrame()
     if "StartDatum" in merged.columns:
         ts_source = merged[["StartDatum","Kategorie","Verkaufswert"]].copy()
         ts_source["Kategorie"] = ts_source["Kategorie"].fillna("— ohne Kategorie —").replace({"":"— ohne Kategorie —"})
 
-    merged.drop(columns=["_rowdate"], errors="ignore", inplace=True)
-    return detail, totals, ts_source
+    return detail, totals, ts_source, latest_stock_view
 
 # =========================
 # UI
 # =========================
-st.title("📊 Galaxus Sellout Analyse (Woche – Lagerstand aus Sell-out Spalte G)")
-st.caption("Lagermenge stammt ausschliesslich aus dem Sell-out (Spalte G); als letzter Stand gilt die jüngste Periode (I/J).")
+st.title("📊 Galaxus Sellout Analyse (Woche – korrekter letzter Lagerwert)")
+st.caption(
+    "Lagermenge stammt ausschliesslich aus dem Sell-out (Spalte G). "
+    "Als letzter Stand gilt die jüngste Periode (I/J). Zeitfilter wirkt nur auf Umsätze."
+)
 
 c1,c2 = st.columns(2)
 with c1:
@@ -397,7 +360,7 @@ if sell_file and price_file:
             sell_df  = prepare_sell_df(raw_sell)
             price_df = prepare_price_df(raw_price)
 
-        # Zeitraumfilter (beeinflusst NUR Umsätze; Lagerstand immer „letzte I/J“)
+        # ===== Zeitraumfilter (wirkt nur auf Umsätze) =====
         filtered_sell_df = sell_df
         if {"StartDatum","EndDatum"}.issubset(sell_df.columns) and not sell_df["StartDatum"].isna().all():
             st.subheader("Periode wählen")
@@ -429,10 +392,12 @@ if sell_file and price_file:
             mask = ~((sell_df["EndDatum"].dt.date < start_date) |
                      (sell_df["StartDatum"].dt.date > end_date))
             filtered_sell_df = sell_df.loc[mask].copy()
+        # ================================================
 
         with st.spinner("🔗 Matche & berechne Werte…"):
-            # Wichtig: un-gefilterten sell_df als Baseline mitgeben
-            detail, totals, ts_source = enrich_and_merge(filtered_sell_df, price_df, latest_stock_baseline_df=sell_df)
+            detail, totals, ts_source, latest_stock_view = enrich_and_merge(
+                filtered_sell_df, price_df, latest_stock_baseline_df=sell_df
+            )
 
         # ===== EIN Chart: Wochenverlauf (Umsatz) =====
         st.markdown("### 📈 Verkaufsverlauf nach Kategorie (Woche)")
@@ -484,6 +449,16 @@ if sell_file and price_file:
         else:
             st.info("Für den Verlauf werden gültige Startdaten benötigt.")
 
+        # ===== Kontrolltabelle =====
+        st.markdown("#### 🔍 Kontrolle: herangezogener letzter Lagerstand (aus Sell-out)")
+        st.dataframe(latest_stock_view, use_container_width=True)
+        st.download_button(
+            "⬇️ Kontrolle (CSV)",
+            data=latest_stock_view.to_csv(index=False).encode("utf-8"),
+            file_name="kontrolle_letzter_lagerstand.csv",
+            mime="text/csv"
+        )
+
         # ===== Tabellen =====
         show_detail = st.checkbox("Detailtabelle anzeigen", value=False)
         if show_detail:
@@ -491,17 +466,23 @@ if sell_file and price_file:
             d_rounded, d_styler = style_numeric(detail)
             st.dataframe(d_styler, use_container_width=True)
 
-        st.subheader("Summen pro Artikel (Lagerwert = letzter Stand aus Sell-out)")
+        st.subheader("Summen pro Artikel (Lagerwert = letzter Stand)")
         t_rounded, t_styler = style_numeric(totals)
         st.dataframe(t_styler, use_container_width=True)
 
         dl1, dl2 = st.columns(2)
         with dl1:
-            st.download_button("⬇️ Detail (CSV)", data=(detail if show_detail else pd.DataFrame()).to_csv(index=False).encode("utf-8"),
-                               file_name="detail.csv", mime="text/csv", disabled=not show_detail)
+            st.download_button(
+                "⬇️ Detail (CSV)",
+                data=(detail if show_detail else pd.DataFrame()).to_csv(index=False).encode("utf-8"),
+                file_name="detail.csv", mime="text/csv", disabled=not show_detail
+            )
         with dl2:
-            st.download_button("⬇️ Summen (CSV)", data=t_rounded.to_csv(index=False).encode("utf-8"),
-                               file_name="summen.csv", mime="text/csv")
+            st.download_button(
+                "⬇️ Summen (CSV)",
+                data=t_rounded.to_csv(index=False).encode("utf-8"),
+                file_name="summen.csv", mime="text/csv"
+            )
 
     except KeyError as e:
         st.error(str(e))
