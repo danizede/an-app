@@ -1,8 +1,11 @@
-# app.py — Galaxus Sellout Analyse (Woche + korrekter letzter Lagerwert aus Sell-out Spalte G)
-# - Lagermenge ausschliesslich aus Sell-out (Spalte G), letzter Stand = jüngste I/J-Periode
-# - Overflow-Schutz (Clipping) für Mengen/Preise/Produkte
-# - Interaktives Wochen-Chart mit Hover-Highlight & Pop-up
-# - Kontrolltabelle "welche G/I/J-Zeile wurde genommen?"
+# app.py — Galaxus Sellout Analyse
+# Struktur: Einkauf • Verkauf • Lager (Lager = letzter Stand aus Sell-out Spalte G je Artikel, bestimmt über neueste Periode I/J)
+# - Robustes Einlesen
+# - Matching per ArtikelNr_key (ArtNr normalisiert)
+# - Zeitfilter wirkt nur auf Umsätze (nicht auf letzten Lagerstand)
+# - Overflow-Schutz (Clipping/NaN-Handling)
+# - Wochen-Chart mit Hover-Highlight
+# - Kontrolltabelle: zeigt, aus welcher G/I/J-Zeile der letzte Lagerstand stammt
 
 import re
 import unicodedata
@@ -13,17 +16,16 @@ import altair as alt
 
 st.set_page_config(page_title="Galaxus Sellout Analyse", layout="wide")
 
-# Altair: große Datensätze erlauben
 try:
     alt.data_transformers.disable_max_rows()
 except Exception:
     pass
 
 # =========================
-# Anzeige-Helfer
+# Konstanten & Anzeige
 # =========================
 THOUSANDS_SEP = "'"
-MAX_QTY, MAX_PRICE = 1_000_000, 1_000_000  # Obergrenzen für Clip
+MAX_QTY, MAX_PRICE = 1_000_000, 1_000_000
 
 NUM_COLS_DEFAULT = [
     "Einkaufsmenge","Einkaufswert",
@@ -45,7 +47,7 @@ def style_numeric(df: pd.DataFrame, num_cols=NUM_COLS_DEFAULT, sep=THOUSANDS_SEP
     return out, out.style.format(fmt)
 
 # =========================
-# Datei robust einlesen
+# Einlesen (robust gegen Kopfzeilen)
 # =========================
 def read_excel_flat(upload) -> pd.DataFrame:
     raw = pd.read_excel(upload, header=None, dtype=object)
@@ -122,17 +124,31 @@ def sanitize_numbers(qty: pd.Series, price: pd.Series) -> tuple[pd.Series,pd.Ser
     return q, p
 
 # =========================
-# Parsing – Preisliste
+# Feld-Kandidaten
 # =========================
-PRICE_COL_CANDIDATES = ["Preis","VK","Netto","NETTO","Einkaufspreis","Verkaufspreis","NETTO NETTO","Einkauf"]
-BUY_PRICE_CANDIDATES  = ["Einkaufspreis","Einkauf"]
-SELL_PRICE_CANDIDATES = ["Verkaufspreis","VK","Preis"]
-
 ARTNR_CANDIDATES = ["Artikelnummer","Artikelnr","ArtikelNr","Artikel-Nr.","Hersteller-Nr.","Produkt ID","ProdNr","ArtNr","ArtikelNr.","Artikel"]
 EAN_CANDIDATES  = ["EAN","GTIN","BarCode","Barcode"]
 NAME_CANDIDATES_PL = ["Bezeichnung","Produktname","Name","Titel","Artikelname"]
 CAT_CANDIDATES  = ["Kategorie","Warengruppe","Zusatz"]
 
+NAME_CANDIDATES_SO   = ["Bezeichnung","Name","Artikelname","Bezeichnung_Sales","Produktname"]
+SALES_QTY_CANDIDATES = ["SalesQty","Verkauf","Verkaufte Menge","Menge verkauft","Absatz","Stück","Menge"]
+BUY_QTY_CANDIDATES   = ["Einkauf","Einkaufsmenge","Menge Einkauf"]
+
+DATE_START_CANDS     = ["Start","Startdatum","Start Date","Anfangs datum","Anfangsdatum","Von","Period Start"]
+DATE_END_CANDS       = ["Ende","Enddatum","End Date","Bis","Period End"]
+
+# WICHTIG: Lagermenge im Sell-out (Spalte G)
+STOCK_SO_CANDIDATES  = ["Lagermenge","Lagerbestand","Bestand"]
+
+# Preise Preisliste
+BUY_PRICE_CANDIDATES  = ["Einkaufspreis","Einkauf"]
+SELL_PRICE_CANDIDATES = ["Verkaufspreis","VK","Preis"]
+PRICE_COL_CANDIDATES  = ["Preis","VK","Netto","NETTO","NETTO NETTO","Einkaufspreis","Verkaufspreis","Einkauf"]
+
+# =========================
+# Parsing – Preislisten
+# =========================
 def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     df = normalize_cols(df)
     col_art   = find_column(df, ARTNR_CANDIDATES, "Artikelnummer")
@@ -161,7 +177,6 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     if "Einkaufspreis" not in out: out["Einkaufspreis"]=out.get("Verkaufspreis", pd.Series([np.nan]*len(out)))
     if "Verkaufspreis" not in out: out["Verkaufspreis"]=out.get("Einkaufspreis", pd.Series([np.nan]*len(out)))
 
-    # Dedupliziere nach ArtikelNr_key (bevorzuge mit Preis)
     out = out.assign(_have=out["Verkaufspreis"].notna()).sort_values(["ArtikelNr_key","_have"], ascending=[True,False])
     out = out.drop_duplicates(subset=["ArtikelNr_key"], keep="first").drop(columns=["_have"])
     return out
@@ -169,13 +184,6 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
 # =========================
 # Parsing – Sell-out (G/I/J)
 # =========================
-NAME_CANDIDATES_SO   = ["Bezeichnung","Name","Artikelname","Bezeichnung_Sales","Produktname"]
-SALES_QTY_CANDIDATES = ["SalesQty","Verkauf","Verkaufte Menge","Menge verkauft","Absatz","Stück","Menge"]
-BUY_QTY_CANDIDATES   = ["Einkauf","Einkaufsmenge","Menge Einkauf"]
-DATE_START_CANDS     = ["Start","Startdatum","Start Date","Anfangs datum","Anfangsdatum","Von","Period Start"]
-DATE_END_CANDS       = ["Ende","Enddatum","End Date","Bis","Period End"]
-STOCK_SO_CANDIDATES  = ["Lagermenge","Lagerbestand","Bestand"]  # Spalte G
-
 def _fallback_col_by_index(df: pd.DataFrame, idx0: int) -> str|None:
     try: return df.columns[idx0]
     except: return None
@@ -188,16 +196,16 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
     col_sales = find_column(df, SALES_QTY_CANDIDATES, "Verkaufsmenge", required=True)
     col_buy   = find_column(df, BUY_QTY_CANDIDATES,   "Einkaufsmenge", required=False)
 
-    # G (Index 6): Lagermenge im Sell-out
+    # Spalte G
     col_stock_so = find_column(df, STOCK_SO_CANDIDATES, "Lagermenge (Sell-out: Spalte G)", required=False)
     if not col_stock_so and df.shape[1] >= 7:
-        col_stock_so = _fallback_col_by_index(df, 6)  # G
+        col_stock_so = _fallback_col_by_index(df, 6)
 
-    # I/J (Indizes 8/9): Start/Ende
+    # I/J
     col_start = find_column(df, DATE_START_CANDS, "Startdatum (Spalte I)", required=False)
     col_end   = find_column(df, DATE_END_CANDS,   "Enddatum (Spalte J)",   required=False)
-    if not col_start and df.shape[1] >= 9:  col_start = _fallback_col_by_index(df, 8)  # I
-    if not col_end   and df.shape[1] >= 10: col_end   = _fallback_col_by_index(df, 9)  # J
+    if not col_start and df.shape[1] >= 9:  col_start = _fallback_col_by_index(df, 8)
+    if not col_end   and df.shape[1] >= 10: col_end   = _fallback_col_by_index(df, 9)
 
     out = pd.DataFrame()
     out["ArtikelNr"]       = df[col_art].astype(str) if col_art else ""
@@ -210,7 +218,7 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
     out["Verkaufsmenge"] = parse_number_series(df[col_sales]).fillna(0).astype("Int64")
     out["Einkaufsmenge"] = parse_number_series(df[col_buy]).fillna(0).astype("Int64") if col_buy else pd.Series([0]*len(df), dtype="Int64")
 
-    # Lagermenge NUR aus Sell-out (Spalte G) – sicher parsen + clippen
+    # Lagermenge nur aus Sell-out (G) – clippen
     if col_stock_so:
         out["SellLagermenge"] = (
             parse_number_series(df[col_stock_so])
@@ -226,31 +234,30 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 # =========================
-# Merge & Werte (+ Kontrolltabelle)
+# Merge & Werte
 # =========================
 @st.cache_data(show_spinner=False)
 def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, latest_stock_baseline_df: pd.DataFrame|None=None):
     """
-    - Lagermenge/-wert: ausschliesslich aus Sell-out-Spalte G, je Artikel jüngste I/J-Zeile (UNGEFILTERT)
-    - Umsatz/Erlöse: gefilterter Zeitraum + Preise aus Preisliste
+    - Lager (Menge/Wert): ausschliesslich aus Sell-out G, je Artikel jüngste I/J-Zeile aus latest_stock_baseline_df (ungefiltert)
+    - Umsätze/Einkäufe: aus filtered_sell_df mit Preisen aus Preisliste
     """
     sell_for_stock = latest_stock_baseline_df if latest_stock_baseline_df is not None else filtered_sell_df
 
-    # Merge für Umsätze
-    merged = filtered_sell_df.merge(price_df, on=["ArtikelNr_key"], how="left", suffixes=("", "_pl"))
+    # Merge für Umsätze/Einkäufe
+    merged = filtered_sell_df.merge(price_df[["ArtikelNr_key","ArtikelNr","Bezeichnung","Kategorie","Einkaufspreis","Verkaufspreis"]],
+                                    on="ArtikelNr_key", how="left", suffixes=("", "_pl"))
 
-    # --- Umsatzwerte (overflow-sicher) ---
+    # Umsatz/Einkauf (overflow-sicher)
     q_buy,p_buy   = sanitize_numbers(merged.get("Einkaufsmenge",0), merged.get("Einkaufspreis",np.nan))
     q_sell,p_sell = sanitize_numbers(merged.get("Verkaufsmenge",0), merged.get("Verkaufspreis",np.nan))
     with np.errstate(over="ignore", invalid="ignore"):
-        einkaufswert  = (q_buy.fillna(0.0)  * p_buy.fillna(0.0)).astype("float64")
-        verkaufswert  = (q_sell.fillna(0.0) * p_sell.fillna(0.0)).astype("float64")
-    einkaufswert[~np.isfinite(einkaufswert)] = 0.0
-    verkaufswert[~np.isfinite(verkaufswert)] = 0.0
-    merged["Einkaufswert"] = einkaufswert
-    merged["Verkaufswert"] = verkaufswert
+        merged["Einkaufswert"] = (q_buy.fillna(0)*p_buy.fillna(0)).astype("float64")
+        merged["Verkaufswert"] = (q_sell.fillna(0)*p_sell.fillna(0)).astype("float64")
+    merged["Einkaufswert"].mask(~np.isfinite(merged["Einkaufswert"]), 0.0, inplace=True)
+    merged["Verkaufswert"].mask(~np.isfinite(merged["Verkaufswert"]), 0.0, inplace=True)
 
-    # === Letzter Lagerstand aus Sell-out (G) nach jüngster I/J ===
+    # === Letzter Lagerstand je Artikel (aus ungefiltertem Sell-out) ===
     stock_df = sell_for_stock.copy()
 
     def _row_date(df):
@@ -276,65 +283,55 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
     stock_df = stock_df.sort_values(["ArtikelNr_key","_rowdate"], ascending=[True, True])
     last_rows = stock_df.groupby("ArtikelNr_key", as_index=False).tail(1)
 
-    latest_qty_map = last_rows.set_index("ArtikelNr_key")["SellLagermenge"].to_dict()
+    latest_qty_map  = last_rows.set_index("ArtikelNr_key")["SellLagermenge"].to_dict()
+    price_map       = pd.to_numeric(price_df.drop_duplicates("ArtikelNr_key").set_index("ArtikelNr_key")["Verkaufspreis"], errors="coerce").clip(0, MAX_PRICE).to_dict()
 
-    # Preis aus Preisliste – clippen
-    price_map = (
-        price_df.drop_duplicates("ArtikelNr_key")
-                .assign(Verkaufspreis=lambda d: pd.to_numeric(d["Verkaufspreis"], errors="coerce").clip(0, MAX_PRICE))
-                .set_index("ArtikelNr_key")["Verkaufspreis"]
-                .to_dict()
-    )
-
-    merged["Lagermenge_latest"]     = pd.to_numeric(merged["ArtikelNr_key"].map(latest_qty_map), errors="coerce").fillna(0.0).astype("float64").clip(0, MAX_QTY)
-    merged["Verkaufspreis_latest"]  = pd.to_numeric(merged["ArtikelNr_key"].map(price_map), errors="coerce").fillna(0.0).astype("float64").clip(0, MAX_PRICE)
-
+    # auf merged projizieren
+    merged["Lagermenge_latest"]    = pd.to_numeric(merged["ArtikelNr_key"].map(latest_qty_map), errors="coerce").fillna(0.0).astype("float64").clip(0, MAX_QTY)
+    merged["Verkaufspreis_latest"] = pd.to_numeric(merged["ArtikelNr_key"].map(price_map), errors="coerce").fillna(0.0).astype("float64").clip(0, MAX_PRICE)
     with np.errstate(over="ignore", invalid="ignore"):
-        lagerwert = merged["Lagermenge_latest"] * merged["Verkaufspreis_latest"]
-    lagerwert[~np.isfinite(lagerwert)] = 0.0
-    merged["Lagerwert_latest"] = lagerwert
+        merged["Lagerwert_latest"] = (merged["Lagermenge_latest"] * merged["Verkaufspreis_latest"]).astype("float64")
+    merged["Lagerwert_latest"].mask(~np.isfinite(merged["Lagerwert_latest"]), 0.0, inplace=True)
 
-    # --- Tabellen (Lagermenge/-wert = letzter Stand, nicht Summe) ---
+    # ---- Tabellenaufbau (alte Struktur) ----
+    # Detail (Zeilenebene, aber Lager = letzter Stand je Artikel)
     detail = merged[["ArtikelNr","Bezeichnung","Kategorie","Einkaufsmenge","Einkaufswert","Verkaufsmenge","Verkaufswert"]].copy()
     detail.rename(columns={"Bezeichnung":"Bezeichnung_anzeige"}, inplace=True)
     detail["Lagermenge"] = merged["Lagermenge_latest"]
     detail["Lagerwert"]  = merged["Lagerwert_latest"]
 
-    totals = (detail.groupby(["ArtikelNr","Bezeichnung_anzeige","Kategorie"], dropna=False, as_index=False)
-              .agg({
-                  "Einkaufsmenge":"sum",
-                  "Einkaufswert":"sum",
-                  "Verkaufsmenge":"sum",
-                  "Verkaufswert":"sum",
-                  "Lagermenge":"max",
-                  "Lagerwert":"max",
-              }))
+    # Summen pro Artikel – Einkauf/Verkauf summieren, Lager = letzter Stand (nicht summieren)
+    summary = (detail.groupby(["ArtikelNr","Bezeichnung_anzeige","Kategorie"], as_index=False)
+               .agg({
+                   "Einkaufsmenge":"sum",
+                   "Einkaufswert":"sum",
+                   "Verkaufsmenge":"sum",
+                   "Verkaufswert":"sum",
+                   "Lagermenge":"max",
+                   "Lagerwert":"max",
+               }))
 
-    # Kontrolltabelle: von welcher Zeile stammt der letzte Lagerstand?
+    # Kontrolltabelle: aus welcher G/I/J-Zeile stammt der Lagerstand?
     latest_stock_view = (last_rows[["ArtikelNr_key","ArtikelNr","Bezeichnung","SellLagermenge","StartDatum","EndDatum"]]
-                         .rename(columns={
-                             "SellLagermenge":"Lagermenge (G)",
-                             "StartDatum":"Start (I)",
-                             "EndDatum":"Ende (J)",
-                         }))
+                         .rename(columns={"SellLagermenge":"Lagermenge (G)","StartDatum":"Start (I)","EndDatum":"Ende (J)"}))
     latest_stock_view["Preis (PL)"] = latest_stock_view["ArtikelNr_key"].map(price_map).astype(float)
     latest_stock_view["Lagerwert"]  = latest_stock_view["Lagermenge (G)"].astype(float) * latest_stock_view["Preis (PL)"].astype(float)
 
-    # Quelle fürs Chart (nur Umsätze)
+    # Zeitquelle fürs Chart
     ts_source = pd.DataFrame()
     if "StartDatum" in merged.columns:
         ts_source = merged[["StartDatum","Kategorie","Verkaufswert"]].copy()
         ts_source["Kategorie"] = ts_source["Kategorie"].fillna("— ohne Kategorie —").replace({"":"— ohne Kategorie —"})
 
-    return detail, totals, ts_source, latest_stock_view
+    return detail, summary, ts_source, latest_stock_view
 
 # =========================
 # UI
 # =========================
-st.title("📊 Galaxus Sellout Analyse (Woche – korrekter letzter Lagerwert)")
+st.title("📊 Galaxus Sellout Analyse (Einkauf • Verkauf • Lager)")
 st.caption(
-    "Lagermenge stammt ausschliesslich aus dem Sell-out (Spalte G). "
-    "Als letzter Stand gilt die jüngste Periode (I/J). Zeitfilter wirkt nur auf Umsätze."
+    "Lager basiert ausschliesslich auf Sell-out Spalte G; letzter Stand je Artikel per jüngster Periode I/J. "
+    "Zeitfilter wirkt nur auf Umsätze/Einkäufe."
 )
 
 c1,c2 = st.columns(2)
@@ -360,7 +357,7 @@ if sell_file and price_file:
             sell_df  = prepare_sell_df(raw_sell)
             price_df = prepare_price_df(raw_price)
 
-        # ===== Zeitraumfilter (wirkt nur auf Umsätze) =====
+        # ===== Zeitraumfilter (beeinflusst NUR Umsätze/Einkäufe) =====
         filtered_sell_df = sell_df
         if {"StartDatum","EndDatum"}.issubset(sell_df.columns) and not sell_df["StartDatum"].isna().all():
             st.subheader("Periode wählen")
@@ -392,21 +389,20 @@ if sell_file and price_file:
             mask = ~((sell_df["EndDatum"].dt.date < start_date) |
                      (sell_df["StartDatum"].dt.date > end_date))
             filtered_sell_df = sell_df.loc[mask].copy()
-        # ================================================
+        # =============================================================
 
         with st.spinner("🔗 Matche & berechne Werte…"):
-            detail, totals, ts_source, latest_stock_view = enrich_and_merge(
+            detail, summary, ts_source, latest_stock_view = enrich_and_merge(
                 filtered_sell_df, price_df, latest_stock_baseline_df=sell_df
             )
 
-        # ===== EIN Chart: Wochenverlauf (Umsatz) =====
+        # ===== Chart: Wochen-Verlauf Verkauf =====
         st.markdown("### 📈 Verkaufsverlauf nach Kategorie (Woche)")
         if not ts_source.empty:
             ts = ts_source.dropna(subset=["StartDatum"]).copy()
             ts["Periode"] = ts["StartDatum"].dt.to_period("W").dt.start_time
             ts["Kategorie"] = ts["Kategorie"].astype("string").fillna("— ohne Kategorie —").replace({"":"— ohne Kategorie —"})
 
-            # Filter Kategorien
             all_cats = sorted(ts["Kategorie"].unique())
             sel_cats = st.multiselect("Kategorien filtern", options=all_cats, default=all_cats)
             if sel_cats:
@@ -421,31 +417,28 @@ if sell_file and price_file:
             hover_pt  = alt.selection_single(fields=["Periode","Kategorie"], on="mouseover", nearest=True, empty="none")
 
             base = alt.Chart(ts_agg)
-
             lines = (
-                base.mark_line(point=alt.OverlayMarkDef(size=30), interpolate="linear")
+                base.mark_line(point=alt.OverlayMarkDef(size=28), interpolate="linear")
                     .encode(
                         x=alt.X("Periode:T", title="Woche"),
                         y=alt.Y("Wert:Q", title="Verkaufswert (Summe pro Woche)", stack=None),
                         color=alt.Color("Kategorie:N", title="Kategorie"),
                         opacity=alt.condition(hover_cat, alt.value(1.0), alt.value(0.25)),
                         strokeWidth=alt.condition(hover_cat, alt.value(3), alt.value(1.5)),
-                        tooltip=[
-                            alt.Tooltip("Periode:T", title="Woche"),
-                            alt.Tooltip("Kategorie:N", title="Kategorie"),
-                            alt.Tooltip("Wert:Q", title="Verkaufswert", format=",.0f"),
-                        ],
+                        tooltip=[alt.Tooltip("Periode:T", title="Woche"),
+                                 alt.Tooltip("Kategorie:N", title="Kategorie"),
+                                 alt.Tooltip("Wert:Q", title="Verkaufswert", format=",.0f")],
                     ).add_selection(hover_cat)
             )
             points = base.mark_point(size=70, opacity=0).encode(x="Periode:T", y="Wert:Q", color="Kategorie:N").add_selection(hover_pt)
-            popup = base.transform_filter(hover_pt).mark_text(align='left', dx=6, dy=-8, fontSize=12, fontWeight='bold')\
+            popup  = base.transform_filter(hover_pt).mark_text(align='left', dx=6, dy=-8, fontSize=12, fontWeight='bold')\
                         .encode(x="Periode:T", y="Wert:Q", text="Kategorie:N", color="Kategorie:N")
-            end_labels = (base.transform_window(row_number='row_number()', sort=[alt.SortField(field='Periode', order='descending')], groupby=['Kategorie'])
-                               .transform_filter(alt.datum.row_number == 0)
-                               .mark_text(align='left', dx=6, dy=-6, fontSize=11)
-                               .encode(x='Periode:T', y='Wert:Q', text='Kategorie:N', color='Kategorie:N',
-                                       opacity=alt.condition(hover_cat, alt.value(1.0), alt.value(0.6))))
-            st.altair_chart((lines + points + popup + end_labels).properties(height=400), use_container_width=True)
+            endlab = (base.transform_window(row_number='row_number()', sort=[alt.SortField(field='Periode', order='descending')], groupby=['Kategorie'])
+                          .transform_filter(alt.datum.row_number == 0)
+                          .mark_text(align='left', dx=6, dy=-6, fontSize=11)
+                          .encode(x='Periode:T', y='Wert:Q', text='Kategorie:N', color='Kategorie:N',
+                                  opacity=alt.condition(hover_cat, alt.value(1.0), alt.value(0.6))))
+            st.altair_chart((lines + points + popup + endlab).properties(height=380), use_container_width=True)
         else:
             st.info("Für den Verlauf werden gültige Startdaten benötigt.")
 
@@ -459,16 +452,16 @@ if sell_file and price_file:
             mime="text/csv"
         )
 
-        # ===== Tabellen =====
+        # ===== Tabellen (alte Struktur) =====
         show_detail = st.checkbox("Detailtabelle anzeigen", value=False)
         if show_detail:
-            st.subheader("Detailtabelle")
+            st.subheader("Detailtabelle (Zeilen)")
             d_rounded, d_styler = style_numeric(detail)
             st.dataframe(d_styler, use_container_width=True)
 
-        st.subheader("Summen pro Artikel (Lagerwert = letzter Stand)")
-        t_rounded, t_styler = style_numeric(totals)
-        st.dataframe(t_styler, use_container_width=True)
+        st.subheader("Summen pro Artikel – Einkauf • Verkauf • Lager (Lager = letzter Stand)")
+        s_rounded, s_styler = style_numeric(summary)
+        st.dataframe(s_styler, use_container_width=True)
 
         dl1, dl2 = st.columns(2)
         with dl1:
@@ -480,7 +473,7 @@ if sell_file and price_file:
         with dl2:
             st.download_button(
                 "⬇️ Summen (CSV)",
-                data=t_rounded.to_csv(index=False).encode("utf-8"),
+                data=s_rounded.to_csv(index=False).encode("utf-8"),
                 file_name="summen.csv", mime="text/csv"
             )
 
