@@ -397,7 +397,7 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
             d = pd.to_datetime(pd.NaT)
         return pd.to_datetime(d, errors="coerce")
 
-    merged["_rowdate"] = _rowdate = _row_date(merged)
+    merged["_rowdate"] = _row_date(merged)
     stock_merged["_rowdate"] = _row_date(stock_merged)
 
     # ---------- Fallback-Matches (nur auf Umsatz-Merge) ----------
@@ -448,7 +448,8 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
         merged["Verkaufswert"] = (q_sell*p_sell).astype("float64")
 
     # ---------- Bestimmung "letzter Lagerstand" ----------  (NUR dieser Block wurde angepasst)
-    # Nur Sell-out-Lagermenge verwenden (Spalte: SellLagermenge); KEIN Fallback auf Preisliste.
+    # Ziel: innerh. der UI-Periode den neuesten gemeldeten Sell-out-Bestand je Artikel bestimmen.
+    # Fallback: falls in der Periode nichts gemeldet, nimm letzten Bestand bis Periodenende.
     stock_merged = stock_merged.copy()
 
     # Nur Zeilen mit gemeldeter Lagermenge berücksichtigen
@@ -464,14 +465,36 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
         stock_valid = stock_merged.iloc[0:0].copy()
         stock_valid["SellLagermenge"] = np.nan
 
-    # Falls keine gültigen Bestände vorhanden sind, auf leeres Mapping fallen (ergibt 0)
-    if stock_valid.empty:
+    # Key-Bildung für robustes Matching: bevorzuge ArtikelNr_key, sonst EAN_key
+    def _mk_grpkey(df):
+        a = df.get("ArtikelNr_key","").astype(str).fillna("")
+        e = df.get("EAN_key","").astype(str).fillna("")
+        use_art = a.str.len() > 0
+        return np.where(use_art, "A:" + a, "E:" + e)
+
+    stock_valid["_grpkey"] = _mk_grpkey(stock_valid)
+    merged["_grpkey"]      = _mk_grpkey(merged)
+
+    # Periodengrenzen aus gefiltertem Umsatz (falls vorhanden)
+    period_min = pd.to_datetime(merged["_rowdate"]).min()
+    period_max = pd.to_datetime(merged["_rowdate"]).max()
+
+    # Filter 1: innerhalb der Periode
+    sv_in = stock_valid
+    if pd.notna(period_min) and pd.notna(period_max):
+        sv_in = stock_valid.loc[(stock_valid["_rowdate"]>=period_min) & (stock_valid["_rowdate"]<=period_max)]
+
+    # Wenn innerhalb der Periode nichts vorhanden, nimm alles bis Periodenende
+    if sv_in.empty and pd.notna(period_max):
+        sv_in = stock_valid.loc[(stock_valid["_rowdate"]<=period_max)]
+
+    # Wenn immer noch leer, bleibt Mapping leer → 0
+    if sv_in.empty:
         latest_qty_map = {}
     else:
-        # Neuester Bestand je Artikel über _rowdate (aus Start/Ende) bestimmen
-        stock_valid = stock_valid.sort_values(["ArtikelNr_key","_rowdate"], ascending=[True, True])
-        last_rows = stock_valid.groupby("ArtikelNr_key", as_index=False).tail(1)
-        latest_qty_map = last_rows.set_index("ArtikelNr_key")["SellLagermenge"].to_dict()
+        sv_in = sv_in.sort_values(["_grpkey","_rowdate"], ascending=[True, True])
+        last_rows = sv_in.groupby("_grpkey", as_index=False).tail(1)
+        latest_qty_map = last_rows.set_index("_grpkey")["SellLagermenge"].to_dict()
 
     # Verkaufspreis je Artikel aus Preisliste (ohne Datums-/Filtereinfluss)
     price_map = (
@@ -484,7 +507,7 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
 
     # Auf Umsatz-Merge projizieren
     merged["Lagermenge_latest"] = (
-        pd.to_numeric(merged["ArtikelNr_key"].map(latest_qty_map), errors="coerce")
+        pd.to_numeric(merged["_grpkey"].map(latest_qty_map), errors="coerce")
         .fillna(0.0).clip(lower=0, upper=MAX_QTY).astype("float64")
     )
     merged["Verkaufspreis_latest"] = (
@@ -520,7 +543,7 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
         ts_source = merged[["StartDatum","Kategorie","Verkaufswert"]].copy()
         ts_source["Kategorie"] = ts_source["Kategorie"].replace({"": "— ohne Kategorie —"}).fillna("— ohne Kategorie —")
 
-    merged.drop(columns=["_rowdate"], errors="ignore", inplace=True)
+    merged.drop(columns=["_rowdate","_grpkey"], errors="ignore", inplace=True)
 
     return detail, totals, ts_source
 
@@ -531,7 +554,8 @@ st.title("📊 Galaxus Sellout Analyse (Woche – korrekter letzter Lagerwert)")
 st.caption(
     "Summenansicht, robustes Matching (ArtNr → EAN → Name → Familie → Hints → Fuzzy), EU-Datumsfilter. "
     "Detailtabelle optional. Interaktiver Wochen-Überblick pro Kategorie. "
-    "Lagermenge/Lagerwert stammen stets aus der zuletzt verfügbaren Meldung je Artikel (nur Sell-out)."
+    "Lagermenge/Lagerwert stammen stets aus der zuletzt verfügbaren Meldung je Artikel (nur Sell-out), "
+    "validiert gegen die gewählte Datumsperiode."
 )
 
 c1, c2 = st.columns(2)
@@ -596,7 +620,7 @@ if sell_file and price_file:
         # ===============================================
 
         with st.spinner("🔗 Matche & berechne Werte…"):
-            # Ungefilterter sell_df als Baseline für "Letzter Lagerwert"
+            # Ungefilterter sell_df als Baseline – der neue Lager-Block beachtet die Periode selbst
             detail, totals, ts_source = enrich_and_merge(filtered_sell_df, price_df, latest_stock_baseline_df=sell_df)
 
         # ===== Linienchart =====
