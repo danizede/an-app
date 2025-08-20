@@ -3,13 +3,17 @@
 # - EU-Datumsfilter, Detailtabelle optional
 # - Summen pro Artikel (Lagerwert = letzter verfügbarer Stand je Artikel, NICHT aufsummiert)
 # - Interaktives Linienchart (Woche) mit Hover-Highlight & Pop-up-Label
+# - NEU: Auto-Load aus /data (sellout.xlsx, preisliste.xlsx) + optionales Persistieren von Uploads
 
+import os
+import io
 import re
 import unicodedata
 import numpy as np
 import pandas as pd
 import streamlit as st
 import altair as alt
+from pathlib import Path
 
 st.set_page_config(page_title="Galaxus Sellout Analyse", layout="wide")
 
@@ -235,7 +239,7 @@ SALES_QTY_CANDIDATES = ["SalesQty","Verkauf","Verkaufte Menge","Menge verkauft",
 BUY_QTY_CANDIDATES   = ["Einkauf","Einkaufsmenge","Menge Einkauf"]
 DATE_START_CANDS     = ["Start","Startdatum","Start Date","Anfangs datum","Anfangsdatum","Von","Period Start"]
 DATE_END_CANDS       = ["Ende","Enddatum","End Date","Bis","Period End"]
-STOCK_SO_CANDIDATES  = ["Lagermenge","Lagerbestand","Bestand","Verfügbar","verfügbar","Verfuegbar","Available"]  # <- erweitert
+STOCK_SO_CANDIDATES  = ["Lagermenge","Lagerbestand","Bestand","Verfügbar","verfügbar","Verfuegbar","Available"]  # <- inkl. "Verfügbar"
 
 # Einfache Äquivalenzen / Regeln
 ART_EXACT_EQUIV  = {"e008":"e009","j031":"j030","m057":"m051","s054":"s054"}
@@ -301,9 +305,9 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
 
     # Lagermenge aus Sell-out
     if col_stock_so:
-        # Wichtig: 0 ist ein gültiger, "gemeldeter" Bestand -> nicht zu NaN machen!
+        # 0 ist ein gültiger gemeldeter Bestand
         out["SellLagermenge"] = pd.to_numeric(df[col_stock_so], errors="coerce")
-    # Start/Ende
+
     if col_start: out["StartDatum"] = parse_date_series_us(df[col_start])
     if col_end:   out["EndDatum"]   = parse_date_series_us(df[col_end])
     if "StartDatum" in out and "EndDatum" in out:
@@ -534,6 +538,28 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
     return detail, totals, ts_source
 
 # =========================
+# NEU: Datenquellen / Fallbacks / Persistieren
+# =========================
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR.parent / "data" if (BASE_DIR.name == "galaxus_tool_source") else BASE_DIR / "data"
+DEFAULT_SELL_PATH  = DATA_DIR / "sellout.xlsx"
+DEFAULT_PRICE_PATH = DATA_DIR / "preisliste.xlsx"
+DATA_DIR.mkdir(exist_ok=True, parents=True)
+
+def _persist_upload(uploaded_file, target_path: Path):
+    """Upload dauerhaft im data/-Ordner speichern."""
+    if uploaded_file is None:
+        return
+    # Streamlit UploadedFile hat getvalue()
+    try:
+        content = uploaded_file.getvalue()
+    except Exception:
+        # Fallback auf .read() (selten nötig)
+        content = uploaded_file.read()
+    with open(target_path, "wb") as f:
+        f.write(content)
+
+# =========================
 # UI
 # =========================
 st.title("📊 Galaxus Sellout Analyse (Woche – korrekter letzter Lagerwert)")
@@ -547,21 +573,36 @@ c1, c2 = st.columns(2)
 with c1:
     st.subheader("Sell-out-Report (.xlsx)")
     sell_file = st.file_uploader("Drag & drop oder Datei wählen", type=["xlsx"], key="sell")
-    if "sell_last" in st.session_state and st.session_state["sell_last"]:
-        st.text(f"Letzter Sell-out: {st.session_state['sell_last']['name']}")
 with c2:
     st.subheader("Preisliste (.xlsx)")
     price_file = st.file_uploader("Drag & drop oder Datei wählen", type=["xlsx"], key="price")
-    if "price_last" in st.session_state and st.session_state["price_last"]:
-        st.text(f"Letzte Preisliste: {st.session_state['price_last']['name']}")
 
-if sell_file and price_file:
+# ======= NEU: Auto-Load + Fallback =======
+raw_sell = None
+raw_price = None
+
+if sell_file is not None:
+    raw_sell = read_excel_flat(sell_file)
+    st.session_state["sell_last"]  = {"name": sell_file.name}
+    # Optional: persistieren
+    _persist_upload(sell_file, DEFAULT_SELL_PATH)
+elif DEFAULT_SELL_PATH.exists():
+    with open(DEFAULT_SELL_PATH, "rb") as f:
+        raw_sell = read_excel_flat(io.BytesIO(f.read()))
+    st.session_state["sell_last"]  = {"name": DEFAULT_SELL_PATH.name}
+
+if price_file is not None:
+    raw_price = read_excel_flat(price_file)
+    st.session_state["price_last"] = {"name": price_file.name}
+    _persist_upload(price_file, DEFAULT_PRICE_PATH)
+elif DEFAULT_PRICE_PATH.exists():
+    with open(DEFAULT_PRICE_PATH, "rb") as f:
+        raw_price = read_excel_flat(io.BytesIO(f.read()))
+    st.session_state["price_last"] = {"name": DEFAULT_PRICE_PATH.name}
+
+# ======= Verarbeitung nur, wenn beide Quellen vorhanden =======
+if (raw_sell is not None) and (raw_price is not None):
     try:
-        st.session_state["sell_last"]  = {"name": sell_file.name}
-        st.session_state["price_last"] = {"name": price_file.name}
-        raw_sell  = read_excel_flat(sell_file)
-        raw_price = read_excel_flat(price_file)
-
         with st.spinner("📖 Lese & prüfe Spalten…"):
             sell_df  = prepare_sell_df(raw_sell)
             price_df = prepare_price_df(raw_price)
@@ -605,7 +646,13 @@ if sell_file and price_file:
         # ===============================================
 
         with st.spinner("🔗 Matche & berechne Werte…"):
+            # Ungefilterter sell_df als Baseline für "Letzter Lagerwert"
             detail, totals, ts_source = enrich_and_merge(filtered_sell_df, price_df, latest_stock_baseline_df=sell_df)
+
+        # ===== Info zu verwendeten Dateien =====
+        used_sell = st.session_state.get("sell_last", {}).get("name", "sellout.xlsx")
+        used_price = st.session_state.get("price_last", {}).get("name", "preisliste.xlsx")
+        st.info(f"Verwendete Dateien: {used_sell} / {used_price}")
 
         # ===== Linienchart =====
         st.markdown("### 📈 Verkaufsverlauf nach Kategorie (Woche)")
@@ -621,11 +668,13 @@ if sell_file and price_file:
                 .replace({"": "— ohne Kategorie —"})
             )
 
+            # Kategorien-Auswahl
             all_cats = sorted(ts["Kategorie"].unique())
             sel_cats = st.multiselect("Kategorien filtern", options=all_cats, default=all_cats)
             if sel_cats:
                 ts = ts[ts["Kategorie"].isin(sel_cats)]
 
+            # Wochenwerte je Kategorie summieren
             ts_agg = (ts.groupby(["Kategorie","Periode"], as_index=False)["Verkaufswert"]
                         .sum()
                         .rename(columns={"Verkaufswert":"Wert"}))
@@ -724,4 +773,4 @@ if sell_file and price_file:
     except Exception as e:
         st.error(f"Unerwarteter Fehler: {e}")
 else:
-    st.info("Bitte beide Dateien hochladen (Sell-out & Preisliste).")
+    st.info("Bitte beide Dateien hochladen oder in den Ordner `data/` legen (Sell-out = `sellout.xlsx`, Preisliste = `preisliste.xlsx`).")
