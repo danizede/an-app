@@ -6,6 +6,7 @@
 # - Auto-Load aus /data (sellout.xlsx, preisliste.xlsx) + optionales Persistieren von Uploads
 # - FIX: Sichere Multiplikation (safe_mul) + np.seterr(all="ignore")
 # - UPDATE: Kategorie primär aus Spalte G; leere/NaN-Kategorien bleiben leer und erscheinen nicht im Chart
+# - NEU: Summenzeile Σ Gesamt für Detail- und Summen-Tabelle (nur Anzeige; CSV ohne Σ)
 
 import os
 import io
@@ -51,10 +52,24 @@ def style_numeric(df: pd.DataFrame, num_cols=NUM_COLS_DEFAULT, sep=THOUSANDS_SEP
     fmt = {c: (lambda v, s=sep: _fmt_thousands(v, s)) for c in present}
     return out, out.style.format(fmt)
 
+def append_total_row_for_display(df: pd.DataFrame) -> pd.DataFrame:
+    """Hängt eine Summenzeile ans Tabellenende (nur für die Anzeige)."""
+    if df is None or df.empty:
+        return df
+    cols = list(df.columns)
+    num_targets = ["Einkaufsmenge","Einkaufswert","Verkaufsmenge","Verkaufswert","Lagermenge","Lagerwert"]
+    num_cols = [c for c in num_targets if c in cols]
+    label_col = next((c for c in ["Bezeichnung_anzeige","Bezeichnung","ArtikelNr","Kategorie"] if c in cols), cols[0])
+    total_row = {c: "" for c in cols}
+    total_row[label_col] = "Σ Gesamt"
+    for c in num_cols:
+        total_row[c] = pd.to_numeric(df[c], errors="coerce").sum()
+    return pd.concat([df, pd.DataFrame([total_row])], ignore_index=True)
+
 # =========================
 # Robust: Excel einlesen (tolerant ggü. Kopfzeilen)
 # =========================
-def read_excel_flat(upload):
+def read_excel_flat(upload) -> pd.DataFrame:
     raw = pd.read_excel(upload, header=None, dtype=object)
     if raw.empty: return pd.DataFrame()
     header_idx = int(raw.notna().mean(axis=1).idxmax())
@@ -93,7 +108,7 @@ def normalize_key(s: str) -> str:
     s = s.lower()
     return re.sub(r"[^a-z0-9]+","", s)
 
-def find_column(df: pd.DataFrame, candidates, purpose: str, required=True):
+def find_column(df: pd.DataFrame, candidates, purpose: str, required=True) -> str|None:
     cols = list(df.columns)
     for cand in candidates:
         if cand in cols: return cand
@@ -118,20 +133,21 @@ def parse_number_series(s: pd.Series) -> pd.Series:
 
 def parse_date_series_us(s: pd.Series) -> pd.Series:
     if np.issubdtype(s.dtype, np.datetime64): return s
-    dt1 = pd.to_datetime(s, errors="coerce", dayfirst=False)
+    dt1 = pd.to_datetime(s, errors="coerce", dayfirst=False, infer_datetime_format=True)
     nums = pd.to_numeric(s, errors="coerce")
     dt2 = pd.to_datetime(nums, origin="1899-12-30", unit="d", errors="coerce")
     return dt1.combine_first(dt2)
 
 # Obergrenzen (Overflow-Fix)
 MAX_QTY, MAX_PRICE = 1_000_000, 1_000_000
-def sanitize_numbers(qty: pd.Series, price: pd.Series):
+def sanitize_numbers(qty: pd.Series, price: pd.Series) -> tuple[pd.Series,pd.Series]:
     q = pd.to_numeric(qty, errors="coerce").astype("float64").clip(lower=0, upper=MAX_QTY)
     p = pd.to_numeric(price, errors="coerce").astype("float64").clip(lower=0, upper=MAX_PRICE)
     return q, p
 
 # Sichere Multiplikation (gegen Overflow/NaN/Inf)
-def safe_mul(a: pd.Series, b: pd.Series, max_a=MAX_QTY, max_b=MAX_PRICE) -> pd.Series:
+def safe_mul(a: pd.Series, b: pd.Series,
+             max_a=MAX_QTY, max_b=MAX_PRICE) -> pd.Series:
     a = pd.to_numeric(a, errors="coerce").astype("float64")
     b = pd.to_numeric(b, errors="coerce").astype("float64")
     a = np.clip(a, 0, max_a)
@@ -298,7 +314,7 @@ def _apply_hints_to_row(name_raw: str) -> dict:
     if "mia" in s and "m-057" in s: h["hint_art_exact"]="m057"
     return h
 
-def _fallback_col_by_index(df: pd.DataFrame, idx0: int):
+def _fallback_col_by_index(df: pd.DataFrame, idx0: int) -> str|None:
     try: return df.columns[idx0]
     except: return None
 
@@ -310,16 +326,16 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
     col_sales = find_column(df, SALES_QTY_CANDIDATES, "Verkaufsmenge", required=True)
     col_buy   = find_column(df, BUY_QTY_CANDIDATES,   "Einkaufsmenge", required=False)
 
-    # Lager aus Sell-out (G = Index 6) – Header- oder Positions-Fallback
+    # Lager (Spalte G Fallback)
     col_stock_so = find_column(df, STOCK_SO_CANDIDATES, "Lagermenge (Sell-out)", required=False)
     if not col_stock_so and df.shape[1] >= 7:
-        col_stock_so = _fallback_col_by_index(df, 6)  # Spalte G
+        col_stock_so = _fallback_col_by_index(df, 6)
 
     # Datumsfelder (I/J)
     col_start = find_column(df, DATE_START_CANDS, "Startdatum (Spalte I)", required=False)
     col_end   = find_column(df, DATE_END_CANDS,   "Enddatum (Spalte J)",   required=False)
-    if not col_start and df.shape[1]>=9:  col_start=_fallback_col_by_index(df,8)   # Spalte I
-    if not col_end   and df.shape[1]>=10: col_end  =_fallback_col_by_index(df,9)   # Spalte J
+    if not col_start and df.shape[1]>=9:  col_start=_fallback_col_by_index(df,8)
+    if not col_end   and df.shape[1]>=10: col_end  =_fallback_col_by_index(df,9)
 
     out = pd.DataFrame()
     out["ArtikelNr"]       = df[col_art].astype(str) if col_art else ""
@@ -339,9 +355,7 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
     out["Verkaufsmenge"] = parse_number_series(df[col_sales]).fillna(0).astype("Int64")
     out["Einkaufsmenge"] = parse_number_series(df[col_buy]).fillna(0).astype("Int64") if col_buy else pd.Series([0]*len(df), dtype="Int64")
 
-    # Lagermenge aus Sell-out
     if col_stock_so:
-        # 0 ist ein gültiger gemeldeter Bestand
         out["SellLagermenge"] = pd.to_numeric(df[col_stock_so], errors="coerce")
 
     if col_start: out["StartDatum"] = parse_date_series_us(df[col_start])
@@ -363,7 +377,7 @@ def _token_set(s: str) -> set:
     toks = [t for t in s.split() if t and (t not in _STOP_TOKENS) and (t not in _COLOR_WORDS)]
     return set(toks)
 
-def _best_fuzzy_in_candidates(name: str, cand_series: pd.Series):
+def _best_fuzzy_in_candidates(name: str, cand_series: pd.Series) -> int|None:
     base = _token_set(name)
     if not len(base): return None
     best_idx, best_score = None, 0.0
@@ -388,7 +402,7 @@ def _family_match(row: pd.Series, price_df: pd.DataFrame, prefer_color: str|None
         if not g2.empty: grp = g2
     return grp.iloc[0]
 
-def _apply_equivalences(hint_art_exact: str, hint_art_pref: str):
+def _apply_equivalences(hint_art_exact: str, hint_art_pref: str) -> str|None:
     if hint_art_exact:
         return ART_EXACT_EQUIV.get(hint_art_exact.lower(), hint_art_exact.lower())
     if hint_art_pref:
@@ -417,7 +431,7 @@ def _final_backstops(merged: pd.DataFrame, price_df: pd.DataFrame):
 # Merge & Werte (+ Quelle für Chart)
 # =========================
 @st.cache_data(show_spinner=False)
-def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, latest_stock_baseline_df: pd.DataFrame=None):
+def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, latest_stock_baseline_df: pd.DataFrame|None=None):
     if filtered_sell_df is None or price_df is None:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
     if filtered_sell_df.empty or price_df.empty:
@@ -447,7 +461,7 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
         merged["_rowdate"] = _row_date(merged)
         stock_merged["_rowdate"] = _row_date(stock_merged)
 
-        # Fallback-Matches (nur auf Umsatz-Merge)
+        # ---------- Fallback-Matches (nur auf Umsatz-Merge) ----------
         need = merged["Verkaufspreis"].isna() & merged["EAN_key"].astype(bool)
         if need.any():
             tmp = merged.loc[need, ["EAN_key"]].merge(
@@ -469,7 +483,7 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
                 if f and f in fam_map.index: _assign_from_price_row(merged,i, fam_map.loc[f])
         _final_backstops(merged, price_df)
 
-        # Strings: Kategorie leeren, nie NaN anzeigen
+        # ---------- Strings ----------
         for df in (merged, stock_merged):
             df["Kategorie"] = (
                 df["Kategorie"].fillna("")
@@ -485,14 +499,15 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
         valid_color = merged["Farbe"].astype(str).str.strip().map(lambda t: (t!="") and (not _looks_like_not_a_color(t)))
         merged.loc[dup & valid_color, "Bezeichnung_anzeige"] = merged.loc[dup & valid_color,"Bezeichnung"] + " – " + merged.loc[dup & valid_color,"Farbe"].astype(str).str.strip()
 
-        # Umsatz-Werte (gefiltert)
+        # ---------- Umsatz-Werte (gefiltert) ----------
         q_buy,p_buy   = sanitize_numbers(merged["Einkaufsmenge"], merged["Einkaufspreis"])
         q_sell,p_sell = sanitize_numbers(merged["Verkaufsmenge"], merged["Verkaufspreis"])
         merged["Einkaufswert"] = safe_mul(q_buy.fillna(0.0),  p_buy.fillna(0.0))
         merged["Verkaufswert"] = safe_mul(q_sell.fillna(0.0), p_sell.fillna(0.0))
 
-        # Aktuellster Lagerstand aus Sell-out
+        # ---------- Aktuellster Lagerstand aus Sell-out ----------
         stock_merged = stock_merged.copy()
+
         if "SellLagermenge" in stock_merged.columns:
             stock_valid = stock_merged.loc[stock_merged["SellLagermenge"].notna()].copy()
             stock_valid["SellLagermenge"] = (
@@ -581,7 +596,7 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
         return detail, totals, ts_source
 
 # =========================
-# Datenquellen / Fallbacks / Persistieren
+# NEU: Datenquellen / Fallbacks / Persistieren
 # =========================
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR.parent / "data" if (BASE_DIR.name == "galaxus_tool_source") else BASE_DIR / "data"
@@ -590,6 +605,7 @@ DEFAULT_PRICE_PATH = DATA_DIR / "preisliste.xlsx"
 DATA_DIR.mkdir(exist_ok=True, parents=True)
 
 def _persist_upload(uploaded_file, target_path: Path):
+    """Upload dauerhaft im data/-Ordner speichern."""
     if uploaded_file is None:
         return
     try:
@@ -780,11 +796,13 @@ if (raw_sell is not None) and (raw_price is not None):
         show_detail = st.checkbox("Detailtabelle anzeigen", value=False)
         if show_detail:
             st.subheader("Detailtabelle")
-            d_rounded, d_styler = style_numeric(detail)
+            detail_display = append_total_row_for_display(detail)
+            d_rounded, d_styler = style_numeric(detail_display)
             st.dataframe(d_styler, use_container_width=True)
 
         st.subheader("Summen pro Artikel (Lagerwert = letzter Stand)")
-        t_rounded, t_styler = style_numeric(totals)
+        totals_display = append_total_row_for_display(totals)
+        t_rounded, t_styler = style_numeric(totals_display)
         st.dataframe(t_styler, use_container_width=True)
 
         dl1, dl2 = st.columns(2)
