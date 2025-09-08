@@ -5,6 +5,7 @@
 # - Interaktives Linienchart (Woche) mit Hover-Highlight & Pop-up-Label
 # - NEU: Auto-Load aus /data (sellout.xlsx, preisliste.xlsx) + optionales Persistieren von Uploads
 # - FIX: Sichere Multiplikation (safe_mul) gegen Overflow/NaN/Inf
+# - UPDATE: Kategorie explizit aus Spalte G der Preisliste
 
 import os
 import io
@@ -202,10 +203,23 @@ COLOR_CANDIDATES= ["Farbe","Color","Colour","Variante","Variant","Farbvariante",
 
 def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     df = normalize_cols(df)
+
     col_art   = find_column(df, ARTNR_CANDIDATES, "Artikelnummer")
     col_ean   = find_column(df, EAN_CANDIDATES,  "EAN/GTIN", required=False)
     col_name  = find_column(df, NAME_CANDIDATES_PL, "Bezeichnung")
-    col_cat   = find_column(df, CAT_CANDIDATES,  "Kategorie", required=False)
+
+    # --- NEU: Kategorie primär aus Spalte G (Index 6), sonst Kandidaten ---
+    col_cat = None
+    try:
+        # Spalte G = Index 6 (0-basiert). Nur nehmen, wenn wirklich existiert.
+        maybe_g = df.columns[6]
+        if maybe_g in df.columns:
+            col_cat = maybe_g
+    except Exception:
+        col_cat = None
+    if not col_cat:
+        col_cat = find_column(df, CAT_CANDIDATES,  "Kategorie", required=False)
+
     col_stock = find_column(df, STOCK_CANDIDATES, "Bestand/Lager", required=False)
     col_buy   = find_column(df, BUY_PRICE_CANDIDATES,  "Einkaufspreis", required=False)
     col_sell  = find_column(df, SELL_PRICE_CANDIDATES, "Verkaufspreis", required=False)
@@ -222,7 +236,12 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     out["Bezeichnung"]     = df[col_name].astype(str)
     out["Bezeichnung_key"] = out["Bezeichnung"].map(normalize_key)
     out["Familie"]         = out["Bezeichnung"].map(make_family_key)
-    out["Kategorie"]       = df[col_cat].astype(str) if col_cat else ""
+
+    # Kategorie verschlankt/gestrippt
+    if col_cat:
+        out["Kategorie"] = df[col_cat].astype(str).str.strip()
+    else:
+        out["Kategorie"] = ""
 
     # Farbe
     if col_color:
@@ -442,7 +461,7 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
 
     # ---------- Strings ----------
     for df in (merged, stock_merged):
-        df["Kategorie"]   = df["Kategorie"].fillna("")
+        df["Kategorie"]   = df["Kategorie"].fillna("").astype(str).str.strip()
         df["Bezeichnung"] = df["Bezeichnung"].fillna("")
         df["Farbe"]       = df.get("Farbe","").fillna("")
 
