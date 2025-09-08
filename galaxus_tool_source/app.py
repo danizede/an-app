@@ -4,6 +4,7 @@
 # - Summen pro Artikel (Lagerwert = letzter verfügbarer Stand je Artikel, NICHT aufsummiert)
 # - Interaktives Linienchart (Woche) mit Hover-Highlight & Pop-up-Label
 # - NEU: Auto-Load aus /data (sellout.xlsx, preisliste.xlsx) + optionales Persistieren von Uploads
+# - FIX: Sichere Multiplikation (safe_mul) gegen Overflow/NaN/Inf
 
 import os
 import io
@@ -124,6 +125,18 @@ def sanitize_numbers(qty: pd.Series, price: pd.Series) -> tuple[pd.Series,pd.Ser
     q = pd.to_numeric(qty, errors="coerce").astype("float64").clip(lower=0, upper=MAX_QTY)
     p = pd.to_numeric(price, errors="coerce").astype("float64").clip(lower=0, upper=MAX_PRICE)
     return q, p
+
+# Sichere Multiplikation (gegen Overflow/NaN/Inf)
+def safe_mul(a: pd.Series, b: pd.Series,
+             max_a=MAX_QTY, max_b=MAX_PRICE) -> pd.Series:
+    a = pd.to_numeric(a, errors="coerce").astype("float64")
+    b = pd.to_numeric(b, errors="coerce").astype("float64")
+    a = np.clip(a, 0, max_a)
+    b = np.clip(b, 0, max_b)
+    with np.errstate(all='ignore'):
+        out = np.multiply(a, b, dtype="float64")
+    out = np.where(np.isfinite(out), out, 0.0).astype("float64")
+    return pd.Series(out, index=a.index)
 
 # =========================
 # Farben & Familie
@@ -443,9 +456,9 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
     q_sell,p_sell = sanitize_numbers(merged["Verkaufsmenge"], merged["Verkaufspreis"])
     q_buy=q_buy.fillna(0.0); p_buy=p_buy.fillna(0.0)
     q_sell=q_sell.fillna(0.0); p_sell=p_sell.fillna(0.0)
-    with np.errstate(over='ignore', invalid='ignore'):
-        merged["Einkaufswert"] = (q_buy*p_buy).astype("float64")
-        merged["Verkaufswert"] = (q_sell*p_sell).astype("float64")
+
+    merged["Einkaufswert"] = safe_mul(q_buy,  p_buy)
+    merged["Verkaufswert"] = safe_mul(q_sell, p_sell)
 
     # ---------- Aktuellster Lagerstand aus Sell-out ----------
     stock_merged = stock_merged.copy()
@@ -509,9 +522,8 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
         .fillna(pd.to_numeric(merged.get("Verkaufspreis", np.nan), errors="coerce"))
         .fillna(0.0).clip(lower=0, upper=MAX_PRICE).astype("float64")
     )
-    with np.errstate(over='ignore', invalid='ignore'):
-        merged["Lagerwert_latest"] = (merged["Lagermenge_latest"] * merged["Verkaufspreis_latest"]).astype("float64")
-    merged["Lagerwert_latest"].mask(~np.isfinite(merged["Lagerwert_latest"]), 0.0, inplace=True)
+
+    merged["Lagerwert_latest"] = safe_mul(merged["Lagermenge_latest"], merged["Verkaufspreis_latest"])
 
     # ---------- Tabellen ----------
     detail = merged[["ArtikelNr","Bezeichnung_anzeige","Kategorie",
@@ -550,11 +562,9 @@ def _persist_upload(uploaded_file, target_path: Path):
     """Upload dauerhaft im data/-Ordner speichern."""
     if uploaded_file is None:
         return
-    # Streamlit UploadedFile hat getvalue()
     try:
         content = uploaded_file.getvalue()
     except Exception:
-        # Fallback auf .read() (selten nötig)
         content = uploaded_file.read()
     with open(target_path, "wb") as f:
         f.write(content)
@@ -584,7 +594,6 @@ raw_price = None
 if sell_file is not None:
     raw_sell = read_excel_flat(sell_file)
     st.session_state["sell_last"]  = {"name": sell_file.name}
-    # Optional: persistieren
     _persist_upload(sell_file, DEFAULT_SELL_PATH)
 elif DEFAULT_SELL_PATH.exists():
     with open(DEFAULT_SELL_PATH, "rb") as f:
