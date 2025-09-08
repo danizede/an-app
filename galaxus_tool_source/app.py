@@ -61,7 +61,7 @@ def append_total_row_for_display(df: pd.DataFrame) -> pd.DataFrame:
     num_cols = [c for c in num_targets if c in cols]
     label_col = next((c for c in ["Bezeichnung_anzeige","Bezeichnung","ArtikelNr","Kategorie"] if c in cols), cols[0])
     total_row = {c: "" for c in cols}
-    total_row[label_col] = "Σ Gesamt"
+    total_row[label_col] = "Gesamt"
     for c in num_cols:
         total_row[c] = pd.to_numeric(df[c], errors="coerce").sum()
     return pd.concat([df, pd.DataFrame([total_row])], ignore_index=True)
