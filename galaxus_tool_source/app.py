@@ -1,4 +1,4 @@
-# app.py — Galaxus Sellout Analyse (Woche + Hover-Popup)
+# app.py — Galaxus Sellout Analyse
 # - Robustes Matching (ArtNr → EAN → Name → Familie → Hints → Fuzzy)
 # - EU-Datumsfilter, Detailtabelle optional
 # - Summen pro Artikel (Lagerwert = letzter verfügbarer Stand je Artikel, NICHT aufsummiert)
@@ -7,6 +7,7 @@
 # - FIX: Sichere Multiplikation (safe_mul) + np.seterr(all="ignore")
 # - UPDATE: Kategorie primär aus Spalte G; leere/NaN-Kategorien bleiben leer und erscheinen nicht im Chart
 # - NEU: Summenzeile Σ Gesamt für Detail- und Summen-Tabelle (nur Anzeige; CSV ohne Σ)
+# - NEU: Altair-CHF-Locale (kein £ mehr), Achse/Tooltip mit (CHF)
 
 import os
 import io
@@ -23,16 +24,30 @@ np.seterr(all='ignore')
 
 st.set_page_config(page_title="Galaxus Sellout Analyse", layout="wide")
 
-# Altair: große Datensätze zulassen
+# Altair: große Datensätze zulassen + CHF-Locale setzen
 try:
     alt.data_transformers.disable_max_rows()
 except Exception:
     pass
 
+# WICHTIG: CHF statt £ – Locale für Zahlen/Currency + Tausendertrennzeichen
+try:
+    alt.renderers.set_embed_options(
+        locale={
+            "decimal": ".",          # interne Darstellung; Tooltips formatieren wir explizit
+            "thousands": "’",        # Schweizer Tausender
+            "grouping": [3],
+            "currency": ["CHF ", ""]
+        }
+    )
+except Exception:
+    # Fallback: not critical
+    pass
+
 # =========================
 # Anzeige-Helfer
 # =========================
-THOUSANDS_SEP = "'"
+THOUSANDS_SEP = "’"
 NUM_COLS_DEFAULT = [
     "Einkaufsmenge","Einkaufswert",
     "Verkaufsmenge","Verkaufswert",
@@ -185,7 +200,7 @@ def _strip_parens_units(name: str) -> str:
 def make_family_key(name: str) -> str:
     if not isinstance(name,str): return ""
     s = _strip_parens_units(name.lower())
-    s = re.sub(r"\b[o0]-\d+\b"," ", s)   # Codes wie O-061 etc. ausblenden
+    s = re.sub(r"\b[o0]-\d+\b"," ", s)
     s = re.sub(r"[^a-z0-9]+"," ", s)
     toks = [t for t in s.split() if t and (t not in _STOP_TOKENS) and (t not in _COLOR_WORDS)]
     return "".join(toks[:2]) if toks else ""
@@ -596,7 +611,7 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
         return detail, totals, ts_source
 
 # =========================
-# NEU: Datenquellen / Fallbacks / Persistieren
+# Datenquellen / Fallbacks / Persistieren
 # =========================
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR.parent / "data" if (BASE_DIR.name == "galaxus_tool_source") else BASE_DIR / "data"
@@ -605,7 +620,6 @@ DEFAULT_PRICE_PATH = DATA_DIR / "preisliste.xlsx"
 DATA_DIR.mkdir(exist_ok=True, parents=True)
 
 def _persist_upload(uploaded_file, target_path: Path):
-    """Upload dauerhaft im data/-Ordner speichern."""
     if uploaded_file is None:
         return
     try:
@@ -618,12 +632,8 @@ def _persist_upload(uploaded_file, target_path: Path):
 # =========================
 # UI
 # =========================
-st.title("📊 Galaxus Sellout Analyse (Woche – korrekter letzter Lagerwert)")
-st.caption(
-    "Summenansicht, robustes Matching (ArtNr → EAN → Name → Familie → Hints → Fuzzy), EU-Datumsfilter. "
-    "Detailtabelle optional. Interaktiver Wochen-Überblick pro Kategorie. "
-    "Lagermenge/Lagerwert stammen stets aus der zuletzt verfügbaren Meldung je Artikel (Spalte G «Verfügbar» im Sell-out)."
-)
+st.title("Galaxus Sellout Analyse")  # exakt so gewünscht (ohne Zusatz)
+# Keine caption mehr
 
 c1, c2 = st.columns(2)
 with c1:
@@ -701,7 +711,6 @@ if (raw_sell is not None) and (raw_price is not None):
         # ===============================================
 
         with st.spinner("🔗 Matche & berechne Werte…"):
-            # Ungefilterter sell_df als Baseline für "Letzter Lagerwert"
             detail, totals, ts_source = enrich_and_merge(filtered_sell_df, price_df, latest_stock_baseline_df=sell_df)
 
         # ===== Info zu verwendeten Dateien =====
@@ -740,14 +749,14 @@ if (raw_sell is not None) and (raw_price is not None):
                 base.mark_line(point=alt.OverlayMarkDef(size=30), interpolate="linear")
                     .encode(
                         x=alt.X("Periode:T", title="Woche"),
-                        y=alt.Y("Wert:Q", title="Verkaufswert (Summe pro Woche)", stack=None),
+                        y=alt.Y("Wert:Q", title="Verkaufswert (CHF, Summe pro Woche)", stack=None),
                         color=alt.Color("Kategorie:N", title="Kategorie"),
                         opacity=alt.condition(hover_cat, alt.value(1.0), alt.value(0.25)),
                         strokeWidth=alt.condition(hover_cat, alt.value(3), alt.value(1.5)),
                         tooltip=[
                             alt.Tooltip("Periode:T", title="Woche"),
                             alt.Tooltip("Kategorie:N", title="Kategorie"),
-                            alt.Tooltip("Wert:Q", title="Verkaufswert", format=",.0f"),
+                            alt.Tooltip("Wert:Q", title="Verkaufswert (CHF)", format=",.0f"),
                         ],
                     )
                     .add_selection(hover_cat)
@@ -800,7 +809,7 @@ if (raw_sell is not None) and (raw_price is not None):
             d_rounded, d_styler = style_numeric(detail_display)
             st.dataframe(d_styler, use_container_width=True)
 
-        st.subheader("Summen pro Artikel (Lagerwert = letzter Stand)")
+        st.subheader("Summen pro Artikel (Lagerwert = letzter Stand, Werte in CHF)")
         totals_display = append_total_row_for_display(totals)
         t_rounded, t_styler = style_numeric(totals_display)
         st.dataframe(t_styler, use_container_width=True)
