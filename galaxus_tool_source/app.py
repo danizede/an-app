@@ -1,4 +1,4 @@
-# app.py — Galaxus Sellout Analyse
+# app.py — Galaxus Sellout Analyse (+ Passcode-Login kompatibel zu deinem gestrigen Secrets-Setup)
 # - Robustes Matching (ArtNr → EAN → Name → Familie → Hints → Fuzzy)
 # - EU-Datumsfilter, Detailtabelle optional
 # - Summen pro Artikel (Lagerwert = letzter verfügbarer Stand je Artikel, NICHT aufsummiert)
@@ -7,6 +7,9 @@
 # - Sichere Multiplikation (safe_mul) + np.seterr(all="ignore")
 # - Kategorie primär aus Spalte G; leere/NaN-Kategorien bleiben leer und erscheinen nicht im Chart
 # - Summenzeile Σ Gesamt (nur Anzeige) – Währungsangaben in Spaltennamen (CHF)
+# - 🔐 Passwortschutz kompatibel mit:
+#   * Einfachem Code: st.secrets["auth"]["code"] / ["password"] / ["passcode"]
+#   * Benutzerliste:  [users] mit bcrypt-Hash oder *_clear
 
 import os
 import io
@@ -17,6 +20,9 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 from pathlib import Path
+import bcrypt
+from datetime import datetime
+from typing import Dict, Tuple
 
 # ---------- Global ----------
 np.seterr(all='ignore')
@@ -27,6 +33,95 @@ try:
     alt.data_transformers.disable_max_rows()
 except Exception:
     pass
+
+# =========================
+# 🔐 Auth (NEU – kompatibel zu deinem Secret-"Code")
+# =========================
+def _auth_cfg() -> dict:
+    cfg = st.secrets.get("auth", {})
+    return cfg if isinstance(cfg, dict) else {}
+
+def auth_enabled() -> bool:
+    return bool(_auth_cfg().get("require_login", True))
+
+def _get_passcode() -> str | None:
+    # Wir akzeptieren mehrere Key-Namen, damit dein "Code" von gestern sicher gefunden wird
+    cfg = _auth_cfg()
+    for k in ("code", "password", "passcode"):
+        v = cfg.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+def _load_users() -> Tuple[Dict[str, str], Dict[str, str]]:
+    users = st.secrets.get("users", {}) or {}
+    hashed, clear = {}, {}
+    for k, v in users.items():
+        if k.endswith("_clear"):
+            clear[k.replace("_clear", "")] = str(v)
+        else:
+            hashed[k] = str(v)
+    return hashed, clear
+
+def _check_userpass(username: str, password: str) -> bool:
+    hashed, clear = _load_users()
+    if username in hashed:
+        try:
+            return bcrypt.checkpw(password.encode(), hashed[username].encode())
+        except Exception:
+            return False
+    if username in clear:
+        return password == clear[username]
+    return False
+
+def _login_view():
+    passcode = _get_passcode()
+    st.title("🔐 Zugang")
+    if passcode:
+        # Ein-Feld-Login (dein gestriger Code in st.secrets.auth)
+        with st.form("login-passcode", clear_on_submit=False):
+            code = st.text_input("Code / Passwort", type="password")
+            ok = st.form_submit_button("Anmelden")
+        if ok:
+            if code.strip() == passcode:
+                st.session_state["auth_ok"] = True
+                st.session_state["auth_user"] = "passcode"
+                st.session_state["auth_ts"] = datetime.utcnow().isoformat()
+                st.success("Erfolgreich angemeldet.")
+                st.experimental_rerun()
+            else:
+                st.error("Ungültiger Code.")
+    else:
+        # Benutzer/Passwort-Login (falls du [users] nutzt)
+        with st.form("login-userpass", clear_on_submit=False):
+            c1, c2 = st.columns(2)
+            user = c1.text_input("Username")
+            pw   = c2.text_input("Passwort", type="password")
+            ok = st.form_submit_button("Anmelden")
+        if ok:
+            if _check_userpass(user.strip(), pw.strip()):
+                st.session_state["auth_ok"] = True
+                st.session_state["auth_user"] = user.strip()
+                st.session_state["auth_ts"] = datetime.utcnow().isoformat()
+                st.success("Erfolgreich angemeldet.")
+                st.experimental_rerun()
+            else:
+                st.error("Ungültige Zugangsdaten.")
+
+def ensure_auth():
+    if not auth_enabled():
+        return True
+    if not st.session_state.get("auth_ok"):
+        _login_view()
+        return False
+    return True
+
+def logout_button():
+    with st.sidebar:
+        if st.button("Logout"):
+            for k in ("auth_ok","auth_user","auth_ts"):
+                st.session_state.pop(k, None)
+            st.experimental_rerun()
 
 # =========================
 # Anzeige-Helfer
@@ -190,8 +285,8 @@ def make_family_key(name: str) -> str:
 def extract_color_from_name(name: str) -> str:
     if not isinstance(name, str): return ""
     m = re.search(r"\(([^)]+)\)$", name.strip())
-    if not m: m = re.search(r"[-–—]\s*([A-Za-zäöüÄÖÜß]+)$", name.strip())
-    if not m: m = re.search(r"/\s*([A-Za-zäöüÄÖÜß]+)$", name.strip())
+    if not m: m = re.search(r"[-–—]\s*([A-Za-z äöüÄÖÜß]+)$", name.strip())
+    if not m: m = re.search(r"/\s*([A-Za-z äöüÄÖÜß]+)$", name.strip())
     if m:
         cand = m.group(1).strip().lower()
         if not _looks_like_not_a_color(cand):
@@ -250,7 +345,7 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     out["Bezeichnung_key"] = out["Bezeichnung"].map(normalize_key)
     out["Familie"]         = out["Bezeichnung"].map(make_family_key)
 
-    # Kategorie bereinigen (leer statt NaN/None)
+    # Kategorie bereinigen
     if col_cat:
         out["Kategorie"] = (
             df[col_cat].astype(str)
@@ -354,7 +449,6 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
 
     # Lagermenge aus Sell-out
     if col_stock_so:
-        # 0 ist ein gültiger gemeldeter Bestand
         out["SellLagermenge"] = pd.to_numeric(df[col_stock_so], errors="coerce")
 
     if col_start: out["StartDatum"] = parse_date_series_us(df[col_start])
@@ -578,7 +672,6 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
     ts_source = pd.DataFrame()
     if "StartDatum" in merged.columns:
         ts_source = merged[["StartDatum","Kategorie","Verkaufswert"]].copy()
-        # Leere Kategorien nicht anzeigen
         ts_source["Kategorie"] = ts_source["Kategorie"].fillna("").astype(str).str.strip()
         ts_source = ts_source[ts_source["Kategorie"] != ""]
         ts_source.rename(columns={"Verkaufswert":"Verkaufswert (CHF)"}, inplace=True)
@@ -605,7 +698,15 @@ def _persist_upload(uploaded_file, target_path: Path):
         f.write(content)
 
 # =========================
-# UI
+# 🚪 Login-Gate
+# =========================
+if not ensure_auth():
+    st.stop()
+
+logout_button()
+
+# =========================
+# UI (unverändert)
 # =========================
 st.title("Galaxus Sellout Analyse")
 
