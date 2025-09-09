@@ -1,11 +1,11 @@
-# app.py — Galaxus Sellout Analyse (Passcode-Login + Auto-File-Detection, Default-first)
+# app.py — Galaxus Sellout Analyse (Passcode-Login + Auto-File-Detection, Default-first, robust safe_mul)
 # - Robustes Matching (ArtNr → EAN → Name → Familie → Hints → Fuzzy)
 # - EU-Datumsfilter, Detailtabelle optional
 # - Summen pro Artikel (Lagerwert = letzter verfügbarer Stand je Artikel, NICHT aufsummiert)
 # - Interaktives Linienchart (Woche) mit Hover-Highlight & Pop-up-Label
 # - Auto-Load aus /data mit Dateinamen-Autoerkennung (sellout / preisliste)
 # - Zuerst DEFAULT-Dateien (sellout.xlsx / preisliste.xlsx), danach Heuristik
-# - Sichere Multiplikation (safe_mul) + np.seterr(all="ignore")
+# - Sichere Multiplikation (safe_mul) + globale Filterung von NumPy-Overflows
 # - Kategorie primär aus Spalte G; leere/NaN-Kategorien bleiben leer und erscheinen nicht im Chart
 # - Summenzeile Σ Gesamt – Währungsangaben in Spaltennamen (CHF)
 # - 🔐 Login via st.secrets [auth]/Root/Env (kein bcrypt nötig)
@@ -21,6 +21,11 @@ import altair as alt
 from pathlib import Path
 from datetime import datetime
 from collections.abc import Mapping
+import warnings
+
+# —— NumPy-Warnungen (Overflow/Invalid) global unterdrücken ——
+warnings.filterwarnings("ignore", message="overflow encountered in multiply")
+warnings.filterwarnings("ignore", message="invalid value encountered in multiply")
 
 # ---------- Global ----------
 np.seterr(all='ignore')
@@ -247,13 +252,30 @@ def sanitize_numbers(qty: pd.Series, price: pd.Series) -> tuple[pd.Series,pd.Ser
     return q, p
 
 def safe_mul(a: pd.Series, b: pd.Series, max_a=MAX_QTY, max_b=MAX_PRICE) -> pd.Series:
+    """
+    Robuste Multiplikation:
+    - erzwingt float64
+    - NaN/±Inf werden neutralisiert
+    - Eingaben werden vorab geclippt
+    - Overflow/Invalid werden unterdrückt
+    """
     a = pd.to_numeric(a, errors="coerce").astype("float64")
     b = pd.to_numeric(b, errors="coerce").astype("float64")
-    a = np.clip(a, 0, max_a)
-    b = np.clip(b, 0, max_b)
-    with np.errstate(all='ignore'):
-        out = np.multiply(a, b, dtype="float64")
-    out = np.where(np.isfinite(out), out, 0.0).astype("float64")
+
+    # NaN/Inf -> sinnvolle Grenzwerte
+    a_vals = np.nan_to_num(a.to_numpy(), nan=0.0, posinf=max_a, neginf=0.0)
+    b_vals = np.nan_to_num(b.to_numpy(), nan=0.0, posinf=max_b, neginf=0.0)
+
+    # harte Limits
+    a_vals = np.clip(a_vals, 0.0, max_a)
+    b_vals = np.clip(b_vals, 0.0, max_b)
+
+    # Multiplikation ohne Warnungen
+    with np.errstate(over='ignore', invalid='ignore', divide='ignore', under='ignore'):
+        out = a_vals * b_vals
+
+    # Ergebnis säubern
+    out = np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).astype("float64")
     return pd.Series(out, index=a.index)
 
 # =========================
@@ -675,7 +697,6 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
     ts_source = pd.DataFrame()
     if "StartDatum" in merged.columns:
         ts_source = merged[["StartDatum","Kategorie","Verkaufswert"]].copy()
-        # Leere Kategorien nicht anzeigen
         ts_source["Kategorie"] = ts_source["Kategorie"].fillna("").astype(str).str.strip()
         ts_source = ts_source[ts_source["Kategorie"] != ""]
         ts_source.rename(columns={"Verkaufswert":"Verkaufswert (CHF)"}, inplace=True)
