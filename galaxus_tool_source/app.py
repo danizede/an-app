@@ -392,20 +392,38 @@ ART_PREFIX_EQUIV = {"o061":"o061","o013":"o013"}
 
 def _apply_hints_to_row(name_raw: str) -> dict:
     s = (name_raw or "").lower()
-    h = {"hint_family":"","hint_color":"","hint_art_exact":"","hint_art_prefix":""}
-    for fam in ["finn mobile","charly little","duftöl","duftoel","duft oil"]:
-        if fam in s: h["hint_family"] = "finn" if fam=="finn mobile" else ("charly" if "charly" in fam else "duftol")
+    h = {"hint_family": "", "hint_color": "", "hint_art_exact": "", "hint_art_prefix": ""}
+
+    # Familiennamen/Hints
+    for fam in ["finn mobile", "charly little", "duftöl", "duftoel", "duft oil"]:
+        if fam in s:
+            h["hint_family"] = "finn" if fam == "finn mobile" else ("charly" if "charly" in fam else "duftol")
     for fam in ["finn","theo","robert","peter","julia","albert","roger","mia","simon","otto","oskar","tim","charly"]:
-        if fam in s: h["hint_family"] = h["hint_family"] or fam
-    if "tim" in s and "schwarz" in s: h["hint_color"]="weiss"
-    if "mia" in s and "gold" in s:    h["hint_color"]="schwarz"
-    if "oskar" in s and "little" in s: h["hint_art_prefix"]="o061"
-    if "simon" in s: h["hint_art_exact"]="s054"
-    if "otto"  in s: h["hint_art_prefix"]="o013"
-    if "eva" in s and "e-008" in s: h["hint_art_exact"]="e008"
-    if "julia" in s and "j-031" in s: h["hint_art_exact"]="j031"
-    if "mia" in s und "m-057" in s: h["hint_art_exact"]="m057"
+        if fam in s:
+            h["hint_family"] = h["hint_family"] or fam
+
+    # Farb-Hints (Beispiele)
+    if "tim" in s and "schwarz" in s:
+        h["hint_color"] = "weiss"
+    if "mia" in s and "gold" in s:
+        h["hint_color"] = "schwarz"
+
+    # Artikel-Hints/Äquivalenzen
+    if "oskar" in s and "little" in s:
+        h["hint_art_prefix"] = "o061"
+    if "simon" in s:
+        h["hint_art_exact"] = "s054"
+    if "otto" in s:
+        h["hint_art_prefix"] = "o013"
+    if "eva" in s and "e-008" in s:
+        h["hint_art_exact"] = "e008"
+    if "julia" in s and "j-031" in s:
+        h["hint_art_exact"] = "j031"
+    if "mia" in s and "m-057" in s:
+        h["hint_art_exact"] = "m057"
+
     return h
+
 
 def _fallback_col_by_index(df: pd.DataFrame, idx0: int) -> str|None:
     try: return df.columns[idx0]
