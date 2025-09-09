@@ -31,24 +31,48 @@ except Exception:
     pass
 
 # =========================
-# 🔐 Auth – Passcode only (robust)
+# 🔐 Auth – Passcode only (robust, Mapping-kompatibel)
 # =========================
+import os
+from datetime import datetime
+from collections.abc import Mapping
+import streamlit as st
+
+def _to_plain_mapping(obj) -> dict:
+    """Versucht, beliebige Mapping-ähnliche Objekte (z.B. st.secrets) in ein dict zu konvertieren."""
+    if obj is None:
+        return {}
+    if isinstance(obj, Mapping):
+        try:
+            return dict(obj)
+        except Exception:
+            pass
+    # Fallback: keys()/__getitem__()
+    try:
+        return {k: obj[k] for k in obj.keys()}  # type: ignore[attr-defined]
+    except Exception:
+        return {}
+
 def _auth_cfg() -> dict:
-    cfg = st.secrets.get("auth", {})
-    return cfg if isinstance(cfg, dict) else {}
+    # Keine harte dict-Prüfung mehr – alles in ein plain dict umwandeln
+    try:
+        raw = st.secrets.get("auth", {})
+    except Exception:
+        raw = {}
+    return _to_plain_mapping(raw)
 
 def auth_enabled() -> bool:
     return bool(_auth_cfg().get("require_login", True))
 
 def _get_passcode() -> str | None:
     """
-    Sucht den Code an vielen Stellen/Namen:
-    - Query-Parameter ?code=
-    - st.secrets["auth"]["code"/"password"/"passcode"/"pw"/"passwort"/"secret"]
-    - Root-Secrets (ohne [auth]) dieselben Aliase
-    - Environment: AUTH_CODE, AUTH_PASSWORD, AUTH_PASSCODE, STREAMLIT_AUTH_CODE
+    Suchreihenfolge:
+      1) Query-Parameter ?code=
+      2) st.secrets['auth'][aliases]
+      3) st.secrets[aliases] (Root)
+      4) Umgebungsvariablen
     """
-    # 1) Query-Parameter
+    # 1) Query-Parameter (für Test/Auto-Login)
     try:
         qp = st.query_params
         if "code" in qp and str(qp["code"]).strip():
@@ -56,7 +80,7 @@ def _get_passcode() -> str | None:
     except Exception:
         pass
 
-    # 2) st.secrets [auth]
+    # 2) [auth]-Sektion
     auth = _auth_cfg()
     aliases = ("code", "password", "passcode", "pw", "passwort", "secret")
     for k in aliases:
@@ -64,17 +88,18 @@ def _get_passcode() -> str | None:
         if isinstance(v, (str, int)) and str(v).strip():
             return str(v).strip()
 
-    # 3) Root-Secrets
-    root = st.secrets
-    if isinstance(root, dict):
+    # 3) Root-Secrets (ohne [auth])
+    try:
+        root = _to_plain_mapping(st.secrets)
         for k in aliases:
             v = root.get(k)
             if isinstance(v, (str, int)) and str(v).strip():
                 return str(v).strip()
+    except Exception:
+        pass
 
     # 4) Environment
-    env_aliases = ("AUTH_CODE", "AUTH_PASSWORD", "AUTH_PASSCODE", "STREAMLIT_AUTH_CODE")
-    for k in env_aliases:
+    for k in ("AUTH_CODE", "AUTH_PASSWORD", "AUTH_PASSCODE", "STREAMLIT_AUTH_CODE"):
         v = os.environ.get(k)
         if isinstance(v, (str, int)) and str(v).strip():
             return str(v).strip()
@@ -83,8 +108,6 @@ def _get_passcode() -> str | None:
 
 def _login_view():
     st.title("🔐 Zugang")
-
-    # Formular immer anzeigen
     with st.form("login-passcode", clear_on_submit=False):
         code = st.text_input("Code / Passwort", type="password")
         ok = st.form_submit_button("Anmelden")
@@ -118,6 +141,7 @@ def logout_button():
             for k in ("auth_ok","auth_user","auth_ts"):
                 st.session_state.pop(k, None)
             st.experimental_rerun()
+
 
 # 🚪 Login-Gate
 if not ensure_auth():
