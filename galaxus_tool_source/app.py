@@ -1,12 +1,12 @@
-# app.py — Galaxus Sellout Analyse (Passcode-Login only, robust)
+# app.py — Galaxus Sellout Analyse (Passcode-Login + Auto-File-Detection)
 # - Robustes Matching (ArtNr → EAN → Name → Familie → Hints → Fuzzy)
 # - EU-Datumsfilter, Detailtabelle optional
 # - Summen pro Artikel (Lagerwert = letzter verfügbarer Stand je Artikel, NICHT aufsummiert)
 # - Interaktives Linienchart (Woche) mit Hover-Highlight & Pop-up-Label
-# - Auto-Load aus /data (sellout.xlsx, preisliste.xlsx) + optionales Persistieren von Uploads
+# - Auto-Load aus /data mit Dateinamen-Autoerkennung (sellout / preisliste)
 # - Sichere Multiplikation (safe_mul) + np.seterr(all="ignore")
 # - Kategorie primär aus Spalte G; leere/NaN-Kategorien bleiben leer und erscheinen nicht im Chart
-# - Summenzeile Σ Gesamt (nur Anzeige) – Währungsangaben in Spaltennamen (CHF)
+# - Summenzeile Σ Gesamt – Währungsangaben in Spaltennamen (CHF)
 # - 🔐 Login via st.secrets [auth]/Root/Env (kein bcrypt nötig)
 
 import os
@@ -19,6 +19,7 @@ import streamlit as st
 import altair as alt
 from pathlib import Path
 from datetime import datetime
+from collections.abc import Mapping
 
 # ---------- Global ----------
 np.seterr(all='ignore')
@@ -33,13 +34,7 @@ except Exception:
 # =========================
 # 🔐 Auth – Passcode only (robust, Mapping-kompatibel)
 # =========================
-import os
-from datetime import datetime
-from collections.abc import Mapping
-import streamlit as st
-
 def _to_plain_mapping(obj) -> dict:
-    """Versucht, beliebige Mapping-ähnliche Objekte (z.B. st.secrets) in ein dict zu konvertieren."""
     if obj is None:
         return {}
     if isinstance(obj, Mapping):
@@ -47,14 +42,12 @@ def _to_plain_mapping(obj) -> dict:
             return dict(obj)
         except Exception:
             pass
-    # Fallback: keys()/__getitem__()
     try:
         return {k: obj[k] for k in obj.keys()}  # type: ignore[attr-defined]
     except Exception:
         return {}
 
 def _auth_cfg() -> dict:
-    # Keine harte dict-Prüfung mehr – alles in ein plain dict umwandeln
     try:
         raw = st.secrets.get("auth", {})
     except Exception:
@@ -65,30 +58,21 @@ def auth_enabled() -> bool:
     return bool(_auth_cfg().get("require_login", True))
 
 def _get_passcode() -> str | None:
-    """
-    Suchreihenfolge:
-      1) Query-Parameter ?code=
-      2) st.secrets['auth'][aliases]
-      3) st.secrets[aliases] (Root)
-      4) Umgebungsvariablen
-    """
-    # 1) Query-Parameter (für Test/Auto-Login)
+    # 1) Query-Parameter
     try:
         qp = st.query_params
         if "code" in qp and str(qp["code"]).strip():
             return str(qp["code"]).strip()
     except Exception:
         pass
-
-    # 2) [auth]-Sektion
+    # 2) Secrets [auth]
     auth = _auth_cfg()
     aliases = ("code", "password", "passcode", "pw", "passwort", "secret")
     for k in aliases:
         v = auth.get(k)
         if isinstance(v, (str, int)) and str(v).strip():
             return str(v).strip()
-
-    # 3) Root-Secrets (ohne [auth])
+    # 3) Root-Secrets
     try:
         root = _to_plain_mapping(st.secrets)
         for k in aliases:
@@ -97,13 +81,11 @@ def _get_passcode() -> str | None:
                 return str(v).strip()
     except Exception:
         pass
-
     # 4) Environment
     for k in ("AUTH_CODE", "AUTH_PASSWORD", "AUTH_PASSCODE", "STREAMLIT_AUTH_CODE"):
         v = os.environ.get(k)
         if isinstance(v, (str, int)) and str(v).strip():
             return str(v).strip()
-
     return None
 
 def _login_view():
@@ -142,7 +124,6 @@ def logout_button():
                 st.session_state.pop(k, None)
             st.rerun()
 
-
 # 🚪 Login-Gate
 if not ensure_auth():
     st.stop()
@@ -174,7 +155,6 @@ def style_numeric(df: pd.DataFrame, num_cols=NUM_COLS_DEFAULT, sep=THOUSANDS_SEP
     return out, out.style.format(fmt)
 
 def append_total_row_for_display(df: pd.DataFrame) -> pd.DataFrame:
-    """Σ-Gesamt ans Ende anhängen (nur UI-Anzeige)."""
     if df is None or df.empty: return df
     cols = list(df.columns)
     num_targets = ["Einkaufsmenge","Einkaufswert (CHF)","Verkaufsmenge","Verkaufswert (CHF)","Lagermenge","Lagerwert (CHF)"]
@@ -370,7 +350,7 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     out["Bezeichnung_key"] = out["Bezeichnung"].map(normalize_key)
     out["Familie"]         = out["Bezeichnung"].map(make_family_key)
 
-    # Kategorie bereinigen (leer statt NaN/None)
+    # Kategorie bereinigen
     if col_cat:
         out["Kategorie"] = (
             df[col_cat].astype(str)
@@ -410,44 +390,25 @@ DATE_START_CANDS     = ["Start","Startdatum","Start Date","Anfangs datum","Anfan
 DATE_END_CANDS       = ["Ende","Enddatum","End Date","Bis","Period End"]
 STOCK_SO_CANDIDATES  = ["Lagermenge","Lagerbestand","Bestand","Verfügbar","verfügbar","Verfuegbar","Available"]
 
-# Einfache Äquivalenzen / Regeln (Beispiele)
 ART_EXACT_EQUIV  = {"e008":"e009","j031":"j030","m057":"m051","s054":"s054"}
 ART_PREFIX_EQUIV = {"o061":"o061","o013":"o013"}
 
 def _apply_hints_to_row(name_raw: str) -> dict:
     s = (name_raw or "").lower()
-    h = {"hint_family": "", "hint_color": "", "hint_art_exact": "", "hint_art_prefix": ""}
-
-    # Familiennamen/Hints
-    for fam in ["finn mobile", "charly little", "duftöl", "duftoel", "duft oil"]:
-        if fam in s:
-            h["hint_family"] = "finn" if fam == "finn mobile" else ("charly" if "charly" in fam else "duftol")
+    h = {"hint_family":"","hint_color":"","hint_art_exact":"","hint_art_prefix":""}
+    for fam in ["finn mobile","charly little","duftöl","duftoel","duft oil"]:
+        if fam in s: h["hint_family"] = "finn" if fam=="finn mobile" else ("charly" if "charly" in fam else "duftol")
     for fam in ["finn","theo","robert","peter","julia","albert","roger","mia","simon","otto","oskar","tim","charly"]:
-        if fam in s:
-            h["hint_family"] = h["hint_family"] or fam
-
-    # Farb-Hints (Beispiele)
-    if "tim" in s and "schwarz" in s:
-        h["hint_color"] = "weiss"
-    if "mia" in s and "gold" in s:
-        h["hint_color"] = "schwarz"
-
-    # Artikel-Hints/Äquivalenzen
-    if "oskar" in s and "little" in s:
-        h["hint_art_prefix"] = "o061"
-    if "simon" in s:
-        h["hint_art_exact"] = "s054"
-    if "otto" in s:
-        h["hint_art_prefix"] = "o013"
-    if "eva" in s and "e-008" in s:
-        h["hint_art_exact"] = "e008"
-    if "julia" in s and "j-031" in s:
-        h["hint_art_exact"] = "j031"
-    if "mia" in s and "m-057" in s:
-        h["hint_art_exact"] = "m057"
-
+        if fam in s: h["hint_family"] = h["hint_family"] or fam
+    if "tim" in s and "schwarz" in s: h["hint_color"]="weiss"
+    if "mia" in s and "gold" in s:    h["hint_color"]="schwarz"
+    if "oskar" in s and "little" in s: h["hint_art_prefix"]="o061"
+    if "simon" in s: h["hint_art_exact"]="s054"
+    if "otto"  in s: h["hint_art_prefix"]="o013"
+    if "eva" in s and "e-008" in s: h["hint_art_exact"]="e008"
+    if "julia" in s and "j-031" in s: h["hint_art_exact"]="j031"
+    if "mia" in s and "m-057" in s: h["hint_art_exact"]="m057"
     return h
-
 
 def _fallback_col_by_index(df: pd.DataFrame, idx0: int) -> str|None:
     try: return df.columns[idx0]
@@ -461,16 +422,14 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
     col_sales = find_column(df, SALES_QTY_CANDIDATES, "Verkaufsmenge", required=True)
     col_buy   = find_column(df, BUY_QTY_CANDIDATES,   "Einkaufsmenge", required=False)
 
-    # Lager aus Sell-out (G = Index 6) – Header- oder Positions-Fallback
     col_stock_so = find_column(df, STOCK_SO_CANDIDATES, "Lagermenge (Sell-out)", required=False)
     if not col_stock_so and df.shape[1] >= 7:
         col_stock_so = _fallback_col_by_index(df, 6)  # Spalte G
 
-    # Datumsfelder (I/J)
     col_start = find_column(df, DATE_START_CANDS, "Startdatum (Spalte I)", required=False)
     col_end   = find_column(df, DATE_END_CANDS,   "Enddatum (Spalte J)",   required=False)
-    if not col_start and df.shape[1]>=9:  col_start=_fallback_col_by_index(df,8)   # Spalte I
-    if not col_end   and df.shape[1]>=10: col_end  =_fallback_col_by_index(df,9)   # Spalte J
+    if not col_start and df.shape[1]>=9:  col_start=_fallback_col_by_index(df,8)
+    if not col_end   and df.shape[1]>=10: col_end  =_fallback_col_by_index(df,9)
 
     out = pd.DataFrame()
     out["ArtikelNr"]       = df[col_art].astype(str) if col_art else ""
@@ -490,7 +449,6 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
     out["Verkaufsmenge"] = parse_number_series(df[col_sales]).fillna(0).astype("Int64")
     out["Einkaufsmenge"] = parse_number_series(df[col_buy]).fillna(0).astype("Int64") if col_buy else pd.Series([0]*len(df), dtype="Int64")
 
-    # Lagermenge aus Sell-out
     if col_stock_so:
         out["SellLagermenge"] = pd.to_numeric(df[col_stock_so], errors="coerce")
 
@@ -715,7 +673,6 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
     ts_source = pd.DataFrame()
     if "StartDatum" in merged.columns:
         ts_source = merged[["StartDatum","Kategorie","Verkaufswert"]].copy()
-        # Leere Kategorien nicht anzeigen
         ts_source["Kategorie"] = ts_source["Kategorie"].fillna("").astype(str).str.strip()
         ts_source = ts_source[ts_source["Kategorie"] != ""]
         ts_source.rename(columns={"Verkaufswert":"Verkaufswert (CHF)"}, inplace=True)
@@ -724,13 +681,25 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
     return detail, totals, ts_source
 
 # =========================
-# Datenquellen / Persistieren
+# Datenquellen / Persistieren (robust, Auto-Erkennung)
 # =========================
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR.parent / "data" if (BASE_DIR.name == "galaxus_tool_source") else BASE_DIR / "data"
+
+def _find_data_dir() -> Path:
+    candidates = [
+        BASE_DIR / "data",              # ./galaxus_tool_source/data
+        BASE_DIR.parent / "data",       # ./data (Repo-Root)
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    candidates[0].mkdir(parents=True, exist_ok=True)
+    return candidates[0]
+
+DATA_DIR = _find_data_dir()
 DEFAULT_SELL_PATH  = DATA_DIR / "sellout.xlsx"
 DEFAULT_PRICE_PATH = DATA_DIR / "preisliste.xlsx"
-DATA_DIR.mkdir(exist_ok=True, parents=True)
+st.caption(f"📁 Datenordner: {DATA_DIR}")
 
 def _persist_upload(uploaded_file, target_path: Path):
     if uploaded_file is None: return
@@ -740,6 +709,38 @@ def _persist_upload(uploaded_file, target_path: Path):
         content = uploaded_file.read()
     with open(target_path, "wb") as f:
         f.write(content)
+
+def _guess_role_from_name(name: str) -> str | None:
+    n = name.lower()
+    if any(k in n for k in ["sell-out", "sellout", "sell", "sales", "report"]):
+        return "sell"
+    if any(k in n for k in ["preisliste", "preis", "price", "vk", "pl ", "pl_", "pl-"]):
+        return "price"
+    return None
+
+def _pick_default_files_from_dir(folder: Path) -> tuple[io.BytesIO|None, io.BytesIO|None, str|None, str|None]:
+    sell_bytes = price_bytes = None
+    sell_name = price_name = None
+    xlsx_files = sorted([p for p in folder.glob("*.xlsx") if p.is_file()])
+    if not xlsx_files:
+        return None, None, None, None
+    # 1) per Keywords
+    for p in xlsx_files:
+        role = _guess_role_from_name(p.name)
+        if role == "sell" and sell_bytes is None:
+            sell_bytes = io.BytesIO(p.read_bytes()); sell_name = p.name
+        elif role == "price" and price_bytes is None:
+            price_bytes = io.BytesIO(p.read_bytes()); price_name = p.name
+    # 2) Rest auffüllen
+    leftovers = [p for p in xlsx_files if p.name not in {sell_name, price_name}]
+    for p in leftovers:
+        if sell_bytes is None:
+            sell_bytes = io.BytesIO(p.read_bytes()); sell_name = p.name
+        elif price_bytes is None:
+            price_bytes = io.BytesIO(p.read_bytes()); price_name = p.name
+        if sell_bytes is not None and price_bytes is not None:
+            break
+    return sell_bytes, price_bytes, sell_name, price_name
 
 # =========================
 # UI
@@ -754,26 +755,36 @@ with c2:
     st.subheader("Preisliste (.xlsx)")
     price_file = st.file_uploader("Drag & drop oder Datei wählen", type=["xlsx"], key="price")
 
-# Auto-Load + Fallback
+# Auto-Load + Fallback (Auto-Erkennung)
 raw_sell = None
 raw_price = None
+used_sell_name = None
+used_price_name = None
+
 if sell_file is not None:
     raw_sell = read_excel_flat(sell_file)
-    st.session_state["sell_last"]  = {"name": sell_file.name}
+    used_sell_name = sell_file.name
     _persist_upload(sell_file, DEFAULT_SELL_PATH)
-elif DEFAULT_SELL_PATH.exists():
-    with open(DEFAULT_SELL_PATH, "rb") as f:
-        raw_sell = read_excel_flat(io.BytesIO(f.read()))
-    st.session_state["sell_last"]  = {"name": DEFAULT_SELL_PATH.name}
 
 if price_file is not None:
     raw_price = read_excel_flat(price_file)
-    st.session_state["price_last"] = {"name": price_file.name}
+    used_price_name = price_file.name
     _persist_upload(price_file, DEFAULT_PRICE_PATH)
-elif DEFAULT_PRICE_PATH.exists():
-    with open(DEFAULT_PRICE_PATH, "rb") as f:
-        raw_price = read_excel_flat(io.BytesIO(f.read()))
-    st.session_state["price_last"] = {"name": DEFAULT_PRICE_PATH.name}
+
+if raw_sell is None or raw_price is None:
+    sbytes, pbytes, sname, pname = _pick_default_files_from_dir(DATA_DIR)
+    if raw_sell is None and sbytes is not None:
+        raw_sell = read_excel_flat(sbytes); used_sell_name = sname
+    if raw_price is None and pbytes is not None:
+        raw_price = read_excel_flat(pbytes); used_price_name = pname
+
+# Fallback auf feste Dateinamen (Kompatibilität)
+if raw_sell is None and DEFAULT_SELL_PATH.exists():
+    raw_sell = read_excel_flat(io.BytesIO(DEFAULT_SELL_PATH.read_bytes()))
+    used_sell_name = DEFAULT_SELL_PATH.name
+if raw_price is None and DEFAULT_PRICE_PATH.exists():
+    raw_price = read_excel_flat(io.BytesIO(DEFAULT_PRICE_PATH.read_bytes()))
+    used_price_name = DEFAULT_PRICE_PATH.name
 
 # Verarbeitung
 if (raw_sell is not None) and (raw_price is not None):
@@ -821,8 +832,8 @@ if (raw_sell is not None) and (raw_price is not None):
         with st.spinner("🔗 Matche & berechne Werte…"):
             detail, totals, ts_source = enrich_and_merge(filtered_sell_df, price_df, latest_stock_baseline_df=sell_df)
 
-        used_sell  = st.session_state.get("sell_last", {}).get("name", "sellout.xlsx")
-        used_price = st.session_state.get("price_last", {}).get("name", "preisliste.xlsx")
+        used_sell  = used_sell_name or "—"
+        used_price = used_price_name or "—"
         st.info(f"Verwendete Dateien: {used_sell} / {used_price}")
 
         # ------- Chart -------
@@ -832,7 +843,6 @@ if (raw_sell is not None) and (raw_price is not None):
             ts["Periode"]   = ts["StartDatum"].dt.to_period("W").dt.start_time
             ts["Kategorie"] = ts["Kategorie"].astype("string")
 
-            # Filter-Auswahl
             all_cats = sorted(ts["Kategorie"].unique())
             sel_cats = st.multiselect("Kategorien filtern", options=all_cats, default=all_cats)
             if sel_cats:
@@ -934,4 +944,4 @@ if (raw_sell is not None) and (raw_price is not None):
     except Exception as e:
         st.error(f"Unerwarteter Fehler: {e}")
 else:
-    st.info("Bitte beide Dateien hochladen oder in den Ordner `data/` legen (Sell-out = `sellout.xlsx`, Preisliste = `preisliste.xlsx`).")
+    st.info("Bitte beide Dateien hochladen oder in den Ordner `data/` legen (Dateinamen beliebig – Auto-Erkennung aktiv).")
