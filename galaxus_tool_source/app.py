@@ -1,4 +1,4 @@
-# app.py — Galaxus Sellout Analyse (Passcode-Login only, ohne bcrypt)
+# app.py — Galaxus Sellout Analyse (Passcode-Login only, robust)
 # - Robustes Matching (ArtNr → EAN → Name → Familie → Hints → Fuzzy)
 # - EU-Datumsfilter, Detailtabelle optional
 # - Summen pro Artikel (Lagerwert = letzter verfügbarer Stand je Artikel, NICHT aufsummiert)
@@ -7,7 +7,7 @@
 # - Sichere Multiplikation (safe_mul) + np.seterr(all="ignore")
 # - Kategorie primär aus Spalte G; leere/NaN-Kategorien bleiben leer und erscheinen nicht im Chart
 # - Summenzeile Σ Gesamt (nur Anzeige) – Währungsangaben in Spaltennamen (CHF)
-# - 🔐 Login via st.secrets [auth].code / password / passcode (kein bcrypt nötig)
+# - 🔐 Login via st.secrets [auth]/Root/Env (kein bcrypt nötig)
 
 import os
 import io
@@ -19,7 +19,6 @@ import streamlit as st
 import altair as alt
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Tuple
 
 # ---------- Global ----------
 np.seterr(all='ignore')
@@ -32,7 +31,7 @@ except Exception:
     pass
 
 # =========================
-# 🔐 Auth – Passcode only
+# 🔐 Auth – Passcode only (robust)
 # =========================
 def _auth_cfg() -> dict:
     cfg = st.secrets.get("auth", {})
@@ -42,26 +41,61 @@ def auth_enabled() -> bool:
     return bool(_auth_cfg().get("require_login", True))
 
 def _get_passcode() -> str | None:
-    cfg = _auth_cfg()
-    # mehrere Key-Namen akzeptieren (kompatibel zu deinem gestrigen Secret)
-    for k in ("code", "password", "passcode"):
-        v = cfg.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
+    """
+    Sucht den Code an vielen Stellen/Namen:
+    - Query-Parameter ?code=
+    - st.secrets["auth"]["code"/"password"/"passcode"/"pw"/"passwort"/"secret"]
+    - Root-Secrets (ohne [auth]) dieselben Aliase
+    - Environment: AUTH_CODE, AUTH_PASSWORD, AUTH_PASSCODE, STREAMLIT_AUTH_CODE
+    """
+    # 1) Query-Parameter
+    try:
+        qp = st.query_params
+        if "code" in qp and str(qp["code"]).strip():
+            return str(qp["code"]).strip()
+    except Exception:
+        pass
+
+    # 2) st.secrets [auth]
+    auth = _auth_cfg()
+    aliases = ("code", "password", "passcode", "pw", "passwort", "secret")
+    for k in aliases:
+        v = auth.get(k)
+        if isinstance(v, (str, int)) and str(v).strip():
+            return str(v).strip()
+
+    # 3) Root-Secrets
+    root = st.secrets
+    if isinstance(root, dict):
+        for k in aliases:
+            v = root.get(k)
+            if isinstance(v, (str, int)) and str(v).strip():
+                return str(v).strip()
+
+    # 4) Environment
+    env_aliases = ("AUTH_CODE", "AUTH_PASSWORD", "AUTH_PASSCODE", "STREAMLIT_AUTH_CODE")
+    for k in env_aliases:
+        v = os.environ.get(k)
+        if isinstance(v, (str, int)) and str(v).strip():
+            return str(v).strip()
+
     return None
 
 def _login_view():
     st.title("🔐 Zugang")
-    passcode = _get_passcode()
-    if not passcode:
-        st.error("Fehlender Passcode: Bitte in st.secrets unter [auth] 'code' oder 'password' oder 'passcode' setzen.")
-        st.stop()
 
+    # Formular immer anzeigen
     with st.form("login-passcode", clear_on_submit=False):
         code = st.text_input("Code / Passwort", type="password")
         ok = st.form_submit_button("Anmelden")
+
+    expected = _get_passcode()
+    if expected is None:
+        st.error("Kein Passcode in den Secrets/Env gefunden. Bitte in st.secrets oder Env hinterlegen.")
+        return
+
     if ok:
-        if code.strip() == passcode:
+        if code.strip() == expected:
             st.session_state["auth_ok"] = True
             st.session_state["auth_user"] = "passcode"
             st.session_state["auth_ts"] = datetime.utcnow().isoformat()
@@ -84,6 +118,11 @@ def logout_button():
             for k in ("auth_ok","auth_user","auth_ts"):
                 st.session_state.pop(k, None)
             st.experimental_rerun()
+
+# 🚪 Login-Gate
+if not ensure_auth():
+    st.stop()
+logout_button()
 
 # =========================
 # Anzeige-Helfer
@@ -365,7 +404,7 @@ def _apply_hints_to_row(name_raw: str) -> dict:
     if "otto"  in s: h["hint_art_prefix"]="o013"
     if "eva" in s and "e-008" in s: h["hint_art_exact"]="e008"
     if "julia" in s and "j-031" in s: h["hint_art_exact"]="j031"
-    if "mia" in s and "m-057" in s: h["hint_art_exact"]="m057"
+    if "mia" in s und "m-057" in s: h["hint_art_exact"]="m057"
     return h
 
 def _fallback_col_by_index(df: pd.DataFrame, idx0: int) -> str|None:
@@ -475,7 +514,7 @@ def _final_backstops(merged: pd.DataFrame, price_df: pd.DataFrame):
             if not hit.empty:
                 _assign_from_price_row(merged,i, hit.iloc[0]); continue
         pref_color = str(merged.at[i,"Hint_Color"] or "")
-        hit = _family_match(merged.loc[i], price_df, prefer_color=pref_color if pref_color else None)
+        hit = _family_match(merged.loc[i], price_df, pref_color if pref_color else None)
         if hit is not None:
             _assign_from_price_row(merged,i, hit); continue
         idx = _best_fuzzy_in_candidates(str(merged.at[i,"Bezeichnung"]), price_df["Bezeichnung"])
@@ -548,11 +587,11 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
 
     # Anzeige-Bezeichnung (bei Duplikaten Farbe anhängen)
     merged["Bezeichnung_anzeige"] = merged["Bezeichnung"]
-    def _looks_like_not_a_color(token: str) -> bool:
+    def _looks_like_not_a_color2(token: str) -> bool:
         t=(token or "").strip().lower()
         return (not t) or (t in {"eu","ch","us","uk"}) or any(x in t for x in ["ml","db","m²","m2"]) or bool(re.search(r"\d",t))
     dup = merged.duplicated(subset=["Bezeichnung"], keep=False)
-    valid_color = merged["Farbe"].astype(str).str.strip().map(lambda t: (t!="") and (not _looks_like_not_a_color(t)))
+    valid_color = merged["Farbe"].astype(str).str.strip().map(lambda t: (t!="") and (not _looks_like_not_a_color2(t)))
     merged.loc[dup & valid_color, "Bezeichnung_anzeige"] = merged.loc[dup & valid_color,"Bezeichnung"] + " – " + merged.loc[dup & valid_color,"Farbe"].astype(str).str.strip()
 
     # Umsatz-Werte
@@ -661,14 +700,6 @@ def _persist_upload(uploaded_file, target_path: Path):
         f.write(content)
 
 # =========================
-# 🚪 Login-Gate
-# =========================
-if not ensure_auth():
-    st.stop()
-
-logout_button()
-
-# =========================
 # UI
 # =========================
 st.title("Galaxus Sellout Analyse")
@@ -748,7 +779,7 @@ if (raw_sell is not None) and (raw_price is not None):
         with st.spinner("🔗 Matche & berechne Werte…"):
             detail, totals, ts_source = enrich_and_merge(filtered_sell_df, price_df, latest_stock_baseline_df=sell_df)
 
-        used_sell = st.session_state.get("sell_last", {}).get("name", "sellout.xlsx")
+        used_sell  = st.session_state.get("sell_last", {}).get("name", "sellout.xlsx")
         used_price = st.session_state.get("price_last", {}).get("name", "preisliste.xlsx")
         st.info(f"Verwendete Dateien: {used_sell} / {used_price}")
 
@@ -756,7 +787,7 @@ if (raw_sell is not None) and (raw_price is not None):
         st.markdown("### 📈 Verkaufsverlauf nach Kategorie (Woche)")
         if not ts_source.empty:
             ts = ts_source.dropna(subset=["StartDatum"]).copy()
-            ts["Periode"] = ts["StartDatum"].dt.to_period("W").dt.start_time
+            ts["Periode"]   = ts["StartDatum"].dt.to_period("W").dt.start_time
             ts["Kategorie"] = ts["Kategorie"].astype("string")
 
             # Filter-Auswahl
