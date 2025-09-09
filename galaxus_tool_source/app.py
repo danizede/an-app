@@ -123,7 +123,7 @@ def _login_view():
             st.session_state["auth_user"] = "passcode"
             st.session_state["auth_ts"] = datetime.utcnow().isoformat()
             st.success("Erfolgreich angemeldet.")
-            st.experimental_rerun()
+            st.rerun()
         else:
             st.error("Ungültiger Code.")
 
@@ -140,7 +140,7 @@ def logout_button():
         if st.button("Logout"):
             for k in ("auth_ok","auth_user","auth_ts"):
                 st.session_state.pop(k, None)
-            st.experimental_rerun()
+            st.rerun()
 
 
 # 🚪 Login-Gate
@@ -805,7 +805,7 @@ if (raw_sell is not None) and (raw_price is not None):
                 st.write(""); st.write("")
                 if st.button("Gesamten Zeitraum"):
                     st.session_state["date_range"] = (min_date, max_date)
-                    st.experimental_rerun()
+                    st.rerun()
 
             if isinstance(date_value, tuple):
                 start_date, end_date = date_value
