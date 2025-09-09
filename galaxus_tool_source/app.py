@@ -1,4 +1,4 @@
-# app.py — Galaxus Sellout Analyse (+ Passcode-Login kompatibel zu deinem gestrigen Secrets-Setup)
+# app.py — Galaxus Sellout Analyse (Passcode-Login only, ohne bcrypt)
 # - Robustes Matching (ArtNr → EAN → Name → Familie → Hints → Fuzzy)
 # - EU-Datumsfilter, Detailtabelle optional
 # - Summen pro Artikel (Lagerwert = letzter verfügbarer Stand je Artikel, NICHT aufsummiert)
@@ -7,9 +7,7 @@
 # - Sichere Multiplikation (safe_mul) + np.seterr(all="ignore")
 # - Kategorie primär aus Spalte G; leere/NaN-Kategorien bleiben leer und erscheinen nicht im Chart
 # - Summenzeile Σ Gesamt (nur Anzeige) – Währungsangaben in Spaltennamen (CHF)
-# - 🔐 Passwortschutz kompatibel mit:
-#   * Einfachem Code: st.secrets["auth"]["code"] / ["password"] / ["passcode"]
-#   * Benutzerliste:  [users] mit bcrypt-Hash oder *_clear
+# - 🔐 Login via st.secrets [auth].code / password / passcode (kein bcrypt nötig)
 
 import os
 import io
@@ -20,7 +18,6 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 from pathlib import Path
-import bcrypt
 from datetime import datetime
 from typing import Dict, Tuple
 
@@ -35,7 +32,7 @@ except Exception:
     pass
 
 # =========================
-# 🔐 Auth (NEU – kompatibel zu deinem Secret-"Code")
+# 🔐 Auth – Passcode only
 # =========================
 def _auth_cfg() -> dict:
     cfg = st.secrets.get("auth", {})
@@ -45,68 +42,33 @@ def auth_enabled() -> bool:
     return bool(_auth_cfg().get("require_login", True))
 
 def _get_passcode() -> str | None:
-    # Wir akzeptieren mehrere Key-Namen, damit dein "Code" von gestern sicher gefunden wird
     cfg = _auth_cfg()
+    # mehrere Key-Namen akzeptieren (kompatibel zu deinem gestrigen Secret)
     for k in ("code", "password", "passcode"):
         v = cfg.get(k)
         if isinstance(v, str) and v.strip():
             return v.strip()
     return None
 
-def _load_users() -> Tuple[Dict[str, str], Dict[str, str]]:
-    users = st.secrets.get("users", {}) or {}
-    hashed, clear = {}, {}
-    for k, v in users.items():
-        if k.endswith("_clear"):
-            clear[k.replace("_clear", "")] = str(v)
-        else:
-            hashed[k] = str(v)
-    return hashed, clear
-
-def _check_userpass(username: str, password: str) -> bool:
-    hashed, clear = _load_users()
-    if username in hashed:
-        try:
-            return bcrypt.checkpw(password.encode(), hashed[username].encode())
-        except Exception:
-            return False
-    if username in clear:
-        return password == clear[username]
-    return False
-
 def _login_view():
-    passcode = _get_passcode()
     st.title("🔐 Zugang")
-    if passcode:
-        # Ein-Feld-Login (dein gestriger Code in st.secrets.auth)
-        with st.form("login-passcode", clear_on_submit=False):
-            code = st.text_input("Code / Passwort", type="password")
-            ok = st.form_submit_button("Anmelden")
-        if ok:
-            if code.strip() == passcode:
-                st.session_state["auth_ok"] = True
-                st.session_state["auth_user"] = "passcode"
-                st.session_state["auth_ts"] = datetime.utcnow().isoformat()
-                st.success("Erfolgreich angemeldet.")
-                st.experimental_rerun()
-            else:
-                st.error("Ungültiger Code.")
-    else:
-        # Benutzer/Passwort-Login (falls du [users] nutzt)
-        with st.form("login-userpass", clear_on_submit=False):
-            c1, c2 = st.columns(2)
-            user = c1.text_input("Username")
-            pw   = c2.text_input("Passwort", type="password")
-            ok = st.form_submit_button("Anmelden")
-        if ok:
-            if _check_userpass(user.strip(), pw.strip()):
-                st.session_state["auth_ok"] = True
-                st.session_state["auth_user"] = user.strip()
-                st.session_state["auth_ts"] = datetime.utcnow().isoformat()
-                st.success("Erfolgreich angemeldet.")
-                st.experimental_rerun()
-            else:
-                st.error("Ungültige Zugangsdaten.")
+    passcode = _get_passcode()
+    if not passcode:
+        st.error("Fehlender Passcode: Bitte in st.secrets unter [auth] 'code' oder 'password' oder 'passcode' setzen.")
+        st.stop()
+
+    with st.form("login-passcode", clear_on_submit=False):
+        code = st.text_input("Code / Passwort", type="password")
+        ok = st.form_submit_button("Anmelden")
+    if ok:
+        if code.strip() == passcode:
+            st.session_state["auth_ok"] = True
+            st.session_state["auth_user"] = "passcode"
+            st.session_state["auth_ts"] = datetime.utcnow().isoformat()
+            st.success("Erfolgreich angemeldet.")
+            st.experimental_rerun()
+        else:
+            st.error("Ungültiger Code.")
 
 def ensure_auth():
     if not auth_enabled():
@@ -345,7 +307,7 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     out["Bezeichnung_key"] = out["Bezeichnung"].map(normalize_key)
     out["Familie"]         = out["Bezeichnung"].map(make_family_key)
 
-    # Kategorie bereinigen
+    # Kategorie bereinigen (leer statt NaN/None)
     if col_cat:
         out["Kategorie"] = (
             df[col_cat].astype(str)
@@ -513,7 +475,7 @@ def _final_backstops(merged: pd.DataFrame, price_df: pd.DataFrame):
             if not hit.empty:
                 _assign_from_price_row(merged,i, hit.iloc[0]); continue
         pref_color = str(merged.at[i,"Hint_Color"] or "")
-        hit = _family_match(merged.loc[i], price_df, pref_color if pref_color else None)
+        hit = _family_match(merged.loc[i], price_df, prefer_color=pref_color if pref_color else None)
         if hit is not None:
             _assign_from_price_row(merged,i, hit); continue
         idx = _best_fuzzy_in_candidates(str(merged.at[i,"Bezeichnung"]), price_df["Bezeichnung"])
@@ -672,6 +634,7 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
     ts_source = pd.DataFrame()
     if "StartDatum" in merged.columns:
         ts_source = merged[["StartDatum","Kategorie","Verkaufswert"]].copy()
+        # Leere Kategorien nicht anzeigen
         ts_source["Kategorie"] = ts_source["Kategorie"].fillna("").astype(str).str.strip()
         ts_source = ts_source[ts_source["Kategorie"] != ""]
         ts_source.rename(columns={"Verkaufswert":"Verkaufswert (CHF)"}, inplace=True)
@@ -706,7 +669,7 @@ if not ensure_auth():
 logout_button()
 
 # =========================
-# UI (unverändert)
+# UI
 # =========================
 st.title("Galaxus Sellout Analyse")
 
