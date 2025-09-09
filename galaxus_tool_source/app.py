@@ -1,9 +1,10 @@
-# app.py — Galaxus Sellout Analyse (Passcode-Login + Auto-File-Detection)
+# app.py — Galaxus Sellout Analyse (Passcode-Login + Auto-File-Detection, Default-first)
 # - Robustes Matching (ArtNr → EAN → Name → Familie → Hints → Fuzzy)
 # - EU-Datumsfilter, Detailtabelle optional
 # - Summen pro Artikel (Lagerwert = letzter verfügbarer Stand je Artikel, NICHT aufsummiert)
 # - Interaktives Linienchart (Woche) mit Hover-Highlight & Pop-up-Label
 # - Auto-Load aus /data mit Dateinamen-Autoerkennung (sellout / preisliste)
+# - Zuerst DEFAULT-Dateien (sellout.xlsx / preisliste.xlsx), danach Heuristik
 # - Sichere Multiplikation (safe_mul) + np.seterr(all="ignore")
 # - Kategorie primär aus Spalte G; leere/NaN-Kategorien bleiben leer und erscheinen nicht im Chart
 # - Summenzeile Σ Gesamt – Währungsangaben in Spaltennamen (CHF)
@@ -155,6 +156,7 @@ def style_numeric(df: pd.DataFrame, num_cols=NUM_COLS_DEFAULT, sep=THOUSANDS_SEP
     return out, out.style.format(fmt)
 
 def append_total_row_for_display(df: pd.DataFrame) -> pd.DataFrame:
+    """Σ-Gesamt ans Ende anhängen (nur UI-Anzeige)."""
     if df is None or df.empty: return df
     cols = list(df.columns)
     num_targets = ["Einkaufsmenge","Einkaufswert (CHF)","Verkaufsmenge","Verkaufswert (CHF)","Lagermenge","Lagerwert (CHF)"]
@@ -673,6 +675,7 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
     ts_source = pd.DataFrame()
     if "StartDatum" in merged.columns:
         ts_source = merged[["StartDatum","Kategorie","Verkaufswert"]].copy()
+        # Leere Kategorien nicht anzeigen
         ts_source["Kategorie"] = ts_source["Kategorie"].fillna("").astype(str).str.strip()
         ts_source = ts_source[ts_source["Kategorie"] != ""]
         ts_source.rename(columns={"Verkaufswert":"Verkaufswert (CHF)"}, inplace=True)
@@ -755,12 +758,13 @@ with c2:
     st.subheader("Preisliste (.xlsx)")
     price_file = st.file_uploader("Drag & drop oder Datei wählen", type=["xlsx"], key="price")
 
-# Auto-Load + Fallback (Auto-Erkennung)
+# Auto-Load + Fallback (Default-first, dann Auto-Erkennung)
 raw_sell = None
 raw_price = None
 used_sell_name = None
 used_price_name = None
 
+# 0) Uploads – sofort verwenden und als DEFAULT_* persistieren
 if sell_file is not None:
     raw_sell = read_excel_flat(sell_file)
     used_sell_name = sell_file.name
@@ -771,20 +775,21 @@ if price_file is not None:
     used_price_name = price_file.name
     _persist_upload(price_file, DEFAULT_PRICE_PATH)
 
-if raw_sell is None or raw_price is None:
-    sbytes, pbytes, sname, pname = _pick_default_files_from_dir(DATA_DIR)
-    if raw_sell is None and sbytes is not None:
-        raw_sell = read_excel_flat(sbytes); used_sell_name = sname
-    if raw_price is None and pbytes is not None:
-        raw_price = read_excel_flat(pbytes); used_price_name = pname
-
-# Fallback auf feste Dateinamen (Kompatibilität)
+# 1) Falls im aktuellen Run nichts hochgeladen wurde: zuerst die Standardnamen bevorzugen
 if raw_sell is None and DEFAULT_SELL_PATH.exists():
     raw_sell = read_excel_flat(io.BytesIO(DEFAULT_SELL_PATH.read_bytes()))
     used_sell_name = DEFAULT_SELL_PATH.name
 if raw_price is None and DEFAULT_PRICE_PATH.exists():
     raw_price = read_excel_flat(io.BytesIO(DEFAULT_PRICE_PATH.read_bytes()))
     used_price_name = DEFAULT_PRICE_PATH.name
+
+# 2) Falls immer noch etwas fehlt: heuristische Auto-Erkennung im data/-Ordner
+if raw_sell is None or raw_price is None:
+    sbytes, pbytes, sname, pname = _pick_default_files_from_dir(DATA_DIR)
+    if raw_sell is None and sbytes is not None:
+        raw_sell = read_excel_flat(sbytes); used_sell_name = sname
+    if raw_price is None and pbytes is not None:
+        raw_price = read_excel_flat(pbytes); used_price_name = pname
 
 # Verarbeitung
 if (raw_sell is not None) and (raw_price is not None):
@@ -944,4 +949,5 @@ if (raw_sell is not None) and (raw_price is not None):
     except Exception as e:
         st.error(f"Unerwarteter Fehler: {e}")
 else:
-    st.info("Bitte beide Dateien hochladen oder in den Ordner `data/` legen (Dateinamen beliebig – Auto-Erkennung aktiv).")
+    st.info("Bitte beide Dateien hochladen oder in den Ordner `data/` legen. "
+            "Es werden zuerst `sellout.xlsx`/`preisliste.xlsx` geladen, sonst Auto-Erkennung.")
