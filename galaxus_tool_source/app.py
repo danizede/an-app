@@ -951,21 +951,49 @@ if (raw_sell is not None) and (raw_price is not None):
                           .clip(0, 1_000_000)
                     )
 
-        with st.spinner("🔗 Matche & berechne Werte…"):
-            with np.errstate(over="ignore", invalid="ignore",
-                             divide="ignore", under="ignore"):
-                detail, totals, ts_source = enrich_and_merge(
-                    filtered_sell_df, price_df, latest_stock_baseline_df=sell_df
+# --- Dateienhinweis immer anzeigen, damit du siehst, welche Files gezogen wurden
+used_sell  = used_sell_name or "—"
+used_price = used_price_name or "—"
+st.caption(f"🔎 Auto-Erkennung: Sell-out: {used_sell} / Preisliste: {used_price}")
+
+# --- Berechnung robust: auch bei Overflows immer ein Ergebnis liefern ---
+detail = pd.DataFrame(); totals = pd.DataFrame(); ts_source = pd.DataFrame()
+
+with st.spinner("🔗 Matche & berechne Werte…"):
+    try:
+        # Standard-Pfad: Overflows global unterdrücken
+        with np.errstate(over='ignore', invalid='ignore', divide='ignore', under='ignore'):
+            detail, totals, ts_source = enrich_and_merge(
+                filtered_sell_df, price_df, latest_stock_baseline_df=sell_df
+            )
+
+    except FloatingPointError:
+        # Fallback: Inputs hart säubern/clippen und neu rechnen
+        st.warning("Zahlüberlauf erkannt – Inputs werden geclippt und erneut berechnet.")
+        # Mengen im Sell-out
+        for col in ["Einkaufsmenge", "Verkaufsmenge"]:
+            if col in filtered_sell_df:
+                filtered_sell_df[col] = (
+                    pd.to_numeric(filtered_sell_df[col], errors="coerce")
+                      .fillna(0).clip(0, MAX_QTY)
                 )
+        # Preise/Lager in der Preisliste (falls vorhanden)
+        for col in ["Einkaufspreis", "Verkaufspreis", "Lagermenge"]:
+            if col in price_df.columns:
+                price_df[col] = (
+                    pd.to_numeric(price_df[col], errors="coerce")
+                      .fillna(0).clip(0, MAX_PRICE)
+                )
+        with np.errstate(over='ignore', invalid='ignore', divide='ignore', under='ignore'):
+            detail, totals, ts_source = enrich_and_merge(
+                filtered_sell_df, price_df, latest_stock_baseline_df=sell_df
+            )
 
-        # >>> hier geht deine Auswertung / Charts weiter …
+    except Exception as e:
+        st.error(f"Fehler bei der Berechnung: {e}")
+        # Sicherstellen, dass die UI unten weiter rendert (nur leere Frames)
+        detail = pd.DataFrame(); totals = pd.DataFrame(); ts_source = pd.DataFrame()
 
-            # >>> hier geht deine Auswertung / Charts weiter …
-
-        # Hinweis zu den verwendeten Dateien
-        used_sell  = used_sell_name or "—"
-        used_price = used_price_name or "—"
-        st.caption(f"🔎 Auto-Erkennung: Sell-out: {used_sell} / Preisliste: {used_price}")
 
         # ------- Chart -------
         st.markdown("### 📈 Verkaufsverlauf nach Kategorie (Woche)")
