@@ -679,20 +679,41 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
     merged["Lagerwert_latest"] = safe_mul(merged["Lagermenge_latest"], merged["Verkaufspreis_latest"])
 
     # Tabellen
-    detail = merged[["ArtikelNr","Bezeichnung_anzeige","Kategorie",
-                     "Einkaufsmenge","Einkaufswert","Verkaufsmenge","Verkaufswert"]].copy()
-    detail["Lagermenge"] = merged["Lagermenge_latest"]
-    detail["Lagerwert"]  = merged["Lagerwert_latest"]
+  # ---- Detailtabelle (inkl. stabiler Key) ----
+detail = merged[[
+    "ArtikelNr_key","ArtikelNr","Bezeichnung_anzeige","Kategorie",
+    "Einkaufsmenge","Einkaufswert","Verkaufsmenge","Verkaufswert"
+]].copy()
+detail["Lagermenge"] = merged["Lagermenge_latest"]
+detail["Lagerwert"]  = merged["Lagerwert_latest"]
 
-    totals = (detail.groupby(["ArtikelNr","Bezeichnung_anzeige","Kategorie"], dropna=False, as_index=False)
-                  .agg({
-                      "Einkaufsmenge":"sum",
-                      "Einkaufswert":"sum",
-                      "Verkaufsmenge":"sum",
-                      "Verkaufswert":"sum",
-                      "Lagermenge":"max",
-                      "Lagerwert":"max"
-                  }))
+def _mode_nonempty(s: pd.Series) -> str:
+    s = s.dropna().astype(str).str.strip()
+    if s.empty: return ""
+    try:
+        return s.mode().iloc[0]
+    except Exception:
+        return s.iloc[0]
+
+# ---- Harte Konsolidierung: genau 1 Zeile pro Artikel ----
+# Gruppieren über den stabilen Schlüssel (ArtikelNr_key), Summen für EK/VK,
+# letzter Lagerstand via max(), Name/Kategorie via Mehrheitswert.
+_tot = (detail.groupby("ArtikelNr_key", as_index=False)
+    .agg({
+        "ArtikelNr": _mode_nonempty,
+        "Bezeichnung_anzeige": _mode_nonempty,
+        "Kategorie": _mode_nonempty,
+        "Einkaufsmenge": "sum",
+        "Einkaufswert": "sum",
+        "Verkaufsmenge": "sum",
+        "Verkaufswert": "sum",
+        "Lagermenge": "max",   # letzter bekannter Stand
+        "Lagerwert": "max"
+    }))
+
+# Für die Anzeige heissen wie bisher:
+totals = _tot.drop(columns=["ArtikelNr_key"])
+
 
     ts_source = pd.DataFrame()
     if "StartDatum" in merged.columns:
