@@ -947,8 +947,13 @@ if (raw_sell is not None) and (raw_price is not None):
                 if col in filtered_sell_df:
                     filtered_sell_df[col] = pd.to_numeric(filtered_sell_df[col], errors="coerce").fillna(0).clip(0, 1_000_000)
 
-        with st.spinner("🔗 Matche & berechne Werte…"):
-            detail, totals, ts_source = enrich_and_merge(filtered_sell_df, price_df, latest_stock_baseline_df=sell_df)
+with st.spinner("🔗 Matche & berechne Werte…"):
+    # Unterdrücke Overflow/Invalid global für die gesamte Berechnung
+    with np.errstate(over='ignore', invalid='ignore', divide='ignore', under='ignore'):
+        detail, totals, ts_source = enrich_and_merge(
+            filtered_sell_df, price_df, latest_stock_baseline_df=sell_df
+        )
+
 
         used_sell  = used_sell_name or "—"
         used_price = used_price_name or "—"
