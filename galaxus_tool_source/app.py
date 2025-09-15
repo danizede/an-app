@@ -1094,8 +1094,7 @@ if (raw_sell is not None) and (raw_price is not None):
             st.altair_chart((lines + points + popup + end_labels).properties(height=400), use_container_width=True)
         else:
             st.info("Für den Verlauf werden gültige Startdaten und nicht-leere Kategorien benötigt.")
-
-
+    
         # ------- Tabellen & Downloads -------
         detail_renamed = pd.DataFrame()
         totals_renamed = pd.DataFrame()
