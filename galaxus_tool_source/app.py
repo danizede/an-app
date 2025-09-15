@@ -785,6 +785,34 @@ raw_price = None
 used_sell_name = None
 used_price_name = None
 
+def _classify_df(df: pd.DataFrame) -> str|None:
+    """Erkennt 'sell' (hat Verkaufsmenge) oder 'price' (hat Preis/NETTO NETTO/Bestand/Kategorie)."""
+    cols = set(map(str, df.columns))
+    # Kandidaten wie im Parser
+    if any(c in cols or re.sub(r"[\s\-_/\.]+","",c).lower() in {re.sub(r"[\s\-_/\.]+","",x).lower() for x in cols}
+           for c in ["SalesQty","Verkauf","Verkaufte Menge","Menge verkauft","Absatz","Stück","Menge"]):
+        return "sell"
+    price_keys = {"NETTO NETTO","Verkaufspreis","Einkaufspreis","Preis","VK","Netto","Bestand","Kategorie"}
+    if any(pk in cols for pk in price_keys):
+        return "price"
+    return None
+
+def _maybe_swap_roles(rs: pd.DataFrame|None, rp: pd.DataFrame|None):
+    """Wenn nur eines da ist oder die Rollen vertauscht wurden -> korrigieren."""
+    role_s = _classify_df(rs) if rs is not None else None
+    role_p = _classify_df(rp) if rp is not None else None
+
+    # 1) Nur links geladen, aber es ist 'price' -> nach rechts verschieben
+    if rs is not None and rp is None and role_s == "price":
+        return None, rs, None, used_sell_name
+    # 2) Nur rechts geladen, aber es ist 'sell' -> nach links verschieben
+    if rp is not None and rs is None and role_p == "sell":
+        return rp, None, used_price_name, None
+    # 3) Beide geladen, aber Rollen vertauscht
+    if rs is not None and rp is not None and role_s == "price" and role_p == "sell":
+        return rp, rs, used_price_name, used_sell_name
+    return rs, rp, used_sell_name, used_price_name
+
 # 0) Uploads – sofort verwenden und als DEFAULT_* persistieren
 if sell_file is not None:
     raw_sell = read_excel_flat(sell_file)
@@ -795,6 +823,9 @@ if price_file is not None:
     raw_price = read_excel_flat(price_file)
     used_price_name = price_file.name
     _persist_upload(price_file, DEFAULT_PRICE_PATH)
+
+# Falls ein Upload in der falschen Box landete: automatisch korrigieren
+raw_sell, raw_price, used_sell_name, used_price_name = _maybe_swap_roles(raw_sell, raw_price)
 
 # 1) Falls im aktuellen Run nichts hochgeladen wurde: zuerst die Standardnamen bevorzugen
 if raw_sell is None and DEFAULT_SELL_PATH.exists():
@@ -808,9 +839,26 @@ if raw_price is None and DEFAULT_PRICE_PATH.exists():
 if raw_sell is None or raw_price is None:
     sbytes, pbytes, sname, pname = _pick_default_files_from_dir(DATA_DIR)
     if raw_sell is None and sbytes is not None:
-        raw_sell = read_excel_flat(sbytes); used_sell_name = sname
+        tmp = read_excel_flat(sbytes)
+        if _classify_df(tmp) == "price" and raw_price is None:
+            raw_price = tmp; used_price_name = sname
+        else:
+            raw_sell = tmp; used_sell_name = sname
     if raw_price is None and pbytes is not None:
-        raw_price = read_excel_flat(pbytes); used_price_name = pname
+        tmp = read_excel_flat(pbytes)
+        if _classify_df(tmp) == "sell" and raw_sell is None:
+            raw_sell = tmp; used_sell_name = pname
+        else:
+            raw_price = tmp; used_price_name = pname
+
+# Finaler Hinweis, was erkannt wurde
+if raw_sell is not None or raw_price is not None:
+    msg = []
+    if used_sell_name:  msg.append(f"Sell-out: {used_sell_name}")
+    if used_price_name: msg.append(f"Preisliste: {used_price_name}")
+    if msg:
+        st.caption("🔎 Auto-Erkennung: " + " / ".join(msg))
+
 
 # Verarbeitung
 if (raw_sell is not None) and (raw_price is not None):
