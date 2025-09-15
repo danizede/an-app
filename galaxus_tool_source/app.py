@@ -908,41 +908,67 @@ if (raw_sell is not None) and (raw_price is not None):
             sell_df  = prepare_sell_df(raw_sell)
             price_df = prepare_price_df(raw_price)
 
-        # Zeitraumfilter
-        filtered_sell_df = sell_df
-        if {"StartDatum","EndDatum"}.issubset(sell_df.columns) and not sell_df["StartDatum"].isna().all():
-            st.subheader("Periode wählen")
-            min_date = sell_df["StartDatum"].min().date()
-            max_date = (sell_df["EndDatum"].dropna().max() if "EndDatum" in sell_df else sell_df["StartDatum"].max()).date()
+# Zeitraumfilter (auf ganze Wochen snappen: Montag–Sonntag)
+filtered_sell_df = sell_df
+if {"StartDatum","EndDatum"}.issubset(sell_df.columns) and not sell_df["StartDatum"].isna().all():
+    st.subheader("Periode wählen")
 
-            if "date_range" not in st.session_state:
-                st.session_state["date_range"] = (min_date, max_date)
+    min_date = sell_df["StartDatum"].min().date()
+    # Falls EndDatum leer: mit StartDatum füllen (bereits im Parser gemacht, hier doppelt robust)
+    max_date = (sell_df["EndDatum"].dropna().max() if "EndDatum" in sell_df else sell_df["StartDatum"].max()).date()
 
-            col_range, col_btn = st.columns([3,1])
-            with col_range:
-                date_value = st.date_input(
-                    "Zeitraum (DD.MM.YYYY)",
-                    value=st.session_state["date_range"],
-                    min_value=min_date,
-                    max_value=max_date,
-                    format="DD.MM.YYYY",
-                )
-            with col_btn:
-                st.write(""); st.write("")
-                if st.button("Gesamten Zeitraum"):
-                    st.session_state["date_range"] = (min_date, max_date)
-                    st.rerun()
+    if "date_range" not in st.session_state:
+        st.session_state["date_range"] = (min_date, max_date)
 
-            if isinstance(date_value, tuple):
-                start_date, end_date = date_value
-            else:
-                start_date = end_date = date_value
+    col_range, col_btn = st.columns([3, 1])
+    with col_range:
+        date_value = st.date_input(
+            "Zeitraum (DD.MM.YYYY) – Auswahl wird automatisch auf volle Kalenderwochen erweitert",
+            value=st.session_state["date_range"],
+            min_value=min_date,
+            max_value=max_date,
+            format="DD.MM.YYYY",
+        )
+    with col_btn:
+        st.write(""); st.write("")
+        if st.button("Gesamten Zeitraum"):
+            st.session_state["date_range"] = (min_date, max_date)
+            st.rerun()
 
-            st.session_state["date_range"] = (start_date, end_date)
+    # Einzel- oder Doppelwert in Tuple wandeln
+    if isinstance(date_value, tuple):
+        start_date, end_date = date_value
+    else:
+        start_date = end_date = date_value
 
-            mask = ~((sell_df["EndDatum"].dt.date < start_date) |
-                     (sell_df["StartDatum"].dt.date > end_date))
-            filtered_sell_df = sell_df.loc[mask].copy()
+    # --- Auf ganze Wochen snappen (Montag–Sonntag) ---
+    # Montag = 0 … Sonntag = 6
+    from datetime import timedelta
+    start_snapped = start_date - timedelta(days=start_date.weekday())
+    end_snapped   = end_date + timedelta(days=(6 - end_date.weekday()))
+
+    # Im State speichern (für UI-Konsistenz)
+    st.session_state["date_range"] = (start_snapped, end_snapped)
+
+    # Hinweis anzeigen, falls gesnappt wurde
+    if (start_snapped != start_date) or (end_snapped != end_date):
+        st.caption(f"📅 Auswahl auf ganze Wochen erweitert: {start_snapped.strftime('%d.%m.%Y')} – {end_snapped.strftime('%d.%m.%Y')}")
+
+    # Robuste Filterlogik (Intervalle überlappen)
+    sdt = sell_df["StartDatum"].dt.date
+    edt = (sell_df["EndDatum"].fillna(sell_df["StartDatum"])).dt.date
+    mask = ~((edt < start_snapped) | (sdt > end_snapped))
+    filtered_sell_df = sell_df.loc[mask].copy()
+
+    # Zusätzliche Sicherheit: nie leere NaNs in Mengen/Preisen weiterreichen
+    for col in ["Einkaufsmenge","Verkaufsmenge"]:
+        if col in filtered_sell_df:
+            filtered_sell_df[col] = pd.to_numeric(filtered_sell_df[col], errors="coerce").fillna(0)
+
+    # Ganz hart clippen, bevor später multipliziert wird (Overflow-Prävention)
+    for col in ["Einkaufsmenge","Verkaufsmenge"]:
+        if col in filtered_sell_df:
+            filtered_sell_df[col] = filtered_sell_df[col].clip(lower=0, upper=1_000_000)
 
         with st.spinner("🔗 Matche & berechne Werte…"):
             detail, totals, ts_source = enrich_and_merge(filtered_sell_df, price_df, latest_stock_baseline_df=sell_df)
