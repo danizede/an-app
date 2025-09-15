@@ -960,6 +960,124 @@ if (raw_sell is not None) and (raw_price is not None):
 
         # >>> hier geht deine Auswertung / Charts weiter …
 
+            # >>> hier geht deine Auswertung / Charts weiter …
+
+        # Hinweis zu den verwendeten Dateien
+        used_sell  = used_sell_name or "—"
+        used_price = used_price_name or "—"
+        st.caption(f"🔎 Auto-Erkennung: Sell-out: {used_sell} / Preisliste: {used_price}")
+
+        # ------- Chart -------
+        st.markdown("### 📈 Verkaufsverlauf nach Kategorie (Woche)")
+        if not ts_source.empty:
+            ts = ts_source.dropna(subset=["StartDatum"]).copy()
+            ts["Periode"]   = ts["StartDatum"].dt.to_period("W").dt.start_time
+            ts["Kategorie"] = ts["Kategorie"].astype("string")
+
+            all_cats = sorted(ts["Kategorie"].unique())
+            sel_cats = st.multiselect("Kategorien filtern", options=all_cats, default=all_cats)
+            if sel_cats:
+                ts = ts[ts["Kategorie"].isin(sel_cats)]
+
+            ts_agg = (ts.groupby(["Kategorie","Periode"], as_index=False)["Verkaufswert (CHF)"]
+                        .sum()
+                        .rename(columns={"Verkaufswert (CHF)":"Wert (CHF)"}))
+            ts_agg["Periode"]    = pd.to_datetime(ts_agg["Periode"])
+            ts_agg["Kategorie"]  = ts_agg["Kategorie"].astype(str)
+            ts_agg["Wert (CHF)"] = pd.to_numeric(ts_agg["Wert (CHF)"], errors="coerce").fillna(0.0).astype(float)
+
+            hover_cat = alt.selection_single(fields=["Kategorie"], on="mouseover", nearest=True, empty="none")
+            hover_pt  = alt.selection_single(fields=["Periode","Kategorie"], on="mouseover", nearest=True, empty="none")
+
+            base = alt.Chart(ts_agg)
+            lines = (
+                base.mark_line(point=alt.OverlayMarkDef(size=30), interpolate="linear")
+                    .encode(
+                        x=alt.X("Periode:T", title="Woche"),
+                        y=alt.Y("Wert (CHF):Q", title="Verkaufswert (CHF) pro Woche", stack=None),
+                        color=alt.Color("Kategorie:N", title="Kategorie"),
+                        opacity=alt.condition(hover_cat, alt.value(1.0), alt.value(0.25)),
+                        strokeWidth=alt.condition(hover_cat, alt.value(3), alt.value(1.5)),
+                        tooltip=[
+                            alt.Tooltip("Periode:T", title="Woche"),
+                            alt.Tooltip("Kategorie:N", title="Kategorie"),
+                            alt.Tooltip("Wert (CHF):Q", title="Verkaufswert (CHF)", format=",.0f"),
+                        ],
+                    )
+                    .add_selection(hover_cat)
+            )
+            points = (
+                base.mark_point(size=70, opacity=0)
+                    .encode(x="Periode:T", y="Wert (CHF):Q", color="Kategorie:N")
+                    .add_selection(hover_pt)
+            )
+            popup = (
+                base.transform_filter(hover_pt)
+                    .mark_text(align='left', dx=6, dy=-8, fontSize=12, fontWeight='bold')
+                    .encode(x="Periode:T", y="Wert (CHF):Q", text="Kategorie:N", color="Kategorie:N")
+            )
+            end_labels = (
+                base.transform_window(
+                        row_number='row_number()',
+                        sort=[alt.SortField(field='Periode', order='descending')],
+                        groupby=['Kategorie']
+                    )
+                    .transform_filter(alt.datum.row_number == 0)
+                    .mark_text(align='left', dx=6, dy=-6, fontSize=11)
+                    .encode(x='Periode:T', y='Wert (CHF):Q', text='Kategorie:N', color='Kategorie:N',
+                            opacity=alt.condition(hover_cat, alt.value(1.0), alt.value(0.6)))
+            )
+            chart = (lines + points + popup + end_labels).properties(height=400)
+            st.altair_chart(chart, use_container_width=True)
+        else:
+            st.info("Für den Verlauf werden gültige Startdaten und nicht-leere Kategorien benötigt.")
+
+        # ------- Tabellen -------
+        show_detail = st.checkbox("Detailtabelle anzeigen", value=False)
+
+        detail_csv = b""
+        if show_detail:
+            st.subheader("Detailtabelle")
+            detail_renamed = detail.rename(columns={
+                "Einkaufswert":"Einkaufswert (CHF)",
+                "Verkaufswert":"Verkaufswert (CHF)",
+                "Lagerwert":"Lagerwert (CHF)"
+            })
+            detail_display = append_total_row_for_display(detail_renamed)
+            _, d_styler = style_numeric(detail_display)
+            st.dataframe(d_styler, use_container_width=True)
+            # Für Download vormerken
+            detail_csv = detail_renamed.to_csv(index=False).encode("utf-8")
+
+        st.subheader("Summen pro Artikel")
+        totals_renamed = totals.rename(columns={
+            "Einkaufswert":"Einkaufswert (CHF)",
+            "Verkaufswert":"Verkaufswert (CHF)",
+            "Lagerwert":"Lagerwert (CHF)"
+        })
+        totals_display = append_total_row_for_display(totals_renamed)
+        _, t_styler = style_numeric(totals_display)
+        st.dataframe(t_styler, use_container_width=True)
+
+        # ------- Downloads (ohne Σ-Gesamtzeile) -------
+        dl1, dl2 = st.columns(2)
+        with dl1:
+            st.download_button(
+                "⬇️ Detail (CSV)",
+                data=detail_csv,
+                file_name="detail.csv",
+                mime="text/csv",
+                disabled=not show_detail
+            )
+        with dl2:
+            st.download_button(
+                "⬇️ Summen (CSV)",
+                data=totals_renamed.to_csv(index=False).encode("utf-8"),
+                file_name="summen.csv",
+                mime="text/csv"
+            )
+
+
     except KeyError as e:
         st.error(str(e))
         st.info(
