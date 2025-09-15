@@ -290,6 +290,59 @@ def extract_color_from_name(name: str) -> str:
                 return _COLOR_MAP.get(w, w.title())
     return ""
 
+# --- Basis-Anzeigename aus PL/Sell-Name bauen: nur Produktname (inkl. little/big/pro/mobile), KEINE Kategorie ---
+_CATEGORY_TOKENS = {
+    # deutsch
+    "hygrometer","aroma diffuser","diffuser","ventilator","tischventilator","luftreiniger",
+    "luftbefeuchter","verdunster","vernebler","luftentfeuchter","reiniger","aroma","tisch ventilator",
+    # englisch zur Sicherheit
+    "humidifier","dehumidifier","air purifier","purifier","aroma diffuser"
+}
+_EU_TOKENS = {"eu","ch/eu","ch","us","uk"}
+
+def to_base_name(name: str) -> str:
+    """
+    Liefert den 'reinen' Produktnamen:
+    - Entfernt Klammerzusätze wie '(53 dB)', '(50 m²)'
+    - Schneidet einen Suffix nach ' – ' / '-' ab, wenn er:
+        * mit EU/CH/US/UK beginnt ODER
+        * offensichtlich nur Kategoriebegriffe enthält (Hygrometer, Ventilator, Aroma Diffuser, ...)
+    - Behält Varianten wie 'little', 'big', 'pro', 'mobile' bei (die stehen links vom Trennstrich)
+    """
+    if not isinstance(name, str):
+        return ""
+    s = unicodedata.normalize("NFKC", name).strip()
+
+    # ()-Zusätze wie (53 dB), (50 m²) entfernen
+    s = re.sub(r"\([^)]*\)", "", s)
+    s = re.sub(r"\s+", " ", s).strip(" -–—").strip()
+
+    # Trennstrich-Varianten vereinheitlichen
+    parts = re.split(r"\s+[–—-]\s+", s)
+    if len(parts) >= 2:
+        left, right = parts[0].strip(), " ".join(parts[1:]).strip().lower()
+
+        # 1) EU/CH/US/UK-Zeug im rechten Teil? => abschneiden
+        if right.split() and right.split()[0] in _EU_TOKENS:
+            return left.strip()
+
+        # 2) Kategorie-Suffix (z. B. 'hygrometer', 'aroma diffuser', 'ventilator' ...) => abschneiden
+        # Wir schneiden, wenn der rechte Teil NUR aus EU-Tokens, Bindewörtern und Kategorie-Wörtern besteht.
+        clean_right = re.sub(r"[^\w\s/]+", " ", right).strip()
+        words = [w for w in clean_right.split() if w]
+        if words and all((w in _EU_TOKENS) or (w in _CATEGORY_TOKENS) for w in words):
+            return left.strip()
+
+        # sonst Name nicht kürzen (z. B. 'Oskar – Karl Filter')
+        s = (left + " – " + " ".join(parts[1:])).strip()
+    else:
+        s = parts[0].strip()
+
+    # einzelne EU-Tokens am Ende vom linken Teil entfernen (falls mal drin)
+    s = re.sub(rf"\b({'|'.join(map(re.escape,_EU_TOKENS))})\b", "", s, flags=re.I)
+    s = re.sub(r"\s+", " ", s).strip(" -–—").strip()
+    return s
+
 # =========================
 # Parsing – Preislisten
 # =========================
