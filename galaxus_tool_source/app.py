@@ -327,7 +327,6 @@ def to_base_name(name: str) -> str:
             return left.strip()
 
         # 2) Kategorie-Suffix (z. B. 'hygrometer', 'aroma diffuser', 'ventilator' ...) => abschneiden
-        # Wir schneiden, wenn der rechte Teil NUR aus EU-Tokens, Bindewörtern und Kategorie-Wörtern besteht.
         clean_right = re.sub(r"[^\w\s/]+", " ", right).strip()
         words = [w for w in clean_right.split() if w]
         if words and all((w in _EU_TOKENS) or (w in _CATEGORY_TOKENS) for w in words):
@@ -424,7 +423,7 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
             name_lower = out["Bezeichnung"].str.lower()
             variant_lower = variant.str.lower()
             for idx, vlow in variant_lower.items():
-                if not vlow or vlow in {"nan","none"}:  # leere
+                if not vlow or vlow in {"nan","none"}:
                     continue
                 if vlow in {"eu","ch/eu","ch","us","uk"}:
                     continue
@@ -446,7 +445,14 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
         out["Farbe"] = df[col_color].astype(str).map(lambda v: _COLOR_MAP.get(str(v).lower(), str(v)))
     else:
         out["Farbe"] = out["Bezeichnung"].map(extract_color_from_name)
-    out["Farbe"] = out["Farbe"].fillna("").astype(str)
+
+    # NEU: Farbe ggf. aus Variante/Zusatz ableiten
+    if col_variant:
+        var_series = df[col_variant].astype(str)
+        var_color = var_series.map(_as_color_or_empty)
+        out["Farbe"] = np.where(out["Farbe"].fillna("").str.strip()=="", var_color, out["Farbe"])
+
+    out["Farbe"] = out["Farbe"].fillna("").astype(str).str.strip()
 
     out["Lagermenge"] = parse_number_series(df[col_stock]).fillna(0).astype("Int64") if col_stock else pd.Series([0]*len(out), dtype="Int64")
     if col_buy:  out["Einkaufspreis"] = parse_number_series(df[col_buy])
@@ -686,14 +692,38 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
         df["Bezeichnung"] = df["Bezeichnung"].fillna("")
         df["Farbe"]       = df.get("Farbe","").fillna("")
 
-    # Anzeige-Bezeichnung: NUR Farbe bei Duplikaten (keine Kategorie/„little“/…)
-    merged["Bezeichnung_anzeige"] = merged["Bezeichnung"]
-    dup = merged.duplicated(subset=["Bezeichnung"], keep=False)
-    color_lower = merged["Farbe"].astype(str).str.lower().str.strip()
-    valid_color = color_lower.map(lambda col: (col in _COLOR_WORDS))
-    add_mask = dup & valid_color & merged["Farbe"].astype(str).str.strip().ne("")
+    # ---------- NEU: Farbe sicher befüllen & standardisieren ----------
+    # Wenn beim Merge eine rechte "Farbe_pl" existiert, bevorzugen; sonst ist "Farbe" ohnehin aus PL
+    if "Farbe_pl" in merged.columns:
+        merged["Farbe"] = merged["Farbe_pl"].combine_first(merged.get("Farbe", ""))
+
+    merged["Farbe"] = merged.get("Farbe", "").fillna("").astype(str).str.strip()
+
+    # Fallback: Farbe aus der Bezeichnung extrahieren, falls noch leer
+    mask_empty_color = merged["Farbe"].eq("")
+    if mask_empty_color.any():
+        merged.loc[mask_empty_color, "Farbe"] = (
+            merged.loc[mask_empty_color, "Bezeichnung"]
+                  .map(extract_color_from_name)
+                  .fillna("")
+                  .astype(str)
+                  .str.strip()
+        )
+
+    # Standardisierte Farbe (z. B. "weiss ch/eu" -> "Weiss", "weiss matt" -> "Weiss")
+    merged["Farbe_std"] = merged["Farbe"].map(_as_color_or_empty)
+
+    # ---------- Anzeige-Bezeichnung: Basisname + Farbe bei Duplikaten ----------
+    merged["BaseName"] = merged["Bezeichnung"].map(to_base_name)
+    merged["Bezeichnung_anzeige"] = merged["BaseName"]
+
+    # Duplikate über bereinigten Basisnamen erkennen
+    dup = merged.duplicated(subset=["BaseName"], keep=False)
+
+    # Farbe anhängen, wenn erkannt
+    add_mask = dup & merged["Farbe_std"].ne("")
     merged.loc[add_mask, "Bezeichnung_anzeige"] = (
-        merged.loc[add_mask, "Bezeichnung"] + " – " + merged.loc[add_mask, "Farbe"].astype(str).str.strip()
+        merged.loc[add_mask, "BaseName"] + " – " + merged.loc[add_mask, "Farbe_std"]
     )
 
     # Werte
@@ -1064,6 +1094,7 @@ if (raw_sell is not None) and (raw_price is not None):
             st.altair_chart((lines + points + popup + end_labels).properties(height=400), use_container_width=True)
         else:
             st.info("Für den Verlauf werden gültige Startdaten und nicht-leere Kategorien benötigt.")
+
 
         # ------- Tabellen & Downloads -------
         detail_renamed = pd.DataFrame()
