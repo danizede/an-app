@@ -391,9 +391,12 @@ SELL_PRICE_CANDIDATES = ["Verkaufspreis","VK","Preis"]
 ARTNR_CANDIDATES = ["Artikelnummer","Artikelnr","ArtikelNr","Artikel-Nr.","Hersteller-Nr.","Produkt ID","ProdNr","ArtNr","ArtikelNr.","Artikel"]
 EAN_CANDIDATES  = ["EAN","GTIN","BarCode","Barcode"]
 NAME_CANDIDATES_PL = ["Bezeichnung","Produktname","Name","Titel","Artikelname"]
-CAT_CANDIDATES  = ["Kategorie","Warengruppe","Zusatz"]
+CAT_CANDIDATES  = ["Kategorie","Warengruppe"]  # 'Zusatz' NICHT mehr als Kategorie verwenden!
+VARIANT_CANDIDATES = ["Zusatz","Variante","Variant","Scent","Duft","Flavor","Flavour","Subname","Sub-Name"]
+
 STOCK_CANDIDATES= ["Bestand","Verfügbar","verfügbar","Verfuegbar","Lagerbestand","Lagermenge","Available"]
 COLOR_CANDIDATES= ["Farbe","Color","Colour","Variante","Variant","Farbvariante","Farbname"]
+
 
 def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     """Parst die Preisliste und normalisiert die Daten."""
@@ -415,6 +418,7 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     col_buy   = find_column(df, BUY_PRICE_CANDIDATES,  "Einkaufspreis", required=False)
     col_sell  = find_column(df, SELL_PRICE_CANDIDATES, "Verkaufspreis", required=False)
     col_color = find_column(df, COLOR_CANDIDATES, "Farbe/Variante", required=False)
+    col_variant = find_column(df, VARIANT_CANDIDATES, "Variante/Zusatz", required=False)
     col_any = None
     if not col_sell and not col_buy:
         col_any = find_column(df, PRICE_COL_CANDIDATES, "Preis", required=True)
@@ -424,6 +428,20 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     out["EAN"]             = df[col_ean].astype(str) if col_ean else ""
     out["EAN_key"]         = out["EAN"].map(lambda x: re.sub(r"[^0-9]+","",str(x)))
     out["Bezeichnung"]     = df[col_name].astype(str)
+    # Zusatz/Variante (z. B. 'Lavender', 'Lemon') an den Namen anhängen,
+# sofern vorhanden und noch nicht enthalten
+if col_variant:
+    variant = df[col_variant].astype(str).fillna("").str.strip()
+    if not variant.empty:
+        # Nur anhängen, wenn sinnvoll und der Text nicht bereits drin ist
+        contains_variant = out["Bezeichnung"].str.lower().str.contains(
+            variant.str.lower(), na=False
+        )
+        add_mask = (variant.str.len() > 0) & ~contains_variant
+        # Anhängen mit Leerzeichen: 'Duftöl' -> 'Duftöl Lavender'
+        out.loc[add_mask, "Bezeichnung"] = (
+            out.loc[add_mask, "Bezeichnung"].str.strip() + " " + variant[add_mask]
+        ).str.replace(r"\s+", " ", regex=True)
     out["Bezeichnung_key"] = out["Bezeichnung"].map(normalize_key)
     out["Familie"]         = out["Bezeichnung"].map(make_family_key)
     # Kategorie bereinigen
