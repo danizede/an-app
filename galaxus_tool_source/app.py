@@ -1,10 +1,9 @@
-# app.py — Galaxus Sellout Analyse (Passcode-Login + Auto-File-Detection, Default-first, robust safe_mul)
+# app.py — Galaxus Sellout Analyse (Passcode-Login + Auto-File-Detection, Week-Snapping, robust safe_mul)
 # - Robustes Matching (ArtNr → EAN → Name → Familie → Hints → Fuzzy)
 # - EU-Datumsfilter, Detailtabelle optional
 # - Summen pro Artikel (Lagerwert = letzter verfügbarer Stand je Artikel, NICHT aufsummiert)
 # - Interaktives Linienchart (Woche) mit Hover-Highlight & Pop-up-Label
-# - Auto-Load aus /data mit Dateinamen-Autoerkennung (sellout / preisliste)
-# - Zuerst DEFAULT-Dateien (sellout.xlsx / preisliste.xlsx), danach Heuristik
+# - Auto-Load aus /data mit Dateinamen-Autoerkennung (sellout / preisliste) + Umsortieren
 # - Sichere Multiplikation (safe_mul) + globale Filterung von NumPy-Overflows
 # - Kategorie primär aus Spalte G; leere/NaN-Kategorien bleiben leer und erscheinen nicht im Chart
 # - Summenzeile Σ Gesamt – Währungsangaben in Spaltennamen (CHF)
@@ -19,7 +18,7 @@ import pandas as pd
 import streamlit as st
 import altair as alt
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections.abc import Mapping
 import warnings
 
@@ -678,7 +677,9 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
     )
     merged["Lagerwert_latest"] = safe_mul(merged["Lagermenge_latest"], merged["Verkaufspreis_latest"])
 
-    # Tabellen
+    # =========================
+    # Tabellen (harte Konsolidierung pro Artikel)
+    # =========================
     detail = merged[[
         "ArtikelNr_key","ArtikelNr","Bezeichnung_anzeige","Kategorie",
         "Einkaufsmenge","Einkaufswert","Verkaufsmenge","Verkaufswert"
@@ -688,14 +689,12 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
 
     def _mode_nonempty(s: pd.Series) -> str:
         s = s.dropna().astype(str).str.strip()
-        if s.empty:
-            return ""
+        if s.empty: return ""
         try:
             return s.mode().iloc[0]
         except Exception:
             return s.iloc[0]
 
-    # Harte Konsolidierung: genau 1 Zeile pro Artikel
     totals = (
         detail.groupby("ArtikelNr_key", as_index=False)
               .agg({
@@ -761,29 +760,38 @@ def _guess_role_from_name(name: str) -> str | None:
         return "price"
     return None
 
-def _pick_default_files_from_dir(folder: Path) -> tuple[io.BytesIO|None, io.BytesIO|None, str|None, str|None]:
-    sell_bytes = price_bytes = None
-    sell_name = price_name = None
-    xlsx_files = sorted([p for p in folder.glob("*.xlsx") if p.is_file()])
-    if not xlsx_files:
-        return None, None, None, None
-    # 1) per Keywords
-    for p in xlsx_files:
-        role = _guess_role_from_name(p.name)
-        if role == "sell" and sell_bytes is None:
-            sell_bytes = io.BytesIO(p.read_bytes()); sell_name = p.name
-        elif role == "price" and price_bytes is None:
-            price_bytes = io.BytesIO(p.read_bytes()); price_name = p.name
-    # 2) Rest auffüllen
-    leftovers = [p for p in xlsx_files if p.name not in {sell_name, price_name}]
-    for p in leftovers:
-        if sell_bytes is None:
-            sell_bytes = io.BytesIO(p.read_bytes()); sell_name = p.name
-        elif price_bytes is None:
-            price_bytes = io.BytesIO(p.read_bytes()); price_name = p.name
-        if sell_bytes is not None and price_bytes is not None:
-            break
-    return sell_bytes, price_bytes, sell_name, price_name
+def _canon(c: str) -> str:
+    return re.sub(r"[\s\-_/\.]+","", str(c)).lower()
+
+def _classify_df(df: pd.DataFrame) -> str|None:
+    """Erkennt 'sell' (hat Verkaufsmenge) oder 'price' (hat Preis/Bestand/Kategorie)."""
+    if df is None or df.empty:
+        return None
+    canon = {_canon(c) for c in df.columns}
+    sell_cands  = {"salesqty","verkauf","verkauftemenge","mengeverkauft","absatz","stück","stuck","menge"}
+    price_cands = {"nettonetto","verkaufspreis","einkaufspreis","preis","vk","netto","bestand","kategorie"}
+    if canon & sell_cands:
+        return "sell"
+    if canon & price_cands:
+        return "price"
+    if any(k in canon for k in {"nettonetto","preis","verkaufspreis"}) and not (canon & sell_cands):
+        return "price"
+    return None
+
+def _maybe_swap_roles(rs: pd.DataFrame|None, rp: pd.DataFrame|None, rs_name: str|None, rp_name: str|None):
+    """Wenn Rollen vertauscht wurden (egal wann geladen), korrigieren."""
+    role_s = _classify_df(rs) if rs is not None else None
+    role_p = _classify_df(rp) if rp is not None else None
+    # Nur links vorhanden, aber 'price' -> nach rechts
+    if rs is not None and rp is None and role_s == "price":
+        return None, rs, None, rs_name
+    # Nur rechts vorhanden, aber 'sell' -> nach links
+    if rp is not None and rs is None and role_p == "sell":
+        return rp, None, rp_name, None
+    # Beide vorhanden, aber vertauscht
+    if rs is not None and rp is not None and role_s == "price" and role_p == "sell":
+        return rp, rs, rp_name, rs_name
+    return rs, rp, rs_name, rp_name
 
 # =========================
 # UI
@@ -803,45 +811,6 @@ raw_sell = None
 raw_price = None
 used_sell_name = None
 used_price_name = None
-
-def _canon(c: str) -> str:
-    return re.sub(r"[\s\-_/\.]+","", str(c)).lower()
-
-def _classify_df(df: pd.DataFrame) -> str|None:
-    """Erkennt 'sell' (hat Verkaufsmenge) oder 'price' (hat Preis/Bestand/Kategorie)."""
-    if df is None or df.empty:
-        return None
-    cols = {str(c) for c in df.columns}
-    canon = {_canon(c) for c in df.columns}
-
-    sell_cands = {"salesqty","verkauf","verkauftemenge","mengeverkauft","absatz","stück","stuck","menge"}
-    price_cands = {"nettonetto","verkaufspreis","einkaufspreis","preis","vk","netto","bestand","kategorie"}
-
-    if canon & sell_cands:
-        return "sell"
-    if canon & price_cands:
-        return "price"
-    # Heuristik: viele Preis-bezogene Felder, keine Sell-Felder -> price
-    if any(k in canon for k in {"nettonetto","preis","verkaufspreis"}) and not (canon & sell_cands):
-        return "price"
-    return None
-
-def _maybe_swap_roles(rs: pd.DataFrame|None, rp: pd.DataFrame|None,
-                      rs_name: str|None, rp_name: str|None):
-    """Wenn Rollen vertauscht wurden (egal wann geladen), korrigieren."""
-    role_s = _classify_df(rs) if rs is not None else None
-    role_p = _classify_df(rp) if rp is not None else None
-
-    # Nur links vorhanden, aber 'price' -> nach rechts
-    if rs is not None and rp is None and role_s == "price":
-        return None, rs, None, rs_name
-    # Nur rechts vorhanden, aber 'sell' -> nach links
-    if rp is not None and rs is None and role_p == "sell":
-        return rp, None, rp_name, None
-    # Beide vorhanden, aber vertauscht
-    if rs is not None and rp is not None and role_s == "price" and role_p == "sell":
-        return rp, rs, rp_name, rs_name
-    return rs, rp, rs_name, rp_name
 
 # 0) Uploads – sofort verwenden und als DEFAULT_* persistieren
 if sell_file is not None:
@@ -867,12 +836,36 @@ if raw_price is None and DEFAULT_PRICE_PATH.exists():
     raw_price = read_excel_flat(io.BytesIO(DEFAULT_PRICE_PATH.read_bytes()))
     used_price_name = DEFAULT_PRICE_PATH.name
 
-# Nach Defaults ggf. tauschen (wichtiger Fix!)
+# Nach Defaults ggf. tauschen
 raw_sell, raw_price, used_sell_name, used_price_name = _maybe_swap_roles(
     raw_sell, raw_price, used_sell_name, used_price_name
 )
 
 # 2) Heuristische Auto-Erkennung im data/-Ordner
+def _pick_default_files_from_dir(folder: Path) -> tuple[io.BytesIO|None, io.BytesIO|None, str|None, str|None]:
+    sell_bytes = price_bytes = None
+    sell_name = price_name = None
+    xlsx_files = sorted([p for p in folder.glob("*.xlsx") if p.is_file()])
+    if not xlsx_files:
+        return None, None, None, None
+    # 1) per Keywords
+    for p in xlsx_files:
+        role = _guess_role_from_name(p.name)
+        if role == "sell" and sell_bytes is None:
+            sell_bytes = io.BytesIO(p.read_bytes()); sell_name = p.name
+        elif role == "price" and price_bytes is None:
+            price_bytes = io.BytesIO(p.read_bytes()); price_name = p.name
+    # 2) Rest auffüllen
+    leftovers = [p for p in xlsx_files if p.name not in {sell_name, price_name}]
+    for p in leftovers:
+        if sell_bytes is None:
+            sell_bytes = io.BytesIO(p.read_bytes()); sell_name = p.name
+        elif price_bytes is None:
+            price_bytes = io.BytesIO(p.read_bytes()); price_name = p.name
+        if sell_bytes is not None and price_bytes is not None:
+            break
+    return sell_bytes, price_bytes, sell_name, price_name
+
 if raw_sell is None or raw_price is None:
     sbytes, pbytes, sname, pname = _pick_default_files_from_dir(DATA_DIR)
     if raw_sell is None and sbytes is not None:
@@ -893,14 +886,6 @@ raw_sell, raw_price, used_sell_name, used_price_name = _maybe_swap_roles(
     raw_sell, raw_price, used_sell_name, used_price_name
 )
 
-# Finaler Hinweis, was erkannt wurde
-if raw_sell is not None or raw_price is not None:
-    roles = []
-    if used_sell_name:  roles.append(f"Sell-out: {used_sell_name}")
-    if used_price_name: roles.append(f"Preisliste: {used_price_name}")
-    if roles:
-        st.caption("🔎 Auto-Erkennung: " + " / ".join(roles))
-
 # Verarbeitung
 if (raw_sell is not None) and (raw_price is not None):
     try:
@@ -908,14 +893,7 @@ if (raw_sell is not None) and (raw_price is not None):
             sell_df  = prepare_sell_df(raw_sell)
             price_df = prepare_price_df(raw_price)
 
-if (raw_sell is not None) and (raw_price is not None):
-    try:
-        with st.spinner("📖 Lese & prüfe Spalten…"):
-            sell_df  = prepare_sell_df(raw_sell)
-            price_df = prepare_price_df(raw_price)
-
-        # >>> BEGIN REPLACE: Zeitraumfilter (auf ganze Wochen snappen) <<<
-        # (ALLES in diesem Block bleibt auf derselben Einrückungsebene wie die Zeile darüber)
+        # Zeitraumfilter (auf ganze Wochen snappen: Montag–Sonntag)
         filtered_sell_df = sell_df
         if {"StartDatum","EndDatum"}.issubset(sell_df.columns) and not sell_df["StartDatum"].isna().all():
             st.subheader("Periode wählen")
@@ -941,58 +919,40 @@ if (raw_sell is not None) and (raw_price is not None):
                     st.session_state["date_range"] = (min_date, max_date)
                     st.rerun()
 
-            # tuple-normalisierung
+            # Einzel- oder Doppelwert in Tuple wandeln
             if isinstance(date_value, tuple):
                 start_date, end_date = date_value
             else:
                 start_date = end_date = date_value
 
-            from datetime import timedelta
-            start_snapped = start_date - timedelta(days=start_date.weekday())   # Mo
-            end_snapped   = end_date + timedelta(days=(6 - end_date.weekday())) # So
+            # --- Auf ganze Wochen snappen (Montag–Sonntag) ---
+            start_snapped = start_date - timedelta(days=start_date.weekday())
+            end_snapped   = end_date + timedelta(days=(6 - end_date.weekday()))
 
+            # Im State speichern (für UI-Konsistenz)
             st.session_state["date_range"] = (start_snapped, end_snapped)
+
+            # Hinweis anzeigen, falls gesnappt wurde
             if (start_snapped != start_date) or (end_snapped != end_date):
                 st.caption(f"📅 Auswahl auf ganze Wochen erweitert: {start_snapped.strftime('%d.%m.%Y')} – {end_snapped.strftime('%d.%m.%Y')}")
 
+            # Robuste Filterlogik (Intervalle überlappen)
             sdt = sell_df["StartDatum"].dt.date
             edt = (sell_df["EndDatum"].fillna(sell_df["StartDatum"])).dt.date
             mask = ~((edt < start_snapped) | (sdt > end_snapped))
             filtered_sell_df = sell_df.loc[mask].copy()
 
-            # defensiv säubern/clippen
+            # zusätzliche Hygiene: NaN->0 und Clipping
             for col in ["Einkaufsmenge","Verkaufsmenge"]:
                 if col in filtered_sell_df:
                     filtered_sell_df[col] = pd.to_numeric(filtered_sell_df[col], errors="coerce").fillna(0).clip(0, 1_000_000)
-        # >>> END REPLACE <<<
-
-        with st.spinner("🔗 Matche & berechne Werte…"):
-            detail, totals, ts_source = enrich_and_merge(filtered_sell_df, price_df, latest_stock_baseline_df=sell_df)
-
-        # … (Rest bleibt)
-    except KeyError as e:
-        st.error(str(e))
-        st.info("Tipp: Du hast wahrscheinlich eine Preisliste im Sell-out-Uploader oder umgekehrt. "
-                "Die Auto-Erkennung sortiert das künftig automatisch – lade die Dateien nochmals hoch.")
-    except Exception as e:
-        st.error(f"Unerwarteter Fehler: {e}")
-
-    # Zusätzliche Sicherheit: nie leere NaNs in Mengen/Preisen weiterreichen
-    for col in ["Einkaufsmenge","Verkaufsmenge"]:
-        if col in filtered_sell_df:
-            filtered_sell_df[col] = pd.to_numeric(filtered_sell_df[col], errors="coerce").fillna(0)
-
-    # Ganz hart clippen, bevor später multipliziert wird (Overflow-Prävention)
-    for col in ["Einkaufsmenge","Verkaufsmenge"]:
-        if col in filtered_sell_df:
-            filtered_sell_df[col] = filtered_sell_df[col].clip(lower=0, upper=1_000_000)
 
         with st.spinner("🔗 Matche & berechne Werte…"):
             detail, totals, ts_source = enrich_and_merge(filtered_sell_df, price_df, latest_stock_baseline_df=sell_df)
 
         used_sell  = used_sell_name or "—"
         used_price = used_price_name or "—"
-        st.info(f"Verwendete Dateien: {used_sell} / {used_price}")
+        st.caption(f"🔎 Auto-Erkennung: Sell-out: {used_sell} / Preisliste: {used_price}")
 
         # ------- Chart -------
         st.markdown("### 📈 Verkaufsverlauf nach Kategorie (Woche)")
@@ -1099,6 +1059,8 @@ if (raw_sell is not None) and (raw_price is not None):
 
     except KeyError as e:
         st.error(str(e))
+        st.info("Tipp: Du hast wahrscheinlich eine Preisliste im Sell-out-Uploader oder umgekehrt. "
+                "Die Auto-Erkennung sortiert das künftig automatisch – lade die Dateien nochmals hoch.")
     except Exception as e:
         st.error(f"Unerwarteter Fehler: {e}")
 else:
