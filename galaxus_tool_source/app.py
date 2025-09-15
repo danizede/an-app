@@ -954,7 +954,6 @@ with st.spinner("🔗 Matche & berechne Werte…"):
             filtered_sell_df, price_df, latest_stock_baseline_df=sell_df
         )
 
-
         used_sell  = used_sell_name or "—"
         used_price = used_price_name or "—"
         st.caption(f"🔎 Auto-Erkennung: Sell-out: {used_sell} / Preisliste: {used_price}")
