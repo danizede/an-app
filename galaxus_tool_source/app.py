@@ -785,33 +785,44 @@ raw_price = None
 used_sell_name = None
 used_price_name = None
 
+def _canon(c: str) -> str:
+    return re.sub(r"[\s\-_/\.]+","", str(c)).lower()
+
 def _classify_df(df: pd.DataFrame) -> str|None:
-    """Erkennt 'sell' (hat Verkaufsmenge) oder 'price' (hat Preis/NETTO NETTO/Bestand/Kategorie)."""
-    cols = set(map(str, df.columns))
-    # Kandidaten wie im Parser
-    if any(c in cols or re.sub(r"[\s\-_/\.]+","",c).lower() in {re.sub(r"[\s\-_/\.]+","",x).lower() for x in cols}
-           for c in ["SalesQty","Verkauf","Verkaufte Menge","Menge verkauft","Absatz","Stück","Menge"]):
+    """Erkennt 'sell' (hat Verkaufsmenge) oder 'price' (hat Preis/Bestand/Kategorie)."""
+    if df is None or df.empty:
+        return None
+    cols = {str(c) for c in df.columns}
+    canon = {_canon(c) for c in df.columns}
+
+    sell_cands = {"salesqty","verkauf","verkauftemenge","mengeverkauft","absatz","stück","stuck","menge"}
+    price_cands = {"nettonetto","verkaufspreis","einkaufspreis","preis","vk","netto","bestand","kategorie"}
+
+    if canon & sell_cands:
         return "sell"
-    price_keys = {"NETTO NETTO","Verkaufspreis","Einkaufspreis","Preis","VK","Netto","Bestand","Kategorie"}
-    if any(pk in cols for pk in price_keys):
+    if canon & price_cands:
+        return "price"
+    # Heuristik: viele Preis-bezogene Felder, keine Sell-Felder -> price
+    if any(k in canon for k in {"nettonetto","preis","verkaufspreis"}) and not (canon & sell_cands):
         return "price"
     return None
 
-def _maybe_swap_roles(rs: pd.DataFrame|None, rp: pd.DataFrame|None):
-    """Wenn nur eines da ist oder die Rollen vertauscht wurden -> korrigieren."""
+def _maybe_swap_roles(rs: pd.DataFrame|None, rp: pd.DataFrame|None,
+                      rs_name: str|None, rp_name: str|None):
+    """Wenn Rollen vertauscht wurden (egal wann geladen), korrigieren."""
     role_s = _classify_df(rs) if rs is not None else None
     role_p = _classify_df(rp) if rp is not None else None
 
-    # 1) Nur links geladen, aber es ist 'price' -> nach rechts verschieben
+    # Nur links vorhanden, aber 'price' -> nach rechts
     if rs is not None and rp is None and role_s == "price":
-        return None, rs, None, used_sell_name
-    # 2) Nur rechts geladen, aber es ist 'sell' -> nach links verschieben
+        return None, rs, None, rs_name
+    # Nur rechts vorhanden, aber 'sell' -> nach links
     if rp is not None and rs is None and role_p == "sell":
-        return rp, None, used_price_name, None
-    # 3) Beide geladen, aber Rollen vertauscht
+        return rp, None, rp_name, None
+    # Beide vorhanden, aber vertauscht
     if rs is not None and rp is not None and role_s == "price" and role_p == "sell":
-        return rp, rs, used_price_name, used_sell_name
-    return rs, rp, used_sell_name, used_price_name
+        return rp, rs, rp_name, rs_name
+    return rs, rp, rs_name, rp_name
 
 # 0) Uploads – sofort verwenden und als DEFAULT_* persistieren
 if sell_file is not None:
@@ -824,10 +835,12 @@ if price_file is not None:
     used_price_name = price_file.name
     _persist_upload(price_file, DEFAULT_PRICE_PATH)
 
-# Falls ein Upload in der falschen Box landete: automatisch korrigieren
-raw_sell, raw_price, used_sell_name, used_price_name = _maybe_swap_roles(raw_sell, raw_price)
+# Nach Uploads ggf. tauschen
+raw_sell, raw_price, used_sell_name, used_price_name = _maybe_swap_roles(
+    raw_sell, raw_price, used_sell_name, used_price_name
+)
 
-# 1) Falls im aktuellen Run nichts hochgeladen wurde: zuerst die Standardnamen bevorzugen
+# 1) Defaults aus /data bevorzugen, falls im aktuellen Run nichts hochgeladen wurde
 if raw_sell is None and DEFAULT_SELL_PATH.exists():
     raw_sell = read_excel_flat(io.BytesIO(DEFAULT_SELL_PATH.read_bytes()))
     used_sell_name = DEFAULT_SELL_PATH.name
@@ -835,30 +848,39 @@ if raw_price is None and DEFAULT_PRICE_PATH.exists():
     raw_price = read_excel_flat(io.BytesIO(DEFAULT_PRICE_PATH.read_bytes()))
     used_price_name = DEFAULT_PRICE_PATH.name
 
-# 2) Falls immer noch etwas fehlt: heuristische Auto-Erkennung im data/-Ordner
+# Nach Defaults ggf. tauschen (wichtiger Fix!)
+raw_sell, raw_price, used_sell_name, used_price_name = _maybe_swap_roles(
+    raw_sell, raw_price, used_sell_name, used_price_name
+)
+
+# 2) Heuristische Auto-Erkennung im data/-Ordner
 if raw_sell is None or raw_price is None:
     sbytes, pbytes, sname, pname = _pick_default_files_from_dir(DATA_DIR)
     if raw_sell is None and sbytes is not None:
         tmp = read_excel_flat(sbytes)
         if _classify_df(tmp) == "price" and raw_price is None:
-            raw_price = tmp; used_price_name = sname
+            raw_price, used_price_name = tmp, sname
         else:
-            raw_sell = tmp; used_sell_name = sname
+            raw_sell, used_sell_name = tmp, sname
     if raw_price is None and pbytes is not None:
         tmp = read_excel_flat(pbytes)
         if _classify_df(tmp) == "sell" and raw_sell is None:
-            raw_sell = tmp; used_sell_name = pname
+            raw_sell, used_sell_name = tmp, pname
         else:
-            raw_price = tmp; used_price_name = pname
+            raw_price, used_price_name = tmp, pname
+
+# Nach Heuristik ein drittes Mal prüfen/tauschen
+raw_sell, raw_price, used_sell_name, used_price_name = _maybe_swap_roles(
+    raw_sell, raw_price, used_sell_name, used_price_name
+)
 
 # Finaler Hinweis, was erkannt wurde
 if raw_sell is not None or raw_price is not None:
-    msg = []
-    if used_sell_name:  msg.append(f"Sell-out: {used_sell_name}")
-    if used_price_name: msg.append(f"Preisliste: {used_price_name}")
-    if msg:
-        st.caption("🔎 Auto-Erkennung: " + " / ".join(msg))
-
+    roles = []
+    if used_sell_name:  roles.append(f"Sell-out: {used_sell_name}")
+    if used_price_name: roles.append(f"Preisliste: {used_price_name}")
+    if roles:
+        st.caption("🔎 Auto-Erkennung: " + " / ".join(roles))
 
 # Verarbeitung
 if (raw_sell is not None) and (raw_price is not None):
