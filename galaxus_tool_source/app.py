@@ -893,13 +893,14 @@ if (raw_sell is not None) and (raw_price is not None):
             sell_df  = prepare_sell_df(raw_sell)
             price_df = prepare_price_df(raw_price)
 
-        # Zeitraumfilter (auf ganze Wochen snappen: Montag–Sonntag)
+        # Zeitraumfilter (immer ganze Wochen)
         filtered_sell_df = sell_df
         if {"StartDatum","EndDatum"}.issubset(sell_df.columns) and not sell_df["StartDatum"].isna().all():
             st.subheader("Periode wählen")
 
             min_date = sell_df["StartDatum"].min().date()
-            max_date = (sell_df["EndDatum"].dropna().max() if "EndDatum" in sell_df else sell_df["StartDatum"].max()).date()
+            max_date = (sell_df["EndDatum"].dropna().max()
+                        if "EndDatum" in sell_df else sell_df["StartDatum"].max()).date()
 
             if "date_range" not in st.session_state:
                 st.session_state["date_range"] = (min_date, max_date)
@@ -919,154 +920,66 @@ if (raw_sell is not None) and (raw_price is not None):
                     st.session_state["date_range"] = (min_date, max_date)
                     st.rerun()
 
-            # Einzel- oder Doppelwert in Tuple wandeln
+            # Start/Ende normalisieren
             if isinstance(date_value, tuple):
                 start_date, end_date = date_value
             else:
                 start_date = end_date = date_value
 
-            # --- Auf ganze Wochen snappen (Montag–Sonntag) ---
-            start_snapped = start_date - timedelta(days=start_date.weekday())
-            end_snapped   = end_date + timedelta(days=(6 - end_date.weekday()))
+            from datetime import timedelta
+            start_snapped = start_date - timedelta(days=start_date.weekday())   # Montag
+            end_snapped   = end_date + timedelta(days=(6 - end_date.weekday())) # Sonntag
 
-            # Im State speichern (für UI-Konsistenz)
             st.session_state["date_range"] = (start_snapped, end_snapped)
-
-            # Hinweis anzeigen, falls gesnappt wurde
             if (start_snapped != start_date) or (end_snapped != end_date):
-                st.caption(f"📅 Auswahl auf ganze Wochen erweitert: {start_snapped.strftime('%d.%m.%Y')} – {end_snapped.strftime('%d.%m.%Y')}")
+                st.caption(
+                    f"📅 Auswahl auf ganze Wochen erweitert: "
+                    f"{start_snapped.strftime('%d.%m.%Y')} – {end_snapped.strftime('%d.%m.%Y')}"
+                )
 
-            # Robuste Filterlogik (Intervalle überlappen)
             sdt = sell_df["StartDatum"].dt.date
             edt = (sell_df["EndDatum"].fillna(sell_df["StartDatum"])).dt.date
             mask = ~((edt < start_snapped) | (sdt > end_snapped))
             filtered_sell_df = sell_df.loc[mask].copy()
 
-            # zusätzliche Hygiene: NaN->0 und Clipping
-            for col in ["Einkaufsmenge","Verkaufsmenge"]:
+            # Werte sicher bereinigen/clippen
+            for col in ["Einkaufsmenge", "Verkaufsmenge"]:
                 if col in filtered_sell_df:
-                    filtered_sell_df[col] = pd.to_numeric(filtered_sell_df[col], errors="coerce").fillna(0).clip(0, 1_000_000)
-
-with st.spinner("🔗 Matche & berechne Werte…"):
-    # Unterdrücke Overflow/Invalid global für die gesamte Berechnung
-    with np.errstate(over='ignore', invalid='ignore', divide='ignore', under='ignore'):
-        detail, totals, ts_source = enrich_and_merge(
-            filtered_sell_df, price_df, latest_stock_baseline_df=sell_df
-        )
-
-        used_sell  = used_sell_name or "—"
-        used_price = used_price_name or "—"
-        st.caption(f"🔎 Auto-Erkennung: Sell-out: {used_sell} / Preisliste: {used_price}")
-
-        # ------- Chart -------
-        st.markdown("### 📈 Verkaufsverlauf nach Kategorie (Woche)")
-        if not ts_source.empty:
-            ts = ts_source.dropna(subset=["StartDatum"]).copy()
-            ts["Periode"]   = ts["StartDatum"].dt.to_period("W").dt.start_time
-            ts["Kategorie"] = ts["Kategorie"].astype("string")
-
-            all_cats = sorted(ts["Kategorie"].unique())
-            sel_cats = st.multiselect("Kategorien filtern", options=all_cats, default=all_cats)
-            if sel_cats:
-                ts = ts[ts["Kategorie"].isin(sel_cats)]
-
-            ts_agg = (ts.groupby(["Kategorie","Periode"], as_index=False)["Verkaufswert (CHF)"]
-                        .sum()
-                        .rename(columns={"Verkaufswert (CHF)":"Wert (CHF)"}))
-            ts_agg["Periode"]    = pd.to_datetime(ts_agg["Periode"])
-            ts_agg["Kategorie"]  = ts_agg["Kategorie"].astype(str)
-            ts_agg["Wert (CHF)"] = pd.to_numeric(ts_agg["Wert (CHF)"], errors="coerce").fillna(0.0).astype(float)
-
-            hover_cat = alt.selection_single(fields=["Kategorie"], on="mouseover", nearest=True, empty="none")
-            hover_pt  = alt.selection_single(fields=["Periode","Kategorie"], on="mouseover", nearest=True, empty="none")
-
-            base = alt.Chart(ts_agg)
-            lines = (
-                base.mark_line(point=alt.OverlayMarkDef(size=30), interpolate="linear")
-                    .encode(
-                        x=alt.X("Periode:T", title="Woche"),
-                        y=alt.Y("Wert (CHF):Q", title="Verkaufswert (CHF) pro Woche", stack=None),
-                        color=alt.Color("Kategorie:N", title="Kategorie"),
-                        opacity=alt.condition(hover_cat, alt.value(1.0), alt.value(0.25)),
-                        strokeWidth=alt.condition(hover_cat, alt.value(3), alt.value(1.5)),
-                        tooltip=[
-                            alt.Tooltip("Periode:T", title="Woche"),
-                            alt.Tooltip("Kategorie:N", title="Kategorie"),
-                            alt.Tooltip("Wert (CHF):Q", title="Verkaufswert (CHF)", format=",.0f"),
-                        ],
+                    filtered_sell_df[col] = (
+                        pd.to_numeric(filtered_sell_df[col], errors="coerce")
+                          .fillna(0)
+                          .clip(0, 1_000_000)
                     )
-                    .add_selection(hover_cat)
-            )
-            points = (
-                base.mark_point(size=70, opacity=0)
-                    .encode(x="Periode:T", y="Wert (CHF):Q", color="Kategorie:N")
-                    .add_selection(hover_pt)
-            )
-            popup = (
-                base.transform_filter(hover_pt)
-                    .mark_text(align='left', dx=6, dy=-8, fontSize=12, fontWeight='bold')
-                    .encode(x="Periode:T", y="Wert (CHF):Q", text="Kategorie:N", color="Kategorie:N")
-            )
-            end_labels = (
-                base.transform_window(
-                        row_number='row_number()',
-                        sort=[alt.SortField(field='Periode', order='descending')],
-                        groupby=['Kategorie']
-                    )
-                    .transform_filter(alt.datum.row_number == 0)
-                    .mark_text(align='left', dx=6, dy=-6, fontSize=11)
-                    .encode(x='Periode:T', y='Wert (CHF):Q', text='Kategorie:N', color='Kategorie:N',
-                            opacity=alt.condition(hover_cat, alt.value(1.0), alt.value(0.6)))
-            )
-            chart = (lines + points + popup + end_labels).properties(height=400)
-            st.altair_chart(chart, use_container_width=True)
-        else:
-            st.info("Für den Verlauf werden gültige Startdaten und nicht-leere Kategorien benötigt.")
 
-        # ------- Tabellen -------
-        show_detail = st.checkbox("Detailtabelle anzeigen", value=False)
-        if show_detail:
-            st.subheader("Detailtabelle")
-            detail_renamed = detail.rename(columns={
-                "Einkaufswert":"Einkaufswert (CHF)",
-                "Verkaufswert":"Verkaufswert (CHF)",
-                "Lagerwert":"Lagerwert (CHF)"
-            })
-            detail_display = append_total_row_for_display(detail_renamed)
-            d_rounded, d_styler = style_numeric(detail_display)
-            st.dataframe(d_styler, use_container_width=True)
+        with st.spinner("🔗 Matche & berechne Werte…"):
+            with np.errstate(over="ignore", invalid="ignore",
+                             divide="ignore", under="ignore"):
+                detail, totals, ts_source = enrich_and_merge(
+                    filtered_sell_df, price_df, latest_stock_baseline_df=sell_df
+                )
 
-        st.subheader("Summen pro Artikel")
-        totals_renamed = totals.rename(columns={
-            "Einkaufswert":"Einkaufswert (CHF)",
-            "Verkaufswert":"Verkaufswert (CHF)",
-            "Lagerwert":"Lagerwert (CHF)"
-        })
-        totals_display = append_total_row_for_display(totals_renamed)
-        t_rounded, t_styler = style_numeric(totals_display)
-        st.dataframe(t_styler, use_container_width=True)
-
-        # ------- Downloads (ohne Σ-Gesamtzeile) -------
-        dl1, dl2 = st.columns(2)
-        with dl1:
-            st.download_button(
-                "⬇️ Detail (CSV)",
-                data=(detail_renamed if show_detail else pd.DataFrame()).to_csv(index=False).encode("utf-8"),
-                file_name="detail.csv", mime="text/csv", disabled=not show_detail
-            )
-        with dl2:
-            st.download_button(
-                "⬇️ Summen (CSV)",
-                data=totals_renamed.to_csv(index=False).encode("utf-8"),
-                file_name="summen.csv", mime="text/csv"
-            )
+        # >>> hier geht deine Auswertung / Charts weiter …
 
     except KeyError as e:
         st.error(str(e))
-        st.info("Tipp: Du hast wahrscheinlich eine Preisliste im Sell-out-Uploader oder umgekehrt. "
-                "Die Auto-Erkennung sortiert das künftig automatisch – lade die Dateien nochmals hoch.")
+        st.info(
+            "Tipp: Du hast wahrscheinlich eine Preisliste im Sell-out-Uploader "
+            "oder umgekehrt. Die Auto-Erkennung sortiert das künftig automatisch – "
+            "lade die Dateien nochmals hoch."
+        )
+
+    except FloatingPointError:
+        st.warning(
+            "Zahlüberlauf erkannt und unterdrückt. "
+            "Werte wurden automatisch geclippt."
+        )
+
     except Exception as e:
         st.error(f"Unerwarteter Fehler: {e}")
+
 else:
-    st.info("Bitte beide Dateien hochladen oder in den Ordner `data/` legen. "
-            "Es werden zuerst `sellout.xlsx`/`preisliste.xlsx` geladen, sonst Auto-Erkennung.")
+    st.info(
+        "Bitte beide Dateien hochladen oder in den Ordner `data/` legen. "
+        "Die App erkennt die Zuordnung automatisch."
+    )
+
