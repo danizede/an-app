@@ -1,5 +1,4 @@
-# app.py — Galaxus Sellout Analyse (interne ArtikelNr only, Name+Farbe bei Duplikaten, Woche-Snapping)
-
+# app.py — Galaxus Sellout Analyse (interne ArtikelNr only, Name+Farbe immer, Woche-Snapping, Varianten-sicher)
 import os
 import io
 import re
@@ -16,9 +15,11 @@ import warnings
 # =========================
 # Globale Settings
 # =========================
+pd.options.mode.use_inf_as_na = True
 warnings.filterwarnings("ignore", message="overflow encountered in multiply")
 warnings.filterwarnings("ignore", message="invalid value encountered in multiply")
-np.seterr(all="ignore")
+warnings.filterwarnings("ignore", message="divide by zero encountered")
+np.seterr(all="ignore")  # Niemals FloatingPointError raisen
 
 st.set_page_config(page_title="Galaxus Sellout Analyse", layout="wide")
 try:
@@ -50,21 +51,18 @@ def auth_enabled() -> bool:
     return bool(_auth_cfg().get("require_login", True))
 
 def _get_passcode():
-    # 1) Query-Param
     try:
         qp = st.query_params
         if "code" in qp and str(qp["code"]).strip():
             return str(qp["code"]).strip()
     except Exception:
         pass
-    # 2) Secrets [auth]
     auth = _auth_cfg()
     aliases = ("code","password","passcode","pw","passwort","secret")
     for k in aliases:
         v = auth.get(k)
         if isinstance(v, (str,int)) and str(v).strip():
             return str(v).strip()
-    # 3) Root-Secrets
     try:
         root = _to_plain_mapping(st.secrets)
         for k in aliases:
@@ -73,7 +71,6 @@ def _get_passcode():
                 return str(v).strip()
     except Exception:
         pass
-    # 4) Environment
     for k in ("AUTH_CODE","AUTH_PASSWORD","AUTH_PASSCODE","STREAMLIT_AUTH_CODE"):
         v = os.environ.get(k)
         if isinstance(v, (str,int)) and str(v).strip():
@@ -243,7 +240,7 @@ def safe_mul(a: pd.Series, b: pd.Series, max_a=MAX_QTY, max_b=MAX_PRICE) -> pd.S
     return pd.Series(out, index=a.index)
 
 # =========================
-# Farben & Familie
+# Farben & Varianten
 # =========================
 _COLOR_MAP = {
     "weiss":"Weiss","weiß":"Weiss","white":"White","offwhite":"Off-White","cream":"Cream","ivory":"Ivory",
@@ -256,7 +253,9 @@ _COLOR_MAP = {
     "gold":"Gold","rose gold":"Roségold","rosegold":"Roségold","kupfer":"Kupfer","copper":"Kupfer","bronze":"Bronze","transparent":"Transparent","clear":"Transparent",
 }
 _COLOR_WORDS = set(_COLOR_MAP.keys()) | set(map(str.lower, _COLOR_MAP.values()))
-_STOP_TOKENS = {"eu","ch","us","uk","mobile","little","bundle","set","kit"}
+_STOP_TOKENS = {"eu","ch","us","uk","bundle","set","kit"}  # ⚠️ 'little'/'mobile' NICHT mehr als Stop!
+
+VARIANT_TOKENS = {"little","mobile","big","pro","mini","plus"}
 
 def _looks_like_not_a_color(token: str) -> bool:
     t = (token or "").strip().lower()
@@ -267,12 +266,31 @@ def _strip_parens_units(name: str) -> str:
     s = re.sub(r"\b\d+([.,]\d+)?\s*(ml|db|m²|m2)\b", " ", s, flags=re.I)
     return s
 
+def make_variant_flags(name: str) -> dict:
+    s = (name or "").lower()
+    flags = {k: False for k in VARIANT_TOKENS}
+    for k in VARIANT_TOKENS:
+        if re.search(rf"\b{k}\b", s): flags[k] = True
+    return flags
+
+def flags_match(req: dict, cand: dict) -> bool:
+    """Erzwinge Varianten-Übereinstimmung: was im Sell-out gesetzt ist, muss im Kandidaten auch True sein.
+    Zusätzlich: wenn Sell-out keine Variante hat, aber Kandidat eine (z. B. 'mobile'), disqualifiziere."""
+    # alles, was im Sellout True ist, muss im Kandidaten True sein
+    for k,v in req.items():
+        if v and not cand.get(k, False):
+            return False
+    # wenn im Sellout kein Variant gesetzt, Kandidat aber eine Variante hat -> nicht nehmen
+    if not any(req.values()) and any(cand.values()):
+        return False
+    return True
+
 def make_family_key(name: str) -> str:
     if not isinstance(name, str): return ""
     s = _strip_parens_units(name.lower())
     s = re.sub(r"\b[o0]-\d+\b", " ", s)
     s = re.sub(r"[^a-z0-9]+", " ", s)
-    toks = [t for t in s.split() if t and (t not in _STOP_TOKENS) and (t not in _COLOR_WORDS)]
+    toks = [t for t in s.split() if t and (t not in _STOP_TOKENS) and (t not in _COLOR_WORDS) and (t not in VARIANT_TOKENS)]
     return "".join(toks[:2]) if toks else ""
 
 def extract_color_from_name(name: str) -> str:
@@ -292,57 +310,34 @@ def extract_color_from_name(name: str) -> str:
 
 # --- Basis-Anzeigename aus PL/Sell-Name bauen: nur Produktname (inkl. little/big/pro/mobile), KEINE Kategorie ---
 _CATEGORY_TOKENS = {
-    # deutsch
     "hygrometer","aroma diffuser","diffuser","ventilator","tischventilator","luftreiniger",
     "luftbefeuchter","verdunster","vernebler","luftentfeuchter","reiniger","aroma","tisch ventilator",
-    # englisch zur Sicherheit
     "humidifier","dehumidifier","air purifier","purifier","aroma diffuser"
 }
 _EU_TOKENS = {"eu","ch/eu","ch","us","uk"}
 
 def to_base_name(name: str) -> str:
-    """
-    Liefert den 'reinen' Produktnamen:
-    - Entfernt Klammerzusätze wie '(53 dB)', '(50 m²)'
-    - Schneidet einen Suffix nach ' – ' / '-' ab, wenn er:
-        * mit EU/CH/US/UK beginnt ODER
-        * offensichtlich nur Kategoriebegriffe enthält (Hygrometer, Ventilator, Aroma Diffuser, ...)
-    - Behält Varianten wie 'little', 'big', 'pro', 'mobile' bei (die stehen links vom Trennstrich)
-    """
     if not isinstance(name, str):
         return ""
     s = unicodedata.normalize("NFKC", name).strip()
-
-    # ()-Zusätze wie (53 dB), (50 m²) entfernen
     s = re.sub(r"\([^)]*\)", "", s)
     s = re.sub(r"\s+", " ", s).strip(" -–—").strip()
-
-    # Trennstrich-Varianten vereinheitlichen
     parts = re.split(r"\s+[–—-]\s+", s)
     if len(parts) >= 2:
         left, right = parts[0].strip(), " ".join(parts[1:]).strip().lower()
-
-        # 1) EU/CH/US/UK-Zeug im rechten Teil? => abschneiden
         if right.split() and right.split()[0] in _EU_TOKENS:
             return left.strip()
-
-        # 2) Kategorie-Suffix (z. B. 'hygrometer', 'aroma diffuser', 'ventilator' ...) => abschneiden
         clean_right = re.sub(r"[^\w\s/]+", " ", right).strip()
         words = [w for w in clean_right.split() if w]
         if words and all((w in _EU_TOKENS) or (w in _CATEGORY_TOKENS) for w in words):
             return left.strip()
-
-        # sonst Name nicht kürzen (z. B. 'Oskar – Karl Filter')
         s = (left + " – " + " ".join(parts[1:])).strip()
     else:
         s = parts[0].strip()
-
-    # einzelne EU-Tokens am Ende vom linken Teil entfernen (falls mal drin)
     s = re.sub(rf"\b({'|'.join(map(re.escape,_EU_TOKENS))})\b", "", s, flags=re.I)
     s = re.sub(r"\s+", " ", s).strip(" -–—").strip()
     return s
 
-# --- Farberkennung zusätzlich aus Variant/Zusatz nutzen ---
 def _as_color_or_empty(text: str) -> str:
     if not isinstance(text, str): 
         return ""
@@ -352,10 +347,8 @@ def _as_color_or_empty(text: str) -> str:
     low = t.lower()
     if _looks_like_not_a_color(low):
         return ""
-    # exakte Map (inkl. Synonyme)
     if low in _COLOR_MAP:
         return _COLOR_MAP[low]
-    # Wort im Text ist bekannte Farbe?
     for w in sorted(_COLOR_WORDS, key=len, reverse=True):
         if re.search(rf"\b{re.escape(w)}\b", low):
             return _COLOR_MAP.get(w, w.title())
@@ -377,7 +370,6 @@ CAT_CANDIDATES  = ["Kategorie","Warengruppe"]
 VARIANT_CANDIDATES = ["Zusatz","Variante","Variant","Scent","Duft","Flavor","Flavour","Subname","Sub-Name"]
 
 STOCK_CANDIDATES= ["Bestand","Verfügbar","verfügbar","Verfuegbar","Lagerbestand","Lagermenge","Available"]
-# Wichtig: 'Variante/Variant' NICHT als Farbe interpretieren
 COLOR_CANDIDATES= ["Farbe","Color","Colour","Farbvariante","Farbname"]
 
 def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -385,27 +377,12 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     col_art   = find_column(df, ARTNR_CANDIDATES, "Artikelnummer")
     col_ean   = find_column(df, EAN_CANDIDATES,  "EAN/GTIN", required=False)
     col_name  = find_column(df, NAME_CANDIDATES_PL, "Bezeichnung")
-
-    # Kategorie primär aus Spalte G (Index 6)
-    col_cat = None
-    try:
-        maybe_g = df.columns[6]
-        if maybe_g in df.columns:
-            col_cat = maybe_g
-    except Exception:
-        pass
-    if not col_cat:
-        col_cat = find_column(df, CAT_CANDIDATES, "Kategorie", required=False)
-
+    col_cat   = find_column(df, CAT_CANDIDATES, "Kategorie", required=False)
     col_stock = find_column(df, STOCK_CANDIDATES, "Bestand/Lager", required=False)
     col_buy   = find_column(df, BUY_PRICE_CANDIDATES,  "Einkaufspreis", required=False)
     col_sell  = find_column(df, SELL_PRICE_CANDIDATES, "Verkaufspreis", required=False)
     col_color = find_column(df, COLOR_CANDIDATES, "Farbe/Variante", required=False)
     col_variant = find_column(df, VARIANT_CANDIDATES, "Variante/Zusatz", required=False)
-
-    col_any=None
-    if not col_sell and not col_buy:
-        col_any = find_column(df, PRICE_COL_CANDIDATES, "Preis", required=True)
 
     out = pd.DataFrame()
     out["ArtikelNr"]       = df[col_art].astype(str)
@@ -415,28 +392,11 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     out["Bezeichnung"]     = df[col_name].astype(str)
     out["Bezeichnung_key"] = out["Bezeichnung"].map(normalize_key)
     out["Familie"]         = out["Bezeichnung"].map(make_family_key)
-
-    # Variante an Name anhängen (außer EU/CH/US/UK)
-    if col_variant:
-        variant = df[col_variant].astype(str).fillna("").str.strip()
-        if not variant.empty:
-            name_lower = out["Bezeichnung"].str.lower()
-            variant_lower = variant.str.lower()
-            for idx, vlow in variant_lower.items():
-                if not vlow or vlow in {"nan","none"}:
-                    continue
-                if vlow in {"eu","ch/eu","ch","us","uk"}:
-                    continue
-                if vlow not in name_lower.iloc[idx]:
-                    out.at[idx,"Bezeichnung"] = (out.at[idx,"Bezeichnung"].strip() + " " + variant.iloc[idx]).strip()
+    out["VarFlags"]        = out["Bezeichnung"].map(make_variant_flags)
 
     # Kategorie
     if col_cat:
-        out["Kategorie"] = (
-            df[col_cat].astype(str)
-              .replace({"nan":"", "NaN":"", "None":""})
-              .str.strip()
-        )
+        out["Kategorie"] = df[col_cat].astype(str).replace({"nan":"", "NaN":"", "None":""}).str.strip()
     else:
         out["Kategorie"] = ""
 
@@ -446,7 +406,7 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     else:
         out["Farbe"] = out["Bezeichnung"].map(extract_color_from_name)
 
-    # NEU: Farbe ggf. aus Variante/Zusatz ableiten
+    # Variante -> evtl. Farbe ableiten
     if col_variant:
         var_series = df[col_variant].astype(str)
         var_color = var_series.map(_as_color_or_empty)
@@ -457,10 +417,8 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     out["Lagermenge"] = parse_number_series(df[col_stock]).fillna(0).astype("Int64") if col_stock else pd.Series([0]*len(out), dtype="Int64")
     if col_buy:  out["Einkaufspreis"] = parse_number_series(df[col_buy])
     if col_sell: out["Verkaufspreis"] = parse_number_series(df[col_sell])
-    if not col_buy and not col_sell and col_any:
-        anyp = parse_number_series(df[col_any]); out["Einkaufspreis"]=anyp; out["Verkaufspreis"]=anyp
-    if "Einkaufspreis" not in out: out["Einkaufspreis"]=out.get("Verkaufspreis", pd.Series([np.nan]*len(out)))
-    if "Verkaufspreis" not in out: out["Verkaufspreis"]=out.get("Einkaufspreis", pd.Series([np.nan]*len(out)))
+    if "Einkaufspreis" not in out: out["Einkaufspreis"]=pd.Series([np.nan]*len(out))
+    if "Verkaufspreis" not in out: out["Verkaufspreis"]=pd.Series([np.nan]*len(out))
 
     # Dedupliziere nach ArtikelNr_key (bevorzuge Zeilen mit Preis)
     out = out.assign(_have=out["Verkaufspreis"].notna()).sort_values(["ArtikelNr_key","_have"], ascending=[True,False])
@@ -477,28 +435,24 @@ DATE_START_CANDS     = ["Start","Startdatum","Start Date","Anfangs datum","Anfan
 DATE_END_CANDS       = ["Ende","Enddatum","End Date","Bis","Period End"]
 STOCK_SO_CANDIDATES  = ["Lagermenge","Lagerbestand","Bestand","Verfügbar","verfügbar","Verfuegbar","Available"]
 
-# Preis-Äquivalenzen (für NUMERISCHE Fallbacks, Identität bleibt)
+# Äquivalenzen/Guided Hints
 ART_EXACT_EQUIV  = {
+    # gezielte Korrekturen/alias: hier NICHT Finn mobile → Finn!
     "e008":"e009",
     "j031":"j030",
     "m057":"m051",
     "s054":"s054",
-    "a040":"a041",  # A-040 nimmt Preise von A-041 (nur numeric)
-    "f023":"f021",  # F-023 (Finn mobile) nimmt Preise von F-021 (nur numeric)
 }
-ART_PREFIX_EQUIV = {"o061":"o061","o013":"o013"}
+ART_PREFIX_EQUIV = {"o061":"o061","o013":"o013"}  # Beispiel: Oskar little, Otto
 
 def _apply_hints_to_row(name_raw: str) -> dict:
     s = (name_raw or "").lower()
-    h = {"hint_family":"","hint_color":"","hint_art_exact":"","hint_art_prefix":""}
+    h = {"hint_family":"","hint_color":"","hint_art_exact":"","hint_art_prefix":"","var_flags":make_variant_flags(name_raw or "")}
     # Familien
-    if "finn mobile" in s:
-        h["hint_family"] = "finn mobile"
-    for fam in ["finn","theo","robert","peter","julia","albert","roger","mia","simon","otto","oskar","tim","charly","duftöl","duftoel","duft oil"]:
-        if fam in s: h["hint_family"] = h["hint_family"] or ("duftol" if "duft" in fam else fam)
+    for fam in ["finn mobile","finn","theo","albert","robert","peter","julia","oskar","eva little","eva","roger","mia","simon","otto","tim","charly","duftöl","duftoel","duft oil"]:
+        if fam in s:
+            h["hint_family"] = fam.replace(" duft", " duft")
     # Farb-/Artikel-Hints
-    if "tim" in s and "schwarz" in s: h["hint_color"]="weiss"
-    if "mia" in s and "gold" in s:    h["hint_color"]="schwarz"
     if "oskar" in s and "little" in s: h["hint_art_prefix"]="o061"
     if "simon" in s: h["hint_art_exact"]="s054"
     if "otto"  in s: h["hint_art_prefix"]="o013"
@@ -535,6 +489,7 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
     out["Bezeichnung"]     = df[col_name].astype(str) if col_name else ""
     out["Bezeichnung_key"] = out["Bezeichnung"].map(normalize_key)
     out["Familie"]         = out["Bezeichnung"].map(make_family_key)
+    out["VarFlags"]        = out["Bezeichnung"].map(make_variant_flags)
 
     hints = out["Bezeichnung"].map(_apply_hints_to_row)
     out["Hint_Family"]   = hints.map(lambda h: h["hint_family"])
@@ -558,23 +513,32 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
 # Matching-Backstops
 # =========================
 def _assign_from_price_row(merged: pd.DataFrame, i, row: pd.Series):
-    """Nur numerische Felder kopieren (Preis/Lager) – Identitäten bleiben unverändert."""
+    """Nur numerische Felder kopieren (Preis/Lager); Identitäten/Kategorie/Bezeichnung separat."""
     for col in ["Einkaufspreis","Verkaufspreis","Lagermenge"]:
         merged.at[i, col] = row.get(col, merged.at[i, col])
+    # zusätzlich: Bezeichnung/Kategorie/ArtikelNr (aus PL) präferieren
+    merged.at[i, "Bezeichnung_pl"] = row.get("Bezeichnung", merged.at[i, "Bezeichnung_pl"] if "Bezeichnung_pl" in merged else None)
+    merged.at[i, "Kategorie_pl"]   = row.get("Kategorie",   merged.at[i, "Kategorie_pl"]   if "Kategorie_pl"   in merged else None)
+    merged.at[i, "ArtikelNr_pl"]   = row.get("ArtikelNr",   merged.at[i, "ArtikelNr_pl"]   if "ArtikelNr_pl"   in merged else None)
+    merged.at[i, "Farbe_pl"]       = row.get("Farbe",       merged.at[i, "Farbe_pl"]       if "Farbe_pl"       in merged else None)
+    merged.at[i, "VarFlags_pl"]    = row.get("VarFlags",    merged.at[i, "VarFlags_pl"]    if "VarFlags_pl"    in merged else None)
 
 def _token_set(s: str) -> set:
     s = _strip_parens_units(s.lower())
     s = re.sub(r"[^a-z0-9]+"," ", s)
-    toks = [t for t in s.split() if t and (t not in _STOP_TOKENS) and (t not in _COLOR_WORDS)]
+    toks = [t for t in s.split() if t and (t not in _STOP_TOKENS) and (t not in _COLOR_WORDS) and (t not in VARIANT_TOKENS)]
     return set(toks)
 
-def _best_fuzzy_in_candidates(name: str, cand_series: pd.Series):
+def _best_fuzzy_in_candidates(name: str, cand_df: pd.DataFrame, req_flags: dict):
     base = _token_set(name)
     if not len(base): return None
     best_idx, best_score = None, 0.0
-    for idx, val in cand_series.items():
-        cand = _token_set(str(val))
+    for idx, row in cand_df.iterrows():
+        cand = _token_set(str(row["Bezeichnung"]))
         if not cand: continue
+        # Varianten müssen konsistent sein
+        if not flags_match(req_flags, row.get("VarFlags", {})): 
+            continue
         inter = len(base & cand); union = len(base | cand)
         score = inter/union if union else 0.0
         if score > best_score:
@@ -587,6 +551,9 @@ def _family_match(row: pd.Series, price_df: pd.DataFrame, prefer_color: str | No
     if not fam: return None
     grp = price_df.loc[price_df["Familie"]==fam]
     if grp.empty: grp = price_df.loc[price_df["Familie"].str.contains(re.escape(fam), na=False)]
+    if grp.empty: return None
+    # Varianten konsistent?
+    grp = grp.loc[[flags_match(row.get("VarFlags", {}), vf) for vf in grp["VarFlags"].tolist()]]
     if grp.empty: return None
     if prefer_color:
         g2 = grp.loc[grp["Farbe"].str.lower()==prefer_color.lower()]
@@ -614,7 +581,7 @@ def _final_backstops(merged: pd.DataFrame, price_df: pd.DataFrame):
         hit = _family_match(merged.loc[i], price_df, pref_color if pref_color else None)
         if hit is not None:
             _assign_from_price_row(merged,i, hit); continue
-        idx = _best_fuzzy_in_candidates(str(merged.at[i,"Bezeichnung"]), price_df["Bezeichnung"])
+        idx = _best_fuzzy_in_candidates(str(merged.at[i,"Bezeichnung"]), price_df, merged.at[i].get("VarFlags", {}))
         if idx is not None:
             _assign_from_price_row(merged,i, price_df.loc[idx]); continue
 
@@ -651,12 +618,12 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
     if need.any():
         tmp = merged.loc[need, ["EAN_key"]].merge(
             price_df[["EAN_key","Einkaufspreis","Verkaufspreis","Lagermenge","Bezeichnung",
-                      "Familie","Farbe","Kategorie","ArtikelNr","ArtikelNr_key"]],
+                      "Familie","Farbe","Kategorie","ArtikelNr","ArtikelNr_key","VarFlags"]],
             on="EAN_key", how="left"
         )
         idx = merged.index[need]; tmp.index = idx
-        for c in ["Einkaufspreis","Verkaufspreis","Lagermenge"]:
-            merged.loc[idx,c] = merged.loc[idx,c].fillna(tmp[c])
+        for c in ["Einkaufspreis","Verkaufspreis","Lagermenge","Bezeichnung","Familie","Farbe","Kategorie","ArtikelNr","ArtikelNr_key","VarFlags"]:
+            merged.loc[idx,c if c in merged.columns else f"{c}_pl"] = merged.loc[idx,c if c in merged.columns else f"{c}_pl"].fillna(tmp[c])
 
     # Fallback: Bezeichnung_key
     need = merged["Verkaufspreis"].isna()
@@ -666,40 +633,45 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
             if k in name_map.index:
                 _assign_from_price_row(merged,i, name_map.loc[k])
 
-    # Fallback: Familie
+    # Fallback: Familie (+ Varianten-Konsistenz)
     need = merged["Verkaufspreis"].isna()
     if need.any():
-        fam_map = price_df.drop_duplicates("Familie").set_index("Familie")
-        for i,f in zip(merged.index[need], merged.loc[need,"Familie"]):
-            if f and f in fam_map.index:
-                _assign_from_price_row(merged,i, fam_map.loc[f])
+        for i in merged.index[need]:
+            fam = merged.at[i,"Familie"]
+            if fam:
+                grp = price_df.loc[price_df["Familie"]==fam]
+                if not grp.empty:
+                    # Varianten erzwingen
+                    req = merged.at[i,"VarFlags"]
+                    grp2 = grp.loc[[flags_match(req, vf) for vf in grp["VarFlags"].tolist()]]
+                    if not grp2.empty:
+                        _assign_from_price_row(merged,i, grp2.iloc[0])
 
     _final_backstops(merged, price_df)
 
-    # Interne Artikelnummer aus Preisliste bevorzugen (Anzeige/Key)
+    # Interne Artikelnummer/Kategorie/Bezeichnung/Farbe aus Preisliste bevorzugen
     if "ArtikelNr_pl" in merged.columns:
         merged["ArtikelNr"] = merged["ArtikelNr_pl"].combine_first(merged["ArtikelNr"])
         merged["ArtikelNr_key"] = merged["ArtikelNr"].map(normalize_key)
 
-    # Strings
-    for df in (merged, stock_merged):
-        df["Kategorie"] = (
-            df["Kategorie"].fillna("")
-              .astype(str)
-              .replace({"nan":"", "NaN":"", "None":""})
-              .str.strip()
-        )
-        df["Bezeichnung"] = df["Bezeichnung"].fillna("")
-        df["Farbe"]       = df.get("Farbe","").fillna("")
+    if "Kategorie_pl" in merged.columns:
+        merged["Kategorie"] = merged["Kategorie_pl"].combine_first(merged.get("Kategorie",""))
 
-    # ---------- NEU: Farbe sicher befüllen & standardisieren ----------
-    # Wenn beim Merge eine rechte "Farbe_pl" existiert, bevorzugen; sonst ist "Farbe" ohnehin aus PL
+    if "Bezeichnung_pl" in merged.columns:
+        merged["Bezeichnung"] = merged["Bezeichnung_pl"].combine_first(merged["Bezeichnung"])
+
     if "Farbe_pl" in merged.columns:
         merged["Farbe"] = merged["Farbe_pl"].combine_first(merged.get("Farbe", ""))
 
-    merged["Farbe"] = merged.get("Farbe", "").fillna("").astype(str).str.strip()
+    # Strings
+    for df in (merged, stock_merged):
+        df["Kategorie"] = df.get("Kategorie","").fillna("").astype(str).replace({"nan":"", "NaN":"", "None":""}).str.strip()
+        df["Bezeichnung"] = df["Bezeichnung"].fillna("")
+        df["Farbe"]       = df.get("Farbe","").fillna("")
+        df["VarFlags"]    = df.get("VarFlags","")
 
-    # Fallback: Farbe aus der Bezeichnung extrahieren, falls noch leer
+    # ---------- Farbe sicher befüllen & standardisieren ----------
+    merged["Farbe"] = merged.get("Farbe", "").fillna("").astype(str).str.strip()
     mask_empty_color = merged["Farbe"].eq("")
     if mask_empty_color.any():
         merged.loc[mask_empty_color, "Farbe"] = (
@@ -709,21 +681,14 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
                   .astype(str)
                   .str.strip()
         )
-
-    # Standardisierte Farbe (z. B. "weiss ch/eu" -> "Weiss", "weiss matt" -> "Weiss")
     merged["Farbe_std"] = merged["Farbe"].map(_as_color_or_empty)
 
-    # ---------- Anzeige-Bezeichnung: Basisname + Farbe bei Duplikaten ----------
+    # ---------- Anzeige-Bezeichnung: IMMER Basisname + Farbe (falls vorhanden) ----------
     merged["BaseName"] = merged["Bezeichnung"].map(to_base_name)
-    merged["Bezeichnung_anzeige"] = merged["BaseName"]
-
-    # Duplikate über bereinigten Basisnamen erkennen
-    dup = merged.duplicated(subset=["BaseName"], keep=False)
-
-    # Farbe anhängen, wenn erkannt
-    add_mask = dup & merged["Farbe_std"].ne("")
-    merged.loc[add_mask, "Bezeichnung_anzeige"] = (
-        merged.loc[add_mask, "BaseName"] + " – " + merged.loc[add_mask, "Farbe_std"]
+    merged["Bezeichnung_anzeige"] = np.where(
+        merged["Farbe_std"].ne(""),
+        merged["BaseName"] + " – " + merged["Farbe_std"],
+        merged["BaseName"]
     )
 
     # Werte
@@ -856,7 +821,7 @@ def _persist_upload(uploaded_file, target_path: Path):
 def _guess_role_from_name(name: str) -> str | None:
     n = name.lower()
     if any(k in n for k in ["sell-out","sellout","sell","sales","report"]): return "sell"
-    if any(k in n for k in ["preisliste","preis","price","vk","pl ", "pl_", "pl-"]): return "price"
+    if any(k in n for k in ["preisliste","preis","price","vk","pl ", "pl_", "pl-","roh"]): return "price"
     return None
 
 def _canon(c: str) -> str:
@@ -888,14 +853,12 @@ def _pick_default_files_from_dir(folder: Path):
     xlsx_files = sorted([p for p in folder.glob("*.xlsx") if p.is_file()])
     if not xlsx_files:
         return None, None, None, None
-    # 1) per Keywords
     for p in xlsx_files:
         role = _guess_role_from_name(p.name)
         if role == "sell" and sell_bytes is None:
             sell_bytes = io.BytesIO(p.read_bytes()); sell_name = p.name
         elif role == "price" and price_bytes is None:
             price_bytes = io.BytesIO(p.read_bytes()); price_name = p.name
-    # 2) Rest auffüllen
     leftovers = [p for p in xlsx_files if p.name not in {sell_name, price_name}]
     for p in leftovers:
         if sell_bytes is None:
@@ -968,6 +931,7 @@ if (raw_sell is not None) and (raw_price is not None):
             sell_df  = prepare_sell_df(raw_sell)
             price_df = prepare_price_df(raw_price)
 
+ 
         # Zeitraumfilter mit Woche-Snapping (Mo–So)
         filtered_sell_df = sell_df
         if {"StartDatum","EndDatum"}.issubset(sell_df.columns) and not sell_df["StartDatum"].isna().all():
