@@ -343,6 +343,25 @@ def to_base_name(name: str) -> str:
     s = re.sub(r"\s+", " ", s).strip(" -–—").strip()
     return s
 
+# --- Farberkennung zusätzlich aus Variant/Zusatz nutzen ---
+def _as_color_or_empty(text: str) -> str:
+    if not isinstance(text, str): 
+        return ""
+    t = text.strip()
+    if not t:
+        return ""
+    low = t.lower()
+    if _looks_like_not_a_color(low):
+        return ""
+    # exakte Map (inkl. Synonyme)
+    if low in _COLOR_MAP:
+        return _COLOR_MAP[low]
+    # Wort im Text ist bekannte Farbe?
+    for w in sorted(_COLOR_WORDS, key=len, reverse=True):
+        if re.search(rf"\b{re.escape(w)}\b", low):
+            return _COLOR_MAP.get(w, w.title())
+    return ""
+
 # =========================
 # Parsing – Preislisten
 # =========================
