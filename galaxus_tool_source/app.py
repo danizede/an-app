@@ -215,8 +215,21 @@ def find_column(df: pd.DataFrame, candidates, purpose: str, required=True):
         raise KeyError(f"Spalte für «{purpose}» fehlt – gesucht unter {candidates}.\nVerfügbare Spalten: {cols}")
     return None
 
-def parse_number_series(s: pd.Series) -> pd.Series:
-    if s.dtype.kind in ("i","u","f"): return s
+def parse_number_series(s) -> pd.Series:
+    """Robust gegen None / Listen / fremde Typen; gibt float-Serie zurück."""
+    if s is None:
+        return pd.Series(dtype="float64")
+    if not isinstance(s, pd.Series):
+        try:
+            s = pd.Series(s)
+        except Exception:
+            return pd.Series(dtype="float64")
+    # wenn bereits numerisch:
+    try:
+        if getattr(s, "dtype", None) is not None and s.dtype.kind in ("i","u","f"):
+            return s
+    except Exception:
+        pass
     def _clean(x):
         if pd.isna(x): return np.nan
         x = str(x).strip().replace("’","").replace("'","").replace(" ","").replace(",",".")
@@ -226,8 +239,20 @@ def parse_number_series(s: pd.Series) -> pd.Series:
         except Exception: return np.nan
     return s.map(_clean)
 
-def parse_date_series_us(s: pd.Series) -> pd.Series:
-    if np.issubdtype(s.dtype, np.datetime64): return s
+def parse_date_series_us(s) -> pd.Series:
+    """Robust gegen None / gemischte Typen (Text, Excel-Serial, bereits Datetime)."""
+    if s is None:
+        return pd.Series([pd.NaT])
+    if not isinstance(s, pd.Series):
+        try:
+            s = pd.Series(s)
+        except Exception:
+            return pd.Series([pd.NaT])
+    try:
+        if getattr(s, "dtype", None) is not None and np.issubdtype(s.dtype, np.datetime64):
+            return pd.to_datetime(s, errors="coerce")
+    except Exception:
+        pass
     dt1 = pd.to_datetime(s, errors="coerce", dayfirst=False, infer_datetime_format=True)
     nums = pd.to_numeric(s, errors="coerce")
     dt2 = pd.to_datetime(nums, origin="1899-12-30", unit="d", errors="coerce")
