@@ -215,8 +215,9 @@ def find_column(df: pd.DataFrame, candidates, purpose: str, required=True):
         raise KeyError(f"Spalte für «{purpose}» fehlt – gesucht unter {candidates}.\nVerfügbare Spalten: {cols}")
     return None
 
+# === PATCH: robuste Parser (fix für "NoneType has no attribute 'dtype') ===
 def parse_number_series(s) -> pd.Series:
-    """Robust gegen None / Listen / fremde Typen; gibt float-Serie zurück."""
+    """Robust gegen None / Listen / gemischte Typen; gibt float-Serie zurück."""
     if s is None:
         return pd.Series(dtype="float64")
     if not isinstance(s, pd.Series):
@@ -224,19 +225,25 @@ def parse_number_series(s) -> pd.Series:
             s = pd.Series(s)
         except Exception:
             return pd.Series(dtype="float64")
-    # wenn bereits numerisch:
+    # bereits numerisch?
     try:
-        if getattr(s, "dtype", None) is not None and s.dtype.kind in ("i","u","f"):
-            return s
+        if getattr(s, "dtype", None) is not None and getattr(s.dtype, "kind", "") in ("i", "u", "f"):
+            return pd.to_numeric(s, errors="coerce")
     except Exception:
         pass
+
     def _clean(x):
-        if pd.isna(x): return np.nan
-        x = str(x).strip().replace("’","").replace("'","").replace(" ","").replace(",",".")
+        if pd.isna(x): 
+            return np.nan
+        x = str(x).strip().replace("’","").replace("'","").replace(" ","").replace(",", ".")
         if x.count(".") > 1:
-            parts = x.split("."); x = "".join(parts[:-1]) + "." + parts[-1]
-        try: return float(x)
-        except Exception: return np.nan
+            parts = x.split(".")
+            x = "".join(parts[:-1]) + "." + parts[-1]
+        try:
+            return float(x)
+        except Exception:
+            return np.nan
+
     return s.map(_clean)
 
 def parse_date_series_us(s) -> pd.Series:
@@ -248,15 +255,19 @@ def parse_date_series_us(s) -> pd.Series:
             s = pd.Series(s)
         except Exception:
             return pd.Series([pd.NaT])
+
     try:
         if getattr(s, "dtype", None) is not None and np.issubdtype(s.dtype, np.datetime64):
             return pd.to_datetime(s, errors="coerce")
     except Exception:
         pass
-    dt1 = pd.to_datetime(s, errors="coerce", dayfirst=False, infer_datetime_format=True)
+
+    dt1  = pd.to_datetime(s, errors="coerce", dayfirst=False, infer_datetime_format=True)
     nums = pd.to_numeric(s, errors="coerce")
-    dt2 = pd.to_datetime(nums, origin="1899-12-30", unit="d", errors="coerce")
+    dt2  = pd.to_datetime(nums, origin="1899-12-30", unit="d", errors="coerce")
     return dt1.combine_first(dt2)
+# === END PATCH ===
+
 
 MAX_QTY, MAX_PRICE = 1_000_000, 1_000_000
 
