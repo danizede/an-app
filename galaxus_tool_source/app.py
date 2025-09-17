@@ -1,14 +1,13 @@
 # app.py — Galaxus Sellout Analyse (Passcode-Login + Auto-File-Detection)
 # - Robustes Matching (ArtNr → EAN → Name → Familie → Hints → Fuzzy)
 # - EU-Datumsfilter, Detailtabelle optional
-# - Summen pro Artikel (Lagerwert = letzter verfügbarer Stand je Artikel, NICHT aufsummiert)
+# - Summen pro Name+Farbe (Lagerwert = letzter Stand je Artikel, NICHT aufsummiert)
 # - Interaktives Linienchart (Woche) mit Hover-Highlight & Pop-up-Label
 # - Auto-Load aus /data mit Dateinamen-Autoerkennung (sellout / preisliste)
 # - Sichere Multiplikation (safe_mul) + np.seterr(all="ignore")
 # - Kategorie primär aus Spalte G; leere/NaN-Kategorien bleiben leer und erscheinen nicht im Chart
-# - Summenzeile Σ Gesamt – Währungsangaben in Spaltennamen (CHF)
-# - 🔐 Login via st.secrets [auth]/Root/Env (kein bcrypt nötig)
-# - Spezialregeln: Finn vs Finn mobile getrennt; O-014/O-015 nie zusammenführen; Farben immer separat, sonst Name+Farbe zusammenfassen
+# - Anzeige immer "BaseName – Farbe" (Farbe standardisiert)
+# - 🔐 Login via st.secrets [auth]/Root/Env
 
 import os
 import io
@@ -33,7 +32,7 @@ except Exception:
     pass
 
 # =========================
-# 🔐 Auth – Passcode only (robust, Mapping-kompatibel)
+# 🔐 Auth – Passcode only
 # =========================
 def _to_plain_mapping(obj) -> dict:
     if obj is None:
@@ -209,6 +208,22 @@ def normalize_key(s: str) -> str:
     s = s.lower()
     return re.sub(r"[^a-z0-9]+","", s)
 
+# --- NEU: Hersteller-Nr. robuster normalisieren (z.B. O-15 => o015, ST O-015 => o015)
+def normalize_artnr_key(s: str) -> str:
+    t = str(s or "")
+    t = unicodedata.normalize("NFKD", t)
+    t = re.sub(r"^\s*st[-_/ ]*", "", t, flags=re.I)     # ST- Präfix entfernen
+    t = re.sub(r"[^A-Za-z0-9]+", "", t)                 # nur A-Z0-9
+    m = re.match(r"^([A-Za-z]+)(\d+)$", t)
+    if m:
+        prefix = m.group(1).lower()
+        digits = m.group(2).lstrip("0") or "0"
+        if len(digits) <= 3:
+            digits = digits.zfill(3)
+        return prefix + digits
+    # Fallback
+    return normalize_key(t)
+
 def find_column(df: pd.DataFrame, candidates, purpose: str, required=True) -> str|None:
     cols = list(df.columns)
     for cand in candidates:
@@ -271,9 +286,6 @@ _COLOR_MAP = {
 _COLOR_WORDS = set(_COLOR_MAP.keys()) | set(map(str.lower, _COLOR_MAP.values()))
 _STOP_TOKENS = {"eu","ch","us","uk","mobile","little","bundle","set","kit"}
 
-# ======= Sonder-SKUs, die nie zusammengeführt werden =======
-SPECIAL_SEPARATE_KEYS = {"o014", "o015"}  # (ArtikelNr_key in Kleinbuchstaben)
-
 def _looks_like_not_a_color(token: str) -> bool:
     t = (token or "").strip().lower()
     return (not t) or (t in {"eu","ch","us","uk"}) or any(x in t for x in ["ml","db","m²","m2"]) or bool(re.search(r"\d", t))
@@ -284,22 +296,11 @@ def _strip_parens_units(name: str) -> str:
     return s
 
 def make_family_key(name: str) -> str:
-    if not isinstance(name, str): 
-        return ""
+    if not isinstance(name, str): return ""
     s = _strip_parens_units(name.lower())
     s = re.sub(r"\b[o0]-\d+\b", " ", s)
     s = re.sub(r"[^a-z0-9]+", " ", s)
-
-    raw = [t for t in s.split() if t]
-
-    # Sonderregel: 'finn mobile' soll nicht zu 'finn' zusammenschrumpfen
-    keep = set()
-    if "finn" in raw and "mobile" in raw:
-        keep.add("mobile")
-
-    toks = [t for t in raw 
-            if ((t not in _STOP_TOKENS) or (t in keep)) 
-            and (t not in _COLOR_WORDS)]
+    toks = [t for t in s.split() if t and (t not in _STOP_TOKENS) and (t not in _COLOR_WORDS)]
     return "".join(toks[:2]) if toks else ""
 
 def extract_color_from_name(name: str) -> str:
@@ -317,6 +318,52 @@ def extract_color_from_name(name: str) -> str:
                 return _COLOR_MAP.get(w, w.title())
     return ""
 
+# Anzeige-Basis: Name ohne EU-/Kategorie-Suffixe
+_CATEGORY_TOKENS = {
+    "hygrometer","aroma diffuser","diffuser","ventilator","tischventilator","luftreiniger",
+    "luftbefeuchter","verdunster","vernebler","luftentfeuchter","reiniger","aroma","tisch ventilator",
+    "humidifier","dehumidifier","air purifier","purifier","aroma diffuser"
+}
+_EU_TOKENS = {"eu","ch/eu","ch","us","uk"}
+
+def to_base_name(name: str) -> str:
+    if not isinstance(name, str):
+        return ""
+    s = unicodedata.normalize("NFKC", name).strip()
+    s = re.sub(r"\([^)]*\)", "", s)
+    s = re.sub(r"\s+", " ", s).strip(" -–—").strip()
+    parts = re.split(r"\s+[–—-]\s+", s)
+    if len(parts) >= 2:
+        left, right = parts[0].strip(), " ".join(parts[1:]).strip().lower()
+        if right.split() and right.split()[0] in _EU_TOKENS:
+            return left.strip()
+        clean_right = re.sub(r"[^\w\s/]+", " ", right).strip()
+        words = [w for w in clean_right.split() if w]
+        if words and all((w in _EU_TOKENS) or (w in _CATEGORY_TOKENS) for w in words):
+            return left.strip()
+        s = (left + " – " + " ".join(parts[1:])).strip()
+    else:
+        s = parts[0].strip()
+    s = re.sub(rf"\b({'|'.join(map(re.escape,_EU_TOKENS))})\b", "", s, flags=re.I)
+    s = re.sub(r"\s+", " ", s).strip(" -–—").strip()
+    return s
+
+def _as_color_or_empty(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    t = text.strip()
+    if not t:
+        return ""
+    low = t.lower()
+    if _looks_like_not_a_color(low):
+        return ""
+    if low in _COLOR_MAP:
+        return _COLOR_MAP[low]
+    for w in sorted(_COLOR_WORDS, key=len, reverse=True):
+        if re.search(rf"\b{re.escape(w)}\b", low):
+            return _COLOR_MAP.get(w, w.title())
+    return ""
+
 # =========================
 # Parsing – Preislisten
 # =========================
@@ -324,7 +371,7 @@ PRICE_COL_CANDIDATES = ["Preis","VK","Netto","NETTO","Einkaufspreis","Verkaufspr
 BUY_PRICE_CANDIDATES  = ["Einkaufspreis","Einkauf"]
 SELL_PRICE_CANDIDATES = ["Verkaufspreis","VK","Preis"]
 
-ARTNR_CANDIDATES = ["Artikelnummer","Artikelnr","ArtikelNr","Artikel-Nr.","Hersteller-Nr.","Produkt ID","ProdNr","ArtNr","ArtikelNr.","Artikel"]
+ARTNR_CANDIDATES = ["Artikelnummer","Artikelnr","ArtikelNr","Artikel-Nr.","Hersteller-Nr.","Hersteller Nr","Produkt ID","ProdNr","ArtNr","ArtikelNr.","Artikel"]
 EAN_CANDIDATES  = ["EAN","GTIN","BarCode","Barcode"]
 NAME_CANDIDATES_PL = ["Bezeichnung","Produktname","Name","Titel","Artikelname"]
 CAT_CANDIDATES  = ["Kategorie","Warengruppe","Zusatz"]
@@ -358,7 +405,7 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
 
     out = pd.DataFrame()
     out["ArtikelNr"]       = df[col_art].astype(str)
-    out["ArtikelNr_key"]   = out["ArtikelNr"].map(normalize_key)
+    out["ArtikelNr_key"]   = out["ArtikelNr"].map(normalize_artnr_key)
     out["EAN"]             = df[col_ean].astype(str) if col_ean else ""
     out["EAN_key"]         = out["EAN"].map(lambda x: re.sub(r"[^0-9]+","",str(x)))
     out["Bezeichnung"]     = df[col_name].astype(str)
@@ -412,12 +459,8 @@ def _apply_hints_to_row(name_raw: str) -> dict:
     s = (name_raw or "").lower()
     h = {"hint_family":"","hint_color":"","hint_art_exact":"","hint_art_prefix":""}
     for fam in ["finn mobile","charly little","duftöl","duftoel","duft oil"]:
-        if fam in s:
-            if fam == "finn mobile":
-                h["hint_family"] = "finnmobile"
-            else:
-                h["hint_family"] = "charly" if "charly" in fam else "duftol"
-    for fam in ["finn","theo","robert","peter","julia","albert","roger","mia","simon","otto","oskar","tim","charly"]:
+        if fam in s: h["hint_family"] = "finn" if fam=="finn mobile" else ("charly" if "charly" in fam else "duftol")
+    for fam in ["finn","theo","robert","peter","julia","albert","roger","mia","simon","otto","oskar","tim","charly","oliver"]:
         if fam in s: h["hint_family"] = h["hint_family"] or fam
     if "tim" in s and "schwarz" in s: h["hint_color"]="weiss"
     if "mia" in s and "gold" in s:    h["hint_color"]="schwarz"
@@ -435,7 +478,7 @@ def _fallback_col_by_index(df: pd.DataFrame, idx0: int) -> str|None:
 
 def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
     df = normalize_cols(df)
-    col_art   = find_column(df, ARTNR_CANDIDATES,   "Artikelnummer", required=False)
+    col_art   = find_column(df, ARTNR_CANDIDATES,   "Artikelnummer/Hersteller-Nr.", required=False)
     col_ean   = find_column(df, EAN_CANDIDATES,     "EAN/GTIN",      required=False)
     col_name  = find_column(df, NAME_CANDIDATES_SO, "Bezeichnung",   required=False)
     col_sales = find_column(df, SALES_QTY_CANDIDATES, "Verkaufsmenge", required=True)
@@ -452,7 +495,7 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
 
     out = pd.DataFrame()
     out["ArtikelNr"]       = df[col_art].astype(str) if col_art else ""
-    out["ArtikelNr_key"]   = out["ArtikelNr"].map(normalize_key)
+    out["ArtikelNr_key"]   = out["ArtikelNr"].map(normalize_artnr_key)
     out["EAN"]             = df[col_ean].astype(str) if col_ean else ""
     out["EAN_key"]         = out["EAN"].map(lambda x: re.sub(r"[^0-9]+","",str(x)))
     out["Bezeichnung"]     = df[col_name].astype(str) if col_name else ""
@@ -593,26 +636,29 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
             if f and f in fam_map.index: _assign_from_price_row(merged,i, fam_map.loc[f])
     _final_backstops(merged, price_df)
 
-    # Strings säubern
+    # Strings & Farbe standardisieren
     for df in (merged, stock_merged):
         df["Kategorie"] = (
-            df["Kategorie"].fillna("")
+            df.get("Kategorie","").fillna("")
               .astype(str)
               .replace({"nan":"", "NaN":"", "None":""})
               .str.strip()
         )
-        df["Bezeichnung"] = df["Bezeichnung"].fillna("")
-        df["Farbe"]       = df.get("Farbe","").fillna("")
+        df["Bezeichnung"] = df.get("Bezeichnung","").fillna("").astype(str)
+        # Farbe: falls leer → aus Name extrahieren
+        f = df.get("Farbe","").fillna("").astype(str)
+        empty_mask = f.str.strip().eq("")
+        if empty_mask.any():
+            f.loc[empty_mask] = df.loc[empty_mask,"Bezeichnung"].map(extract_color_from_name).fillna("").astype(str)
+        df["Farbe"] = f
 
-    # Anzeige-Bezeichnung: IMMER Farbe anhängen, wenn sie wie eine Farbe aussieht
-    merged["Bezeichnung_anzeige"] = merged["Bezeichnung"]
-    def _looks_like_not_a_color2(token: str) -> bool:
-        t = (token or "").strip().lower()
-        return (not t) or (t in {"eu","ch","us","uk"}) or any(x in t for x in ["ml","db","m²","m2"]) or bool(re.search(r"\d", t))
-    valid_color = merged["Farbe"].astype(str).str.strip().map(lambda t: (t != "") and (not _looks_like_not_a_color2(t)))
-    merged.loc[valid_color, "Bezeichnung_anzeige"] = (
-        merged.loc[valid_color, "Bezeichnung"] + " – " + merged.loc[valid_color, "Farbe"].astype(str).str.strip()
-    )
+    merged["Farbe_std"] = merged["Farbe"].map(_as_color_or_empty)
+
+    # Anzeige-Bezeichnung: IMMER BaseName + " – Farbe" (wenn Farbe erkannt)
+    merged["BaseName"] = merged["Bezeichnung"].map(to_base_name)
+    merged["Bezeichnung_anzeige"] = merged["BaseName"]
+    has_color = merged["Farbe_std"].ne("")
+    merged.loc[has_color, "Bezeichnung_anzeige"] = merged.loc[has_color, "BaseName"] + " – " + merged.loc[has_color, "Farbe_std"]
 
     # Umsatz-Werte
     q_buy,p_buy   = sanitize_numbers(merged["Einkaufsmenge"], merged["Einkaufspreis"])
@@ -674,92 +720,24 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
     )
     merged["Lagerwert_latest"] = safe_mul(merged["Lagermenge_latest"], merged["Verkaufspreis_latest"])
 
-    # ========= Gruppierung / Anzeige-Regeln =========
-    # - O-014 / O-015 IMMER separat (per ArtikelNr_key)
-    # - Farben IMMER separat (Name + " – Farbe")
-    # - Sonst nach (Name, Farbe) zusammenfassen
-    ak   = merged["ArtikelNr_key"].astype(str).str.lower().fillna("")
-    is_special = ak.isin(SPECIAL_SEPARATE_KEYS)
-    namek = merged["Bezeichnung"].map(normalize_key)
-    colk  = merged["Farbe"].astype(str).map(normalize_key)
-    merged["__grp"] = np.where(is_special, "SKU:" + ak, "N:" + namek + "|C:" + colk)
-
-    # Tabellen (2-stufige Aggregation):
-    # 1) pro (Gruppe, SKU) zusammenfassen – Lager via MAX (letzter Stand je SKU),
-    #    Werte (Einkauf/Verkauf) summieren
-    lvl1 = (
-        merged.groupby(
-            ["__grp", "ArtikelNr_key", "ArtikelNr", "Bezeichnung_anzeige", "Kategorie"],
-            dropna=False, as_index=False
-        ).agg({
-            "Einkaufsmenge": "sum",
-            "Einkaufswert":  "sum",
-            "Verkaufsmenge": "sum",
-            "Verkaufswert":  "sum",
-            "Lagermenge_latest": "max",
-            "Lagerwert_latest":  "max",
-        })
-    )
-
-    # 2) auf Gruppenebene aggregieren – Lager SUM (Summe der letzten Stände über alle SKUs der Gruppe)
-    totals = (
-        lvl1.groupby(["__grp"], as_index=False)
-            .agg({
-                "Einkaufsmenge": "sum",
-                "Einkaufswert":  "sum",
-                "Verkaufsmenge": "sum",
-                "Verkaufswert":  "sum",
-                "Lagermenge_latest": "sum",
-                "Lagerwert_latest":  "sum",
-            })
-    )
-
-    # Anzeige-Felder (Bezeichnung/Kategorie) je Gruppe sinnvoll wählen
-    def _mode_nonempty(s: pd.Series) -> str:
-        s = s.dropna().astype(str).str.strip()
-        if s.empty: return ""
-        try: return s.mode().iloc[0]
-        except Exception: return s.iloc[0] if len(s) else ""
-
-    disp = (
-        lvl1.groupby("__grp", as_index=False)
-            .agg({
-                "Bezeichnung_anzeige": _mode_nonempty,
-                "Kategorie": _mode_nonempty,
-            })
-    )
-
-    # ArtikelNr je Gruppe für Anzeige zusammenführen (bei O-014/O-015 ist es ohnehin nur 1)
-    art_join = (
-        lvl1.groupby("__grp")["ArtikelNr"]
-            .apply(lambda s: ", ".join(sorted({str(x) for x in s if str(x).strip()})))
-            .reset_index(name="ArtikelNr")
-    )
-
-    totals = (totals
-              .merge(disp, on="__grp", how="left")
-              .merge(art_join, on="__grp", how="left"))
-
-    # Spalten passend benennen / Reihenfolge
-    totals = totals.rename(columns={
-        "Lagermenge_latest": "Lagermenge",
-        "Lagerwert_latest":  "Lagerwert",
-    })
-    totals = totals[[
-        "ArtikelNr", "Bezeichnung_anzeige", "Kategorie",
-        "Einkaufsmenge","Einkaufswert","Verkaufsmenge","Verkaufswert",
-        "Lagermenge","Lagerwert"
-    ]]
-
-    # Detailtabelle wie gehabt (eine Zeile pro Quellzeile, Lager ist bereits "latest")
-    detail = merged[[
-        "ArtikelNr","Bezeichnung_anzeige","Kategorie",
-        "Einkaufsmenge","Einkaufswert","Verkaufsmenge","Verkaufswert"
-    ]].copy()
+    # Tabellen
+    # Detail enthält jede Zeile (ArtNr separat sichtbar)
+    detail = merged[["ArtikelNr","Bezeichnung_anzeige","Kategorie",
+                     "Einkaufsmenge","Einkaufswert","Verkaufsmenge","Verkaufswert"]].copy()
     detail["Lagermenge"] = merged["Lagermenge_latest"]
     detail["Lagerwert"]  = merged["Lagerwert_latest"]
 
-    # Datenquelle fürs Wochen-Chart
+    # Summen: nach Name+Farbe (Bezeichnung_anzeige) und Kategorie — NICHT nach ArtikelNr
+    totals = (detail.groupby(["Bezeichnung_anzeige","Kategorie"], dropna=False, as_index=False)
+                  .agg({
+                      "Einkaufsmenge":"sum",
+                      "Einkaufswert":"sum",
+                      "Verkaufsmenge":"sum",
+                      "Verkaufswert":"sum",
+                      "Lagermenge":"max",
+                      "Lagerwert":"max"
+                  }))
+
     ts_source = pd.DataFrame()
     if "StartDatum" in merged.columns:
         ts_source = merged[["StartDatum","Kategorie","Verkaufswert"]].copy()
@@ -767,7 +745,7 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
         ts_source = ts_source[ts_source["Kategorie"] != ""]
         ts_source.rename(columns={"Verkaufswert":"Verkaufswert (CHF)"}, inplace=True)
 
-    merged.drop(columns=["_rowdate","_grpkey","__grp"], errors="ignore", inplace=True)
+    merged.drop(columns=["_rowdate","_grpkey"], errors="ignore", inplace=True)
     return detail, totals, ts_source
 
 # =========================
@@ -1004,7 +982,7 @@ if (raw_sell is not None) and (raw_price is not None):
             d_rounded, d_styler = style_numeric(detail_display)
             st.dataframe(d_styler, use_container_width=True)
 
-        st.subheader("Summen pro Artikel")
+        st.subheader("Summen (nach Name + Farbe)")
         totals_renamed = totals.rename(columns={
             "Einkaufswert":"Einkaufswert (CHF)",
             "Verkaufswert":"Verkaufswert (CHF)",
