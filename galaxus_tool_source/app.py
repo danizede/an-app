@@ -532,7 +532,8 @@ def _family_variant_filter(price_df: pd.DataFrame, family: str, variant: str):
     """Filtert Preislisten-Kandidaten nach Familie + Variante-Präferenz (little/mobile/...)."""
     if not family:
         return price_df
-    grp = price_df.loc[price_df["Familie"]==family]
+
+    grp = price_df.loc[price_df["Familie"] == family]
     if grp.empty:
         grp = price_df.loc[price_df["Familie"].str.contains(re.escape(family), na=False)]
     if grp.empty:
@@ -545,34 +546,41 @@ def _family_variant_filter(price_df: pd.DataFrame, family: str, variant: str):
         if not grp_var.empty:
             grp = grp_var
         else:
-            # wenn klare Negativ-Variante existiert, entferne sie (z.B. mobile NICHT in 'finn' Fall)
+            # wenn klare Negativ-Variante existiert, entferne sie
             neg = grp.loc[~grp["Bezeichnung"].str.contains(variant, case=False, na=False)]
             if not neg.empty:
                 grp = neg
 
-    # Spezifische Regeln:
-    # - Finn mobile → vermeide "Finn" ohne mobile
+    # Spezifische Regeln
+    # - Finn mobile → nur mobile
     if re.search(r"\bfinn\b", family, flags=re.I) and variant == "mobile":
         grp2 = grp.loc[grp["Bezeichnung"].str.contains("mobile", case=False, na=False)]
-        if not grp2.empty: grp = grp2
+        if not grp2.empty:
+            grp = grp2
     # - Finn (ohne mobile) → vermeide mobile
     if re.search(r"\bfinn\b", family, flags=re.I) and (variant == "" or variant is None):
         grp2 = grp.loc[~grp["Bezeichnung"].str.contains("mobile", case=False, na=False)]
-        if not grp2.empty: grp = grp2
+        if not grp2.empty:
+            grp = grp2
     # - Albert little → nur little
     if re.search(r"\balbert\b", family, flags=re.I) and variant == "little":
         grp2 = grp.loc[grp["Bezeichnung"].str.contains("little", case=False, na=False)]
-        if not grp2.empty: grp = grp2
-    # - Albert (ohne little)
-if re.search(r"\balbert\b", family, flags=re.I) and (variant == "" or variant is None):
+        if not grp2.empty:
+            grp = grp2
+    # - Albert (ohne little) → vermeide little
+    if re.search(r"\balbert\b", family, flags=re.I) and (variant == "" or variant is None):
         grp2 = grp.loc[~grp["Bezeichnung"].str.contains("little", case=False, na=False)]
-        if not grp2.empty: grp = grp2
-    # - Theo: bevorzugt Einträge mit ArtikelNr beginnt mit 'T'
+        if not grp2.empty:
+            grp = grp2
+
+    # - Theo: bevorzugt ArtikelNr die mit 'T' beginnen
     grp_sorted = grp.copy()
     if "ArtikelNr" in grp.columns:
         grp_sorted["_tprio"] = grp["ArtikelNr"].astype(str).str.upper().str.startswith("T").astype(int)
         grp_sorted = grp_sorted.sort_values(["_tprio"], ascending=False).drop(columns=["_tprio"], errors="ignore")
+
     return grp_sorted
+
 
 def _apply_equivalences(hint_art_exact: str, hint_art_pref: str):
     if hint_art_exact:
