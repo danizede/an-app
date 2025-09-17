@@ -258,12 +258,24 @@ def parse_date_series_us(s: pd.Series) -> pd.Series:
 MAX_QTY, MAX_PRICE = 1_000_000, 1_000_000  # harte Deckelung gegen Ausreißer
 
 def sanitize_numbers(qty: pd.Series, price: pd.Series) -> tuple[pd.Series, pd.Series]:
-    """Zahlen robust einlesen + vorclippen (verhindert Inf/Overflow schon vor dem Produkt)."""
+    """Robust einlesen und als Pandas-Serien (nicht ndarrays) zurückgeben."""
     q = pd.to_numeric(qty, errors="coerce").astype("float64")
     p = pd.to_numeric(price, errors="coerce").astype("float64")
-    q = np.clip(np.nan_to_num(q, nan=0.0, posinf=MAX_QTY, neginf=0.0), 0.0, MAX_QTY)
-    p = np.clip(np.nan_to_num(p, nan=0.0, posinf=MAX_PRICE, neginf=0.0), 0.0, MAX_PRICE)
+
+    q_vals = np.clip(
+        np.nan_to_num(q.to_numpy(), nan=0.0, posinf=MAX_QTY, neginf=0.0),
+        0.0, MAX_QTY
+    )
+    p_vals = np.clip(
+        np.nan_to_num(p.to_numpy(), nan=0.0, posinf=MAX_PRICE, neginf=0.0),
+        0.0, MAX_PRICE
+    )
+
+    # zurück in Series (damit .fillna etc. funktionieren)
+    q = pd.Series(q_vals, index=q.index)
+    p = pd.Series(p_vals, index=p.index)
     return q, p
+
 
 def safe_mul(a: pd.Series, b: pd.Series, max_a=MAX_QTY, max_b=MAX_PRICE) -> pd.Series:
     """
