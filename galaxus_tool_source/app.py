@@ -691,14 +691,23 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
     _final_backstops(merged, price_df)
 
     # Interne Artikelnummer/Kategorie/Bezeichnung/Farbe aus Preisliste bevorzugen (Anzeige/Key)
-    for col_pl in ["ArtikelNr_pl","Kategorie_pl","Bezeichnung_pl","Farbe_pl","ArtikelNr_key_pl"]:
-        if col_pl in merged.columns:
-            pass
-    merged["ArtikelNr"] = merged["ArtikelNr"].combine_first(merged.get("ArtikelNr_pl"))
-    merged["ArtikelNr_key"] = merged["ArtikelNr_key"].combine_first(merged.get("ArtikelNr_key_pl"))
-    merged["Kategorie"] = merged.get("Kategorie_pl", merged.get("Kategorie","")).fillna(merged.get("Kategorie",""))
-    merged["Farbe"] = merged.get("Farbe_pl", merged.get("Farbe","")).fillna(merged.get("Farbe",""))
-    merged["Bezeichnung"] = merged.get("Bezeichnung_pl", merged.get("Bezeichnung","")).fillna(merged.get("Bezeichnung",""))
+    # --- SAFE COALESCE OHNE None ---
+    # Stelle sicher, dass Basis-Spalten existieren
+    for base in ["ArtikelNr", "ArtikelNr_key", "Kategorie", "Farbe", "Bezeichnung"]:
+        if base not in merged.columns:
+            merged[base] = pd.Series([np.nan] * len(merged))
+
+    def _coalesce_cols(df: pd.DataFrame, base: str, pl: str):
+        """Nimmt Werte aus df[pl], falls df[base] leer/NaN ist. Greift nur, wenn pl existiert."""
+        if pl in df.columns:
+            df[base] = df[base].combine_first(df[pl])
+
+    _coalesce_cols(merged, "ArtikelNr",       "ArtikelNr_pl")
+    _coalesce_cols(merged, "ArtikelNr_key",   "ArtikelNr_key_pl")
+    _coalesce_cols(merged, "Kategorie",       "Kategorie_pl")
+    _coalesce_cols(merged, "Farbe",           "Farbe_pl")
+    _coalesce_cols(merged, "Bezeichnung",     "Bezeichnung_pl")
+
 
     # Strings
     for df in (merged, stock_merged):
