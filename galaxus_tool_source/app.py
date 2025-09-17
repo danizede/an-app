@@ -8,6 +8,7 @@
 # - Kategorie primär aus Spalte G; leere/NaN-Kategorien bleiben leer und erscheinen nicht im Chart
 # - Summenzeile Σ Gesamt – Währungsangaben in Spaltennamen (CHF)
 # - 🔐 Login via st.secrets [auth]/Root/Env (kein bcrypt nötig)
+# - Spezialregeln: Finn vs Finn mobile getrennt; O-014/O-015 nie zusammenführen; Farben immer separat, sonst Name+Farbe zusammenfassen
 
 import os
 import io
@@ -270,6 +271,9 @@ _COLOR_MAP = {
 _COLOR_WORDS = set(_COLOR_MAP.keys()) | set(map(str.lower, _COLOR_MAP.values()))
 _STOP_TOKENS = {"eu","ch","us","uk","mobile","little","bundle","set","kit"}
 
+# ======= Sonder-SKUs, die nie zusammengeführt werden =======
+SPECIAL_SEPARATE_KEYS = {"o014", "o015"}  # (ArtikelNr_key in Kleinbuchstaben)
+
 def _looks_like_not_a_color(token: str) -> bool:
     t = (token or "").strip().lower()
     return (not t) or (t in {"eu","ch","us","uk"}) or any(x in t for x in ["ml","db","m²","m2"]) or bool(re.search(r"\d", t))
@@ -297,7 +301,6 @@ def make_family_key(name: str) -> str:
             if ((t not in _STOP_TOKENS) or (t in keep)) 
             and (t not in _COLOR_WORDS)]
     return "".join(toks[:2]) if toks else ""
-
 
 def extract_color_from_name(name: str) -> str:
     if not isinstance(name, str): return ""
@@ -409,7 +412,11 @@ def _apply_hints_to_row(name_raw: str) -> dict:
     s = (name_raw or "").lower()
     h = {"hint_family":"","hint_color":"","hint_art_exact":"","hint_art_prefix":""}
     for fam in ["finn mobile","charly little","duftöl","duftoel","duft oil"]:
-        if fam in s: h["hint_family"] = "finn" if fam=="finn mobile" else ("charly" if "charly" in fam else "duftol")
+        if fam in s:
+            if fam == "finn mobile":
+                h["hint_family"] = "finnmobile"
+            else:
+                h["hint_family"] = "charly" if "charly" in fam else "duftol"
     for fam in ["finn","theo","robert","peter","julia","albert","roger","mia","simon","otto","oskar","tim","charly"]:
         if fam in s: h["hint_family"] = h["hint_family"] or fam
     if "tim" in s and "schwarz" in s: h["hint_color"]="weiss"
@@ -597,14 +604,15 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
         df["Bezeichnung"] = df["Bezeichnung"].fillna("")
         df["Farbe"]       = df.get("Farbe","").fillna("")
 
-    # Anzeige-Bezeichnung (bei Duplikaten Farbe anhängen)
+    # Anzeige-Bezeichnung: IMMER Farbe anhängen, wenn sie wie eine Farbe aussieht
     merged["Bezeichnung_anzeige"] = merged["Bezeichnung"]
     def _looks_like_not_a_color2(token: str) -> bool:
-        t=(token or "").strip().lower()
-        return (not t) or (t in {"eu","ch","us","uk"}) or any(x in t for x in ["ml","db","m²","m2"]) or bool(re.search(r"\d",t))
-    dup = merged.duplicated(subset=["Bezeichnung"], keep=False)
-    valid_color = merged["Farbe"].astype(str).str.strip().map(lambda t: (t!="") and (not _looks_like_not_a_color2(t)))
-    merged.loc[dup & valid_color, "Bezeichnung_anzeige"] = merged.loc[dup & valid_color,"Bezeichnung"] + " – " + merged.loc[dup & valid_color,"Farbe"].astype(str).str.strip()
+        t = (token or "").strip().lower()
+        return (not t) or (t in {"eu","ch","us","uk"}) or any(x in t for x in ["ml","db","m²","m2"]) or bool(re.search(r"\d", t))
+    valid_color = merged["Farbe"].astype(str).str.strip().map(lambda t: (t != "") and (not _looks_like_not_a_color2(t)))
+    merged.loc[valid_color, "Bezeichnung_anzeige"] = (
+        merged.loc[valid_color, "Bezeichnung"] + " – " + merged.loc[valid_color, "Farbe"].astype(str).str.strip()
+    )
 
     # Umsatz-Werte
     q_buy,p_buy   = sanitize_numbers(merged["Einkaufsmenge"], merged["Einkaufspreis"])
@@ -666,22 +674,92 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
     )
     merged["Lagerwert_latest"] = safe_mul(merged["Lagermenge_latest"], merged["Verkaufspreis_latest"])
 
-    # Tabellen
-    detail = merged[["ArtikelNr","Bezeichnung_anzeige","Kategorie",
-                     "Einkaufsmenge","Einkaufswert","Verkaufsmenge","Verkaufswert"]].copy()
+    # ========= Gruppierung / Anzeige-Regeln =========
+    # - O-014 / O-015 IMMER separat (per ArtikelNr_key)
+    # - Farben IMMER separat (Name + " – Farbe")
+    # - Sonst nach (Name, Farbe) zusammenfassen
+    ak   = merged["ArtikelNr_key"].astype(str).str.lower().fillna("")
+    is_special = ak.isin(SPECIAL_SEPARATE_KEYS)
+    namek = merged["Bezeichnung"].map(normalize_key)
+    colk  = merged["Farbe"].astype(str).map(normalize_key)
+    merged["__grp"] = np.where(is_special, "SKU:" + ak, "N:" + namek + "|C:" + colk)
+
+    # Tabellen (2-stufige Aggregation):
+    # 1) pro (Gruppe, SKU) zusammenfassen – Lager via MAX (letzter Stand je SKU),
+    #    Werte (Einkauf/Verkauf) summieren
+    lvl1 = (
+        merged.groupby(
+            ["__grp", "ArtikelNr_key", "ArtikelNr", "Bezeichnung_anzeige", "Kategorie"],
+            dropna=False, as_index=False
+        ).agg({
+            "Einkaufsmenge": "sum",
+            "Einkaufswert":  "sum",
+            "Verkaufsmenge": "sum",
+            "Verkaufswert":  "sum",
+            "Lagermenge_latest": "max",
+            "Lagerwert_latest":  "max",
+        })
+    )
+
+    # 2) auf Gruppenebene aggregieren – Lager SUM (Summe der letzten Stände über alle SKUs der Gruppe)
+    totals = (
+        lvl1.groupby(["__grp"], as_index=False)
+            .agg({
+                "Einkaufsmenge": "sum",
+                "Einkaufswert":  "sum",
+                "Verkaufsmenge": "sum",
+                "Verkaufswert":  "sum",
+                "Lagermenge_latest": "sum",
+                "Lagerwert_latest":  "sum",
+            })
+    )
+
+    # Anzeige-Felder (Bezeichnung/Kategorie) je Gruppe sinnvoll wählen
+    def _mode_nonempty(s: pd.Series) -> str:
+        s = s.dropna().astype(str).str.strip()
+        if s.empty: return ""
+        try: return s.mode().iloc[0]
+        except Exception: return s.iloc[0] if len(s) else ""
+
+    disp = (
+        lvl1.groupby("__grp", as_index=False)
+            .agg({
+                "Bezeichnung_anzeige": _mode_nonempty,
+                "Kategorie": _mode_nonempty,
+            })
+    )
+
+    # ArtikelNr je Gruppe für Anzeige zusammenführen (bei O-014/O-015 ist es ohnehin nur 1)
+    art_join = (
+        lvl1.groupby("__grp")["ArtikelNr"]
+            .apply(lambda s: ", ".join(sorted({str(x) for x in s if str(x).strip()})))
+            .reset_index(name="ArtikelNr")
+    )
+
+    totals = (totals
+              .merge(disp, on="__grp", how="left")
+              .merge(art_join, on="__grp", how="left"))
+
+    # Spalten passend benennen / Reihenfolge
+    totals = totals.rename(columns={
+        "Lagermenge_latest": "Lagermenge",
+        "Lagerwert_latest":  "Lagerwert",
+    })
+    totals = totals[[
+        "ArtikelNr", "Bezeichnung_anzeige", "Kategorie",
+        "Einkaufsmenge","Einkaufswert","Verkaufsmenge","Verkaufswert",
+        "Lagermenge","Lagerwert"
+    ]]
+
+    # Detailtabelle wie gehabt (eine Zeile pro Quellzeile, Lager ist bereits "latest")
+    detail = merged[[
+        "ArtikelNr","Bezeichnung_anzeige","Kategorie",
+        "Einkaufsmenge","Einkaufswert","Verkaufsmenge","Verkaufswert"
+    ]].copy()
     detail["Lagermenge"] = merged["Lagermenge_latest"]
     detail["Lagerwert"]  = merged["Lagerwert_latest"]
 
-    totals = (detail.groupby(["ArtikelNr","Bezeichnung_anzeige","Kategorie"], dropna=False, as_index=False)
-                  .agg({
-                      "Einkaufsmenge":"sum",
-                      "Einkaufswert":"sum",
-                      "Verkaufsmenge":"sum",
-                      "Verkaufswert":"sum",
-                      "Lagermenge":"max",
-                      "Lagerwert":"max"
-                  }))
-
+    # Datenquelle fürs Wochen-Chart
     ts_source = pd.DataFrame()
     if "StartDatum" in merged.columns:
         ts_source = merged[["StartDatum","Kategorie","Verkaufswert"]].copy()
@@ -689,7 +767,7 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
         ts_source = ts_source[ts_source["Kategorie"] != ""]
         ts_source.rename(columns={"Verkaufswert":"Verkaufswert (CHF)"}, inplace=True)
 
-    merged.drop(columns=["_rowdate","_grpkey"], errors="ignore", inplace=True)
+    merged.drop(columns=["_rowdate","_grpkey","__grp"], errors="ignore", inplace=True)
     return detail, totals, ts_source
 
 # =========================
