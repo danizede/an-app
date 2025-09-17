@@ -280,12 +280,24 @@ def _strip_parens_units(name: str) -> str:
     return s
 
 def make_family_key(name: str) -> str:
-    if not isinstance(name, str): return ""
+    if not isinstance(name, str): 
+        return ""
     s = _strip_parens_units(name.lower())
     s = re.sub(r"\b[o0]-\d+\b", " ", s)
     s = re.sub(r"[^a-z0-9]+", " ", s)
-    toks = [t for t in s.split() if t and (t not in _STOP_TOKENS) and (t not in _COLOR_WORDS)]
+
+    raw = [t for t in s.split() if t]
+
+    # Sonderregel: 'finn mobile' soll nicht zu 'finn' zusammenschrumpfen
+    keep = set()
+    if "finn" in raw and "mobile" in raw:
+        keep.add("mobile")
+
+    toks = [t for t in raw 
+            if ((t not in _STOP_TOKENS) or (t in keep)) 
+            and (t not in _COLOR_WORDS)]
     return "".join(toks[:2]) if toks else ""
+
 
 def extract_color_from_name(name: str) -> str:
     if not isinstance(name, str): return ""
