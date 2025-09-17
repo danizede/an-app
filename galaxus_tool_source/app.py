@@ -564,7 +564,7 @@ def _family_variant_filter(price_df: pd.DataFrame, family: str, variant: str):
         grp2 = grp.loc[grp["Bezeichnung"].str.contains("little", case=False, na=False)]
         if not grp2.empty: grp = grp2
     # - Albert (ohne little)
-    if re.search(r"\balbert\b", family, flags=re.I) and (variant == "" oder variant is None):
+if re.search(r"\balbert\b", family, flags=re.I) and (variant == "" or variant is None):
         grp2 = grp.loc[~grp["Bezeichnung"].str.contains("little", case=False, na=False)]
         if not grp2.empty: grp = grp2
     # - Theo: bevorzugt Einträge mit ArtikelNr beginnt mit 'T'
@@ -874,10 +874,10 @@ st.title("Galaxus Sellout Analyse")
 c1, c2 = st.columns(2)
 with c1:
     st.subheader("Sell-out-Report (.xlsx)")
-    sell_file = st.file_uploader("Drag & drop oder Datei wählen", type=["xlsx"], key="sell")
+    sell_file = st.file_uploader("Drag & drop or Datei wählen", type=["xlsx"], key="sell")
 with c2:
     st.subheader("Preisliste (.xlsx)")
-    price_file = st.file_uploader("Drag & drop oder Datei wählen", type=["xlsx"], key="price")
+    price_file = st.file_uploader("Drag & drop or Datei wählen", type=["xlsx"], key="price")
 
 # Auto-Load + Fallback
 raw_sell = None
@@ -962,7 +962,7 @@ if (raw_sell is not None) and (raw_price is not None):
             end_snapped   = end_date + timedelta(days=(6 - end_date.weekday()))      # Sonntag
             st.session_state["date_range"] = (start_snapped, end_snapped)
 
-            if (start_snapped != start_date) oder (end_snapped != end_date):
+            if (start_snapped != start_date) or (end_snapped != end_date):
                 st.caption(f"📅 Auswahl auf ganze Wochen erweitert: {start_snapped.strftime('%d.%m.%Y')} – {end_snapped.strftime('%d.%m.%Y')}")
 
             sdt = sell_df["StartDatum"].dt.date
@@ -1100,5 +1100,5 @@ if (raw_sell is not None) and (raw_price is not None):
     except Exception as e:
         st.error(f"Unerwarteter Fehler: {e}")
 else:
-    st.info("Bitte beide Dateien hochladen oder in den Ordner `data/` legen. "
+    st.info("Bitte beide Dateien hochladen or in den Ordner `data/` legen. "
             "Es werden zuerst `sellout.xlsx`/`preisliste.xlsx` geladen, sonst Auto-Erkennung.")
