@@ -215,59 +215,23 @@ def find_column(df: pd.DataFrame, candidates, purpose: str, required=True):
         raise KeyError(f"Spalte für «{purpose}» fehlt – gesucht unter {candidates}.\nVerfügbare Spalten: {cols}")
     return None
 
-# === PATCH: robuste Parser (fix für "NoneType has no attribute 'dtype') ===
-def parse_number_series(s) -> pd.Series:
-    """Robust gegen None / Listen / gemischte Typen; gibt float-Serie zurück."""
-    if s is None:
-        return pd.Series(dtype="float64")
-    if not isinstance(s, pd.Series):
-        try:
-            s = pd.Series(s)
-        except Exception:
-            return pd.Series(dtype="float64")
-    # bereits numerisch?
-    try:
-        if getattr(s, "dtype", None) is not None and getattr(s.dtype, "kind", "") in ("i", "u", "f"):
-            return pd.to_numeric(s, errors="coerce")
-    except Exception:
-        pass
-
+def parse_number_series(s: pd.Series) -> pd.Series:
+    if s.dtype.kind in ("i","u","f"): return s
     def _clean(x):
-        if pd.isna(x): 
-            return np.nan
-        x = str(x).strip().replace("’","").replace("'","").replace(" ","").replace(",", ".")
+        if pd.isna(x): return np.nan
+        x = str(x).strip().replace("’","").replace("'","").replace(" ","").replace(",",".")
         if x.count(".") > 1:
-            parts = x.split(".")
-            x = "".join(parts[:-1]) + "." + parts[-1]
-        try:
-            return float(x)
-        except Exception:
-            return np.nan
-
+            parts = x.split("."); x = "".join(parts[:-1]) + "." + parts[-1]
+        try: return float(x)
+        except Exception: return np.nan
     return s.map(_clean)
 
-def parse_date_series_us(s) -> pd.Series:
-    """Robust gegen None / gemischte Typen (Text, Excel-Serial, bereits Datetime)."""
-    if s is None:
-        return pd.Series([pd.NaT])
-    if not isinstance(s, pd.Series):
-        try:
-            s = pd.Series(s)
-        except Exception:
-            return pd.Series([pd.NaT])
-
-    try:
-        if getattr(s, "dtype", None) is not None and np.issubdtype(s.dtype, np.datetime64):
-            return pd.to_datetime(s, errors="coerce")
-    except Exception:
-        pass
-
-    dt1  = pd.to_datetime(s, errors="coerce", dayfirst=False, infer_datetime_format=True)
+def parse_date_series_us(s: pd.Series) -> pd.Series:
+    if np.issubdtype(s.dtype, np.datetime64): return s
+    dt1 = pd.to_datetime(s, errors="coerce", dayfirst=False, infer_datetime_format=True)
     nums = pd.to_numeric(s, errors="coerce")
-    dt2  = pd.to_datetime(nums, origin="1899-12-30", unit="d", errors="coerce")
+    dt2 = pd.to_datetime(nums, origin="1899-12-30", unit="d", errors="coerce")
     return dt1.combine_first(dt2)
-# === END PATCH ===
-
 
 MAX_QTY, MAX_PRICE = 1_000_000, 1_000_000
 
@@ -600,7 +564,7 @@ def _family_variant_filter(price_df: pd.DataFrame, family: str, variant: str):
         grp2 = grp.loc[grp["Bezeichnung"].str.contains("little", case=False, na=False)]
         if not grp2.empty: grp = grp2
     # - Albert (ohne little)
-    if re.search(r"\balbert\b", family, flags=re.I) and (variant == "" or variant is None):
+    if re.search(r"\balbert\b", family, flags=re.I) and (variant == "" oder variant is None):
         grp2 = grp.loc[~grp["Bezeichnung"].str.contains("little", case=False, na=False)]
         if not grp2.empty: grp = grp2
     # - Theo: bevorzugt Einträge mit ArtikelNr beginnt mit 'T'
@@ -691,23 +655,14 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
     _final_backstops(merged, price_df)
 
     # Interne Artikelnummer/Kategorie/Bezeichnung/Farbe aus Preisliste bevorzugen (Anzeige/Key)
-    # --- SAFE COALESCE OHNE None ---
-    # Stelle sicher, dass Basis-Spalten existieren
-    for base in ["ArtikelNr", "ArtikelNr_key", "Kategorie", "Farbe", "Bezeichnung"]:
-        if base not in merged.columns:
-            merged[base] = pd.Series([np.nan] * len(merged))
-
-    def _coalesce_cols(df: pd.DataFrame, base: str, pl: str):
-        """Nimmt Werte aus df[pl], falls df[base] leer/NaN ist. Greift nur, wenn pl existiert."""
-        if pl in df.columns:
-            df[base] = df[base].combine_first(df[pl])
-
-    _coalesce_cols(merged, "ArtikelNr",       "ArtikelNr_pl")
-    _coalesce_cols(merged, "ArtikelNr_key",   "ArtikelNr_key_pl")
-    _coalesce_cols(merged, "Kategorie",       "Kategorie_pl")
-    _coalesce_cols(merged, "Farbe",           "Farbe_pl")
-    _coalesce_cols(merged, "Bezeichnung",     "Bezeichnung_pl")
-
+    for col_pl in ["ArtikelNr_pl","Kategorie_pl","Bezeichnung_pl","Farbe_pl","ArtikelNr_key_pl"]:
+        if col_pl in merged.columns:
+            pass
+    merged["ArtikelNr"] = merged["ArtikelNr"].combine_first(merged.get("ArtikelNr_pl"))
+    merged["ArtikelNr_key"] = merged["ArtikelNr_key"].combine_first(merged.get("ArtikelNr_key_pl"))
+    merged["Kategorie"] = merged.get("Kategorie_pl", merged.get("Kategorie","")).fillna(merged.get("Kategorie",""))
+    merged["Farbe"] = merged.get("Farbe_pl", merged.get("Farbe","")).fillna(merged.get("Farbe",""))
+    merged["Bezeichnung"] = merged.get("Bezeichnung_pl", merged.get("Bezeichnung","")).fillna(merged.get("Bezeichnung",""))
 
     # Strings
     for df in (merged, stock_merged):
@@ -1007,7 +962,7 @@ if (raw_sell is not None) and (raw_price is not None):
             end_snapped   = end_date + timedelta(days=(6 - end_date.weekday()))      # Sonntag
             st.session_state["date_range"] = (start_snapped, end_snapped)
 
-            if (start_snapped != start_date) or (end_snapped != end_date):
+            if (start_snapped != start_date) oder (end_snapped != end_date):
                 st.caption(f"📅 Auswahl auf ganze Wochen erweitert: {start_snapped.strftime('%d.%m.%Y')} – {end_snapped.strftime('%d.%m.%Y')}")
 
             sdt = sell_df["StartDatum"].dt.date
