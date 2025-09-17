@@ -254,21 +254,41 @@ def parse_date_series_us(s: pd.Series) -> pd.Series:
     dt2 = pd.to_datetime(nums, origin="1899-12-30", unit="d", errors="coerce")
     return dt1.combine_first(dt2)
 
-MAX_QTY, MAX_PRICE = 1_000_000, 1_000_000
-def sanitize_numbers(qty: pd.Series, price: pd.Series) -> tuple[pd.Series,pd.Series]:
-    q = pd.to_numeric(qty, errors="coerce").astype("float64").clip(lower=0, upper=MAX_QTY)
-    p = pd.to_numeric(price, errors="coerce").astype("float64").clip(lower=0, upper=MAX_PRICE)
+# ===== PATCH: Overflow-sichere Zahlen + Multiplikation =====
+MAX_QTY, MAX_PRICE = 1_000_000, 1_000_000  # harte Deckelung gegen Ausreißer
+
+def sanitize_numbers(qty: pd.Series, price: pd.Series) -> tuple[pd.Series, pd.Series]:
+    """Zahlen robust einlesen + vorclippen (verhindert Inf/Overflow schon vor dem Produkt)."""
+    q = pd.to_numeric(qty, errors="coerce").astype("float64")
+    p = pd.to_numeric(price, errors="coerce").astype("float64")
+    q = np.clip(np.nan_to_num(q, nan=0.0, posinf=MAX_QTY, neginf=0.0), 0.0, MAX_QTY)
+    p = np.clip(np.nan_to_num(p, nan=0.0, posinf=MAX_PRICE, neginf=0.0), 0.0, MAX_PRICE)
     return q, p
 
 def safe_mul(a: pd.Series, b: pd.Series, max_a=MAX_QTY, max_b=MAX_PRICE) -> pd.Series:
+    """
+    Overflow-sicher multiplizieren:
+    - alles auf float64
+    - NaN/Inf -> 0
+    - vorher clippen
+    - Multiplikation in unterdrücktem Errstate
+    """
     a = pd.to_numeric(a, errors="coerce").astype("float64")
     b = pd.to_numeric(b, errors="coerce").astype("float64")
-    a = np.clip(a, 0, max_a)
-    b = np.clip(b, 0, max_b)
-    with np.errstate(all='ignore'):
-        out = np.multiply(a, b, dtype="float64")
-    out = np.where(np.isfinite(out), out, 0.0).astype("float64")
+
+    a_vals = np.nan_to_num(a.to_numpy(), nan=0.0, posinf=max_a, neginf=0.0)
+    b_vals = np.nan_to_num(b.to_numpy(), nan=0.0, posinf=max_b, neginf=0.0)
+
+    a_vals = np.clip(a_vals, 0.0, max_a)
+    b_vals = np.clip(b_vals, 0.0, max_b)
+
+    with np.errstate(over='ignore', invalid='ignore', divide='ignore', under='ignore'):
+        out = a_vals * b_vals
+
+    out = np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).astype("float64")
     return pd.Series(out, index=a.index)
+# ===== Ende PATCH =====
+
 
 # =========================
 # Farben & Familie
