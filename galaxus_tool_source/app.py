@@ -153,13 +153,26 @@ def _fmt_thousands(x, sep=THOUSANDS_SEP):
     except Exception:
         return str(x)
 
-def style_numeric(df: pd.DataFrame, num_cols=NUM_COLS_DEFAULT, sep=THOUSANDS_SEP):
+def style_numeric(df: pd.DataFrame, num_cols=NUM_COLS_DEFAULT, sep=THOUSANDS_SEP, no_sep_cols=None):
+    """
+    Formatiert numerische Spalten:
+    - rundet auf 0 Dezimalstellen und castet auf Int64
+    - verwendet Apostroph als Tausendertrennzeichen
+    - Spalten in no_sep_cols werden OHNE Tausendertrennzeichen formatiert
+    """
+    no_sep_cols = set(no_sep_cols or [])
     out = df.copy()
     present = [c for c in num_cols if c in out.columns]
     for c in present:
         out[c] = pd.to_numeric(out[c], errors="coerce").round(0).astype("Int64")
-    fmt = {c: (lambda v, s=sep: _fmt_thousands(v, s)) for c in present}
+
+    def _mkfmt(col):
+        use_sep = "" if col in no_sep_cols else sep
+        return (lambda v, s=use_sep: _fmt_thousands(v, s))
+
+    fmt = {c: _mkfmt(c) for c in present}
     return out, out.style.format(fmt)
+
 
 def append_total_row_for_display(df: pd.DataFrame) -> pd.DataFrame:
     """Σ-Gesamt ans Ende anhängen (nur UI-Anzeige)."""
