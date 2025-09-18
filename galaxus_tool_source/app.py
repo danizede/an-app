@@ -464,6 +464,9 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
     out["Bezeichnung_key"] = out["Bezeichnung"].map(normalize_key)
     out["Familie"]         = out["Bezeichnung"].map(make_family_key)
 
+    # 🔧 NEU: ST-Präfix aus ArtikelNr_key entfernen, damit ST-F-xxx zu F-xxx wird
+    out["ArtikelNr_key"] = out["ArtikelNr_key"].str.replace(r'^st','', regex=True)
+
     hints = out["Bezeichnung"].map(_apply_hints_to_row)
     out["Hint_Family"]   = hints.map(lambda h: h["hint_family"])
     out["Hint_Color"]    = hints.map(lambda h: h["hint_color"])
@@ -943,7 +946,7 @@ if (raw_sell is not None) and (raw_price is not None):
         st.subheader("Summen pro Artikel")
         totals_renamed = totals.rename(columns={
             "Einkaufswert":"Einkaufswert (CHF)",
-            "Verkaufswert":"Verkaufswert (CHF)",
+            "Verkaufswert":"Verkäufe in CHF",
             "Lagerwert":"Lagerwert (CHF)"
         })
         totals_display = append_total_row_for_display(totals_renamed)
