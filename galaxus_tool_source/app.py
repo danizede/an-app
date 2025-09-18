@@ -141,9 +141,10 @@ logout_button()
 THOUSANDS_SEP = "'"
 NUM_COLS_DEFAULT = [
     "Einkaufsmenge","Einkaufswert (CHF)",
-    "Verkaufsmenge","Verkaufswert (CHF)",
+    "Verkaufsmenge","Verkäufe in CHF",   # hier ergänzen
     "Lagermenge","Lagerwert (CHF)"
 ]
+
 
 def _fmt_thousands(x, sep=THOUSANDS_SEP):
     if pd.isna(x): return ""
@@ -950,8 +951,9 @@ if (raw_sell is not None) and (raw_price is not None):
             "Lagerwert":"Lagerwert (CHF)"
         })
         totals_display = append_total_row_for_display(totals_renamed)
-        t_rounded, t_styler = style_numeric(totals_display)
+        t_rounded, t_styler = style_numeric(totals_display, sep="")  # sep="" entfernt Tausendertrennzeichen
         st.dataframe(t_styler, use_container_width=True)
+
 
         # ------- Downloads (ohne Σ-Gesamtzeile) -------
         dl1, dl2 = st.columns(2)
