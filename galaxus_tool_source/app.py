@@ -769,7 +769,7 @@ def _pick_default_files_from_dir(folder: Path) -> tuple[io.BytesIO|None, io.Byte
 # =========================
 # UI
 # =========================
-st.title("Galaxus Sellout Analyse")
+st.title("Analyse")
 
 c1, c2 = st.columns(2)
 with c1:
