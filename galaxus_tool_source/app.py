@@ -1,4 +1,4 @@
-# app.py — Galaxus Sellout Analyse (Passcode-Login + Auto-File-Detection, Default-first, robust safe_mul)
+# app.py — Galaxus Sellout Analyse (Passcode-Login + Auto-File-Detection, Oliver-Fix + Muster-Erzwingung)
 # - Robustes Matching (ArtNr → EAN → Name → Familie → Hints → Fuzzy)
 # - EU-Datumsfilter, Detailtabelle optional
 # - Summen pro Artikel (Lagerwert = letzter verfügbarer Stand je Artikel, NICHT aufsummiert)
@@ -9,6 +9,7 @@
 # - Kategorie primär aus Spalte G; leere/NaN-Kategorien bleiben leer und erscheinen nicht im Chart
 # - Summenzeile Σ Gesamt – Währungsangaben in Spaltennamen (CHF)
 # - 🔐 Login via st.secrets [auth]/Root/Env (kein bcrypt nötig)
+# - ✅ Oliver-Fix (O-015 Schwarz, O-014 Weiss) und Sichtbarkeits-Erzwingung für ArtNr-Muster (Buchstabe[n]-3 Ziffern [+ Buchstabe])
 
 import os
 import io
@@ -252,14 +253,29 @@ def sanitize_numbers(qty: pd.Series, price: pd.Series) -> tuple[pd.Series,pd.Ser
     return q, p
 
 def safe_mul(a: pd.Series, b: pd.Series, max_a=MAX_QTY, max_b=MAX_PRICE) -> pd.Series:
+    """
+    Robuste Multiplikation:
+    - erzwingt float64
+    - NaN/±Inf werden neutralisiert
+    - Eingaben werden vorab geclippt
+    - Overflow/Invalid werden unterdrückt
+    """
     a = pd.to_numeric(a, errors="coerce").astype("float64")
     b = pd.to_numeric(b, errors="coerce").astype("float64")
+
+    # NaN/Inf -> sinnvolle Grenzwerte
     a_vals = np.nan_to_num(a.to_numpy(), nan=0.0, posinf=max_a, neginf=0.0)
     b_vals = np.nan_to_num(b.to_numpy(), nan=0.0, posinf=max_b, neginf=0.0)
+
+    # harte Limits
     a_vals = np.clip(a_vals, 0.0, max_a)
     b_vals = np.clip(b_vals, 0.0, max_b)
+
+    # Multiplikation ohne Warnungen
     with np.errstate(over='ignore', invalid='ignore', divide='ignore', under='ignore'):
         out = a_vals * b_vals
+
+    # Ergebnis säubern
     out = np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0).astype("float64")
     return pd.Series(out, index=a.index)
 
@@ -325,20 +341,24 @@ CAT_CANDIDATES  = ["Kategorie","Warengruppe","Zusatz"]
 STOCK_CANDIDATES= ["Bestand","Verfügbar","verfügbar","Verfuegbar","Lagerbestand","Lagermenge","Available"]
 COLOR_CANDIDATES= ["Farbe","Color","Colour","Variante","Variant","Farbvariante","Farbname"]
 
+# ---- Oliver & Muster Erzwingung (Preislisten-Seite) ----
 def _force_oliver_color_by_artnr(df: pd.DataFrame) -> pd.DataFrame:
-    """### OLIVER FIX (PL): setze Farbe hart nach Artikelnummer."""
+    """Setzt für O-015 / O-014 Familie/Farbe/Bezeichnung hart, falls nötig."""
     if df.empty: return df
-    art = df.get("ArtikelNr","").astype(str).str.strip()
+    art = df.get("ArtikelNr","").astype(str).str.strip().str.upper()
     art_key = df.get("ArtikelNr_key","").astype(str)
-    cond_015 = art.str.fullmatch(r"(?i)O[\s\-]?015") | art_key.str.fullmatch(r"(?i)o015")
-    cond_014 = art.str.fullmatch(r"(?i)O[\s\-]?014") | art_key.str.fullmatch(r"(?i)o014")
-    df.loc[cond_015, "Farbe"] = "Schwarz"
-    df.loc[cond_014, "Farbe"] = "Weiss"
-    # sichere Familienbezeichnung auf "oliver"
-    df.loc[cond_015 | cond_014, "Familie"] = "oliver"
-    # Falls Bezeichnung leer/ungenau war, minimal konsistent halten
-    df.loc[cond_015 & df["Bezeichnung"].astype(str).str.strip().eq(""), "Bezeichnung"] = "Oliver"
-    df.loc[cond_014 & df["Bezeichnung"].astype(str).str.strip().eq(""), "Bezeichnung"] = "Oliver"
+    cond_015 = art.eq("O-015") | art.eq("O015") | art_key.str.fullmatch(r"(?i)o015")
+    cond_014 = art.eq("O-014") | art.eq("O014") | art_key.str.fullmatch(r"(?i)o014")
+    df.loc[cond_015, ["Bezeichnung","Farbe","Familie"]] = ["Oliver","Schwarz","oliver"]
+    df.loc[cond_014, ["Bezeichnung","Farbe","Familie"]] = ["Oliver","Weiss","oliver"]
+    return df
+
+_ART_MUSTER_RE = re.compile(r"^[A-ZÄÖÜ]{1,2}-?\d{3}[A-Z]?$", re.I)
+
+def _flag_artnr_muster(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty: return df
+    art = df.get("ArtikelNr","").astype(str).str.strip().str.upper()
+    df["__MUSTERSICHTBAR__"] = art.map(lambda x: bool(_ART_MUSTER_RE.match(x)))
     return df
 
 def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -404,9 +424,9 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     out = out.assign(_have=out["Verkaufspreis"].notna()).sort_values(["ArtikelNr_key","_have"], ascending=[True,False])
     out = out.drop_duplicates(subset=["ArtikelNr_key"], keep="first").drop(columns=["_have"])
 
-    # ### OLIVER FIX (PL) ###
+    # ➕ Fixes
     out = _force_oliver_color_by_artnr(out)
-    # -----------------------
+    out = _flag_artnr_muster(out)
 
     return out
 
@@ -426,28 +446,22 @@ ART_PREFIX_EQUIV = {"o061":"o061","o013":"o013"}
 def _apply_hints_to_row(name_raw: str) -> dict:
     s = (name_raw or "").lower()
     h = {"hint_family":"","hint_color":"","hint_art_exact":"","hint_art_prefix":""}
-    # Familien
     for fam in ["finn mobile","charly little","duftöl","duftoel","duft oil"]:
         if fam in s: h["hint_family"] = "finn" if fam=="finn mobile" else ("charly" if "charly" in fam else "duftol")
     for fam in ["finn","theo","robert","peter","julia","albert","roger","mia","simon","otto","oskar","tim","charly","oliver"]:
         if fam in s: h["hint_family"] = h["hint_family"] or fam
-    # Farben
     if "schwarz" in s or "black" in s: h["hint_color"]="schwarz"
     if "weiss" in s or "weiß" in s or "white" in s: h["hint_color"]="weiss"
-    # Artikel-Mappings
     if "oskar" in s and "little" in s: h["hint_art_prefix"]="o061"
     if "simon" in s: h["hint_art_exact"]="s054"
     if "otto"  in s: h["hint_art_prefix"]="o013"
     if "eva" in s and "e-008" in s: h["hint_art_exact"]="e008"
     if "julia" in s and "j-031" in s: h["hint_art_exact"]="j031"
     if "mia" in s and "m-057" in s: h["hint_art_exact"]="m057"
-    # ### OLIVER FIX (SO) ###
+    # Oliver: explizite Art-Keys, falls im Namen
     if "oliver" in s:
-        # wenn im Namen Farbe steckt, ist hint_color schon gesetzt
-        # Art-Keys vorbelegen, falls der Sellout-Namensstring eine eindeutige Spur enthält
         if "o-015" in s or "o015" in s: h["hint_art_exact"]="o015"
         if "o-014" in s or "o014" in s: h["hint_art_exact"]="o014"
-    # -----------------------
     return h
 
 def _fallback_col_by_index(df: pd.DataFrame, idx0: int) -> str|None:
@@ -496,6 +510,10 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
     if col_end:   out["EndDatum"]   = parse_date_series_us(df[col_end])
     if "StartDatum" in out and "EndDatum" in out:
         out.loc[out["EndDatum"].isna(),"EndDatum"] = out.loc[out["EndDatum"].isna(),"StartDatum"]
+
+    # Muster-Flag zur Anzeige (gleiche Logik wie in PL)
+    out = _flag_artnr_muster(out)
+
     return out
 
 # =========================
@@ -596,11 +614,11 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
     need = merged["Verkaufspreis"].isna() & merged["EAN_key"].astype(bool)
     if need.any():
         tmp = merged.loc[need, ["EAN_key"]].merge(
-            price_df[["EAN_key","Einkaufspreis","Verkaufspreis","Lagermenge","Bezeichnung","Familie","Farbe","Kategorie","ArtikelNr","ArtikelNr_key"]],
+            price_df[["EAN_key","Einkaufspreis","Verkaufspreis","Lagermenge","Bezeichnung","Familie","Farbe","Kategorie","ArtikelNr","ArtikelNr_key","__MUSTERSICHTBAR__"]],
             on="EAN_key", how="left"
         )
         idx = merged.index[need]; tmp.index = idx
-        for c in ["Einkaufspreis","Verkaufspreis","Lagermenge","Bezeichnung","Familie","Farbe","Kategorie","ArtikelNr","ArtikelNr_key"]:
+        for c in ["Einkaufspreis","Verkaufspreis","Lagermenge","Bezeichnung","Familie","Farbe","Kategorie","ArtikelNr","ArtikelNr_key","__MUSTERSICHTBAR__"]:
             merged.loc[idx,c] = merged.loc[idx,c].fillna(tmp[c])
     need = merged["Verkaufspreis"].isna()
     if need.any():
@@ -624,10 +642,14 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
         )
         df["Bezeichnung"] = df["Bezeichnung"].fillna("")
         df["Farbe"]       = df.get("Farbe","").fillna("")
+        # Musterflag auffüllen, falls aus PL noch nicht gekommen
+        if "__MUSTERSICHTBAR__" not in df:
+            df["__MUSTERSICHTBAR__"] = False
 
-    # Anzeige-Bezeichnung (bei Duplikaten Farbe anhängen)
+    # Anzeige-Bezeichnung:
     merged["Bezeichnung_anzeige"] = merged["Bezeichnung"]
 
+    # 1) Duplikate → Farbe anhängen (wie gehabt)
     def _looks_like_not_a_color2(token: str) -> bool:
         t=(token or "").strip().lower()
         return (not t) or (t in {"eu","ch","us","uk"}) or any(x in t for x in ["ml","db","m²","m2"]) or bool(re.search(r"\d",t))
@@ -636,16 +658,19 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
     valid_color = merged["Farbe"].astype(str).str.strip().map(lambda t: (t!="") and (not _looks_like_not_a_color2(t)))
     merged.loc[dup & valid_color, "Bezeichnung_anzeige"] = merged.loc[dup & valid_color,"Bezeichnung"] + " – " + merged.loc[dup & valid_color,"Farbe"].astype(str).str.strip()
 
-    # ### OLIVER FIX (Anzeige): für alle Oliver immer Farbe anhängen ###
+    # 2) Oliver IMMER mit Farbe
     is_oliver = (
         merged["Familie"].astype(str).str.fullmatch(r"(?i)oliver") |
         merged["Bezeichnung"].astype(str).str.contains(r"(?i)\boliver\b", na=False)
     )
     merged.loc[is_oliver & valid_color, "Bezeichnung_anzeige"] = "Oliver – " + merged.loc[is_oliver, "Farbe"].astype(str).str.strip()
-    # -----------------------------------------------------------------
+
+    # 3) Muster-Erzwingung: ArtikelNr zusätzlich in Klammern anfügen
+    mustervis = merged.get("__MUSTERSICHTBAR__", False).fillna(False).astype(bool)
+    merged.loc[mustervis, "Bezeichnung_anzeige"] = merged.loc[mustervis, "Bezeichnung_anzeige"].astype(str) + " (" + merged.loc[mustervis,"ArtikelNr"].astype(str) + ")"
 
     # Umsatz-Werte
-    q_buy,p_buy   = sanitize_numbers(merged["Einkaufsmenge"], merged["Einkaufspreis"])
+    q_buy,p_buy   = sanitize_numbers(merged["Einkaufsmenge"], merged["Einkaufspreis"]) if "Einkaufsmenge" in merged else (pd.Series(0,index=merged.index), pd.Series(0,index=merged.index))
     q_sell,p_sell = sanitize_numbers(merged["Verkaufsmenge"], merged["Verkaufspreis"])
     merged["Einkaufswert"] = safe_mul(q_buy.fillna(0.0),  p_buy.fillna(0.0))
     merged["Verkaufswert"] = safe_mul(q_sell.fillna(0.0), p_sell.fillna(0.0))
@@ -737,8 +762,8 @@ BASE_DIR = Path(__file__).resolve().parent
 
 def _find_data_dir() -> Path:
     candidates = [
-        BASE_DIR / "data",
-        BASE_DIR.parent / "data",
+        BASE_DIR / "data",              # ./galaxus_tool_source/data
+        BASE_DIR.parent / "data",       # ./data (Repo-Root)
     ]
     for p in candidates:
         if p.exists():
@@ -845,7 +870,7 @@ if (raw_sell is not None) and (raw_price is not None):
             sell_df  = prepare_sell_df(raw_sell)
             price_df = prepare_price_df(raw_price)
 
-        # Zeitraumfilter
+        # Zeitraumfilter (❗ Fix: kein Walrus-Operator)
         filtered_sell_df = sell_df
         if {"StartDatum","EndDatum"}.issubset(sell_df.columns) and not sell_df["StartDatum"].isna().all():
             st.subheader("Periode wählen")
@@ -861,13 +886,13 @@ if (raw_sell is not None) and (raw_price is not None):
                     "Zeitraum (DD.MM.YYYY)",
                     value=st.session_state["date_range"],
                     min_value=min_date,
-                    max_value=max_value := max_date,
+                    max_value=max_date,   # <-- FIX
                     format="DD.MM.YYYY",
                 )
             with col_btn:
                 st.write(""); st.write("")
                 if st.button("Gesamten Zeitraum"):
-                    st.session_state["date_range"] = (min_date, max_value)
+                    st.session_state["date_range"] = (min_date, max_date)  # <-- FIX
                     st.rerun()
 
             if isinstance(date_value, tuple):
@@ -976,6 +1001,7 @@ if (raw_sell is not None) and (raw_price is not None):
         t_rounded, t_styler = style_numeric(totals_display)
         st.dataframe(t_styler, use_container_width=True)
 
+      
         # ------- Downloads (ohne Σ-Gesamtzeile) -------
         dl1, dl2 = st.columns(2)
         with dl1:
