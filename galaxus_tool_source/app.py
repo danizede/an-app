@@ -30,7 +30,7 @@ warnings.filterwarnings("ignore", message="invalid value encountered in multiply
 # ---------- Global ----------
 np.seterr(all='ignore')
 # 🔁 angepasst: Seitentitel jetzt "Analyse"
-st.set_page_config(page_title="Analyse", layout="wide")
+st.set_page_config(page_title="Analysetool", layout="wide")
 
 # Altair große Datensätze erlauben
 try:
@@ -725,7 +725,8 @@ DATA_DIR = _find_data_dir()
 DEFAULT_SELL_PATH  = DATA_DIR / "sellout.xlsx"
 DEFAULT_PRICE_PATH = DATA_DIR / "preisliste.xlsx"
 # 🔁 angepasst: Datenordner-Hinweis entfernt
-# st.caption(f"📁 Datenordner: {DATA_DIR}")
+# st.caption(f"📁 Datenordner: {DATA_DIR}")  # ausgeblendet
+
 
 def _persist_upload(uploaded_file, target_path: Path):
     if uploaded_file is None: return
