@@ -1,4 +1,4 @@
-# app.py — Galaxus Sellout Analyse (Passcode-Login + Auto-File-Detection, Oliver-Fix + Muster-Erzwingung)
+# app.py — Galaxus Sellout Analyse (Passcode-Login + Auto-File-Detection, Default-first, robust safe_mul)
 # - Robustes Matching (ArtNr → EAN → Name → Familie → Hints → Fuzzy)
 # - EU-Datumsfilter, Detailtabelle optional
 # - Summen pro Artikel (Lagerwert = letzter verfügbarer Stand je Artikel, NICHT aufsummiert)
@@ -9,7 +9,6 @@
 # - Kategorie primär aus Spalte G; leere/NaN-Kategorien bleiben leer und erscheinen nicht im Chart
 # - Summenzeile Σ Gesamt – Währungsangaben in Spaltennamen (CHF)
 # - 🔐 Login via st.secrets [auth]/Root/Env (kein bcrypt nötig)
-# - ✅ Oliver-Fix (O-015 Schwarz, O-014 Weiss) und Sichtbarkeits-Erzwingung für ArtNr-Muster (Buchstabe[n]-3 Ziffern [+ Buchstabe])
 
 import os
 import io
@@ -341,26 +340,6 @@ CAT_CANDIDATES  = ["Kategorie","Warengruppe","Zusatz"]
 STOCK_CANDIDATES= ["Bestand","Verfügbar","verfügbar","Verfuegbar","Lagerbestand","Lagermenge","Available"]
 COLOR_CANDIDATES= ["Farbe","Color","Colour","Variante","Variant","Farbvariante","Farbname"]
 
-# ---- Oliver & Muster Erzwingung (Preislisten-Seite) ----
-def _force_oliver_color_by_artnr(df: pd.DataFrame) -> pd.DataFrame:
-    """Setzt für O-015 / O-014 Familie/Farbe/Bezeichnung hart, falls nötig."""
-    if df.empty: return df
-    art = df.get("ArtikelNr","").astype(str).str.strip().str.upper()
-    art_key = df.get("ArtikelNr_key","").astype(str)
-    cond_015 = art.eq("O-015") | art.eq("O015") | art_key.str.fullmatch(r"(?i)o015")
-    cond_014 = art.eq("O-014") | art.eq("O014") | art_key.str.fullmatch(r"(?i)o014")
-    df.loc[cond_015, ["Bezeichnung","Farbe","Familie"]] = ["Oliver","Schwarz","oliver"]
-    df.loc[cond_014, ["Bezeichnung","Farbe","Familie"]] = ["Oliver","Weiss","oliver"]
-    return df
-
-_ART_MUSTER_RE = re.compile(r"^[A-ZÄÖÜ]{1,2}-?\d{3}[A-Z]?$", re.I)
-
-def _flag_artnr_muster(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty: return df
-    art = df.get("ArtikelNr","").astype(str).str.strip().str.upper()
-    df["__MUSTERSICHTBAR__"] = art.map(lambda x: bool(_ART_MUSTER_RE.match(x)))
-    return df
-
 def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     df = normalize_cols(df)
     col_art   = find_column(df, ARTNR_CANDIDATES, "Artikelnummer")
@@ -423,11 +402,6 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     # Dedupliziere nach ArtikelNr_key (bevorzuge mit Preis)
     out = out.assign(_have=out["Verkaufspreis"].notna()).sort_values(["ArtikelNr_key","_have"], ascending=[True,False])
     out = out.drop_duplicates(subset=["ArtikelNr_key"], keep="first").drop(columns=["_have"])
-
-    # ➕ Fixes
-    out = _force_oliver_color_by_artnr(out)
-    out = _flag_artnr_muster(out)
-
     return out
 
 # =========================
@@ -448,20 +422,16 @@ def _apply_hints_to_row(name_raw: str) -> dict:
     h = {"hint_family":"","hint_color":"","hint_art_exact":"","hint_art_prefix":""}
     for fam in ["finn mobile","charly little","duftöl","duftoel","duft oil"]:
         if fam in s: h["hint_family"] = "finn" if fam=="finn mobile" else ("charly" if "charly" in fam else "duftol")
-    for fam in ["finn","theo","robert","peter","julia","albert","roger","mia","simon","otto","oskar","tim","charly","oliver"]:
+    for fam in ["finn","theo","robert","peter","julia","albert","roger","mia","simon","otto","oskar","tim","charly"]:
         if fam in s: h["hint_family"] = h["hint_family"] or fam
-    if "schwarz" in s or "black" in s: h["hint_color"]="schwarz"
-    if "weiss" in s or "weiß" in s or "white" in s: h["hint_color"]="weiss"
+    if "tim" in s and "schwarz" in s: h["hint_color"]="weiss"
+    if "mia" in s and "gold" in s:    h["hint_color"]="schwarz"
     if "oskar" in s and "little" in s: h["hint_art_prefix"]="o061"
     if "simon" in s: h["hint_art_exact"]="s054"
     if "otto"  in s: h["hint_art_prefix"]="o013"
     if "eva" in s and "e-008" in s: h["hint_art_exact"]="e008"
     if "julia" in s and "j-031" in s: h["hint_art_exact"]="j031"
     if "mia" in s and "m-057" in s: h["hint_art_exact"]="m057"
-    # Oliver: explizite Art-Keys, falls im Namen
-    if "oliver" in s:
-        if "o-015" in s or "o015" in s: h["hint_art_exact"]="o015"
-        if "o-014" in s or "o014" in s: h["hint_art_exact"]="o014"
     return h
 
 def _fallback_col_by_index(df: pd.DataFrame, idx0: int) -> str|None:
@@ -510,10 +480,6 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
     if col_end:   out["EndDatum"]   = parse_date_series_us(df[col_end])
     if "StartDatum" in out and "EndDatum" in out:
         out.loc[out["EndDatum"].isna(),"EndDatum"] = out.loc[out["EndDatum"].isna(),"StartDatum"]
-
-    # Muster-Flag zur Anzeige (gleiche Logik wie in PL)
-    out = _flag_artnr_muster(out)
-
     return out
 
 # =========================
@@ -614,11 +580,11 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
     need = merged["Verkaufspreis"].isna() & merged["EAN_key"].astype(bool)
     if need.any():
         tmp = merged.loc[need, ["EAN_key"]].merge(
-            price_df[["EAN_key","Einkaufspreis","Verkaufspreis","Lagermenge","Bezeichnung","Familie","Farbe","Kategorie","ArtikelNr","ArtikelNr_key","__MUSTERSICHTBAR__"]],
+            price_df[["EAN_key","Einkaufspreis","Verkaufspreis","Lagermenge","Bezeichnung","Familie","Farbe","Kategorie","ArtikelNr","ArtikelNr_key"]],
             on="EAN_key", how="left"
         )
         idx = merged.index[need]; tmp.index = idx
-        for c in ["Einkaufspreis","Verkaufspreis","Lagermenge","Bezeichnung","Familie","Farbe","Kategorie","ArtikelNr","ArtikelNr_key","__MUSTERSICHTBAR__"]:
+        for c in ["Einkaufspreis","Verkaufspreis","Lagermenge","Bezeichnung","Familie","Farbe","Kategorie","ArtikelNr","ArtikelNr_key"]:
             merged.loc[idx,c] = merged.loc[idx,c].fillna(tmp[c])
     need = merged["Verkaufspreis"].isna()
     if need.any():
@@ -642,35 +608,18 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
         )
         df["Bezeichnung"] = df["Bezeichnung"].fillna("")
         df["Farbe"]       = df.get("Farbe","").fillna("")
-        # Musterflag auffüllen, falls aus PL noch nicht gekommen
-        if "__MUSTERSICHTBAR__" not in df:
-            df["__MUSTERSICHTBAR__"] = False
 
-    # Anzeige-Bezeichnung:
+    # Anzeige-Bezeichnung (bei Duplikaten Farbe anhängen)
     merged["Bezeichnung_anzeige"] = merged["Bezeichnung"]
-
-    # 1) Duplikate → Farbe anhängen (wie gehabt)
     def _looks_like_not_a_color2(token: str) -> bool:
         t=(token or "").strip().lower()
         return (not t) or (t in {"eu","ch","us","uk"}) or any(x in t for x in ["ml","db","m²","m2"]) or bool(re.search(r"\d",t))
-
     dup = merged.duplicated(subset=["Bezeichnung"], keep=False)
     valid_color = merged["Farbe"].astype(str).str.strip().map(lambda t: (t!="") and (not _looks_like_not_a_color2(t)))
     merged.loc[dup & valid_color, "Bezeichnung_anzeige"] = merged.loc[dup & valid_color,"Bezeichnung"] + " – " + merged.loc[dup & valid_color,"Farbe"].astype(str).str.strip()
 
-    # 2) Oliver IMMER mit Farbe
-    is_oliver = (
-        merged["Familie"].astype(str).str.fullmatch(r"(?i)oliver") |
-        merged["Bezeichnung"].astype(str).str.contains(r"(?i)\boliver\b", na=False)
-    )
-    merged.loc[is_oliver & valid_color, "Bezeichnung_anzeige"] = "Oliver – " + merged.loc[is_oliver, "Farbe"].astype(str).str.strip()
-
-    # 3) Muster-Erzwingung: ArtikelNr zusätzlich in Klammern anfügen
-    mustervis = merged.get("__MUSTERSICHTBAR__", False).fillna(False).astype(bool)
-    merged.loc[mustervis, "Bezeichnung_anzeige"] = merged.loc[mustervis, "Bezeichnung_anzeige"].astype(str) + " (" + merged.loc[mustervis,"ArtikelNr"].astype(str) + ")"
-
     # Umsatz-Werte
-    q_buy,p_buy   = sanitize_numbers(merged["Einkaufsmenge"], merged["Einkaufspreis"]) if "Einkaufsmenge" in merged else (pd.Series(0,index=merged.index), pd.Series(0,index=merged.index))
+    q_buy,p_buy   = sanitize_numbers(merged["Einkaufsmenge"], merged["Einkaufspreis"])
     q_sell,p_sell = sanitize_numbers(merged["Verkaufsmenge"], merged["Verkaufspreis"])
     merged["Einkaufswert"] = safe_mul(q_buy.fillna(0.0),  p_buy.fillna(0.0))
     merged["Verkaufswert"] = safe_mul(q_sell.fillna(0.0), p_sell.fillna(0.0))
@@ -870,7 +819,7 @@ if (raw_sell is not None) and (raw_price is not None):
             sell_df  = prepare_sell_df(raw_sell)
             price_df = prepare_price_df(raw_price)
 
-        # Zeitraumfilter (❗ Fix: kein Walrus-Operator)
+        # Zeitraumfilter
         filtered_sell_df = sell_df
         if {"StartDatum","EndDatum"}.issubset(sell_df.columns) and not sell_df["StartDatum"].isna().all():
             st.subheader("Periode wählen")
@@ -886,13 +835,13 @@ if (raw_sell is not None) and (raw_price is not None):
                     "Zeitraum (DD.MM.YYYY)",
                     value=st.session_state["date_range"],
                     min_value=min_date,
-                    max_value=max_date,   # <-- FIX
+                    max_value=max_date,
                     format="DD.MM.YYYY",
                 )
             with col_btn:
                 st.write(""); st.write("")
                 if st.button("Gesamten Zeitraum"):
-                    st.session_state["date_range"] = (min_date, max_date)  # <-- FIX
+                    st.session_state["date_range"] = (min_date, max_date)
                     st.rerun()
 
             if isinstance(date_value, tuple):
@@ -1001,7 +950,6 @@ if (raw_sell is not None) and (raw_price is not None):
         t_rounded, t_styler = style_numeric(totals_display)
         st.dataframe(t_styler, use_container_width=True)
 
-      
         # ------- Downloads (ohne Σ-Gesamtzeile) -------
         dl1, dl2 = st.columns(2)
         with dl1:
