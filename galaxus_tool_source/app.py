@@ -402,21 +402,6 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     # Dedupliziere nach ArtikelNr_key (bevorzuge mit Preis)
     out = out.assign(_have=out["Verkaufspreis"].notna()).sort_values(["ArtikelNr_key","_have"], ascending=[True,False])
     out = out.drop_duplicates(subset=["ArtikelNr_key"], keep="first").drop(columns=["_have"])
-
-    # 🔧 NEU: bei doppelten Namen (z. B. Oliver in verschiedenen Farben) Name durch Farbe eindeutig machen
-    dup_name = out["Bezeichnung"].duplicated(keep=False)
-    valid_color = out["Farbe"].astype(str).str.strip().map(lambda t: bool(t) and not _looks_like_not_a_color(t))
-    mask = dup_name & valid_color
-    if mask.any():
-        out.loc[mask, "Bezeichnung"] = (
-            out.loc[mask, "Bezeichnung"].astype(str)
-            + " – "
-            + out.loc[mask, "Farbe"].astype(str).str.strip()
-        )
-        # Keys/Familie neu ableiten
-        out["Bezeichnung_key"] = out["Bezeichnung"].map(normalize_key)
-        out["Familie"] = out["Bezeichnung"].map(make_family_key)
-
     return out
 
 # =========================
@@ -524,7 +509,6 @@ def _best_fuzzy_in_candidates(name: str, cand_series: pd.Series) -> int|None:
     return best_idx if best_score >= 0.5 else None
 
 def _family_match(row: pd.Series, price_df: pd.DataFrame, prefer_color: str|None):
-    """Familien-Match nur dann zurückgeben, wenn eindeutig; bei Mehrfachtreffern None."""
     fam = row.get("Hint_Family") or row.get("Familie") or ""
     fam = fam.strip()
     if not fam: return None
@@ -533,11 +517,7 @@ def _family_match(row: pd.Series, price_df: pd.DataFrame, prefer_color: str|None
     if grp.empty: return None
     if prefer_color:
         g2 = grp.loc[grp["Farbe"].str.lower()==prefer_color.lower()]
-        if not g2.empty:
-            grp = g2
-    # Nur eindeutige Treffer zulassen
-    if len(grp) != 1:
-        return None
+        if not g2.empty: grp = g2
     return grp.iloc[0]
 
 def _apply_equivalences(hint_art_exact: str, hint_art_pref: str) -> str|None:
@@ -606,28 +586,16 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
         idx = merged.index[need]; tmp.index = idx
         for c in ["Einkaufspreis","Verkaufspreis","Lagermenge","Bezeichnung","Familie","Farbe","Kategorie","ArtikelNr","ArtikelNr_key"]:
             merged.loc[idx,c] = merged.loc[idx,c].fillna(tmp[c])
-
-    # 🔧 NEU: Name-/Familien-Mapping nur bei eindeutigen Keys
     need = merged["Verkaufspreis"].isna()
     if need.any():
-        name_counts = price_df["Bezeichnung_key"].value_counts()
-        unique_names = name_counts[name_counts == 1].index
-        name_map = price_df[price_df["Bezeichnung_key"].isin(unique_names)] \
-                    .drop_duplicates("Bezeichnung_key").set_index("Bezeichnung_key")
+        name_map = price_df.drop_duplicates("Bezeichnung_key").set_index("Bezeichnung_key")
         for i,k in zip(merged.index[need], merged.loc[need,"Bezeichnung_key"]):
-            if k in name_map.index:
-                _assign_from_price_row(merged,i, name_map.loc[k])
-
+            if k in name_map.index: _assign_from_price_row(merged,i, name_map.loc[k])
     need = merged["Verkaufspreis"].isna()
     if need.any():
-        fam_counts = price_df["Familie"].value_counts()
-        unique_fams = fam_counts[fam_counts == 1].index
-        fam_map = price_df[price_df["Familie"].isin(unique_fams)] \
-                    .drop_duplicates("Familie").set_index("Familie")
+        fam_map = price_df.drop_duplicates("Familie").set_index("Familie")
         for i,f in zip(merged.index[need], merged.loc[need,"Familie"]):
-            if f and f in fam_map.index:
-                _assign_from_price_row(merged,i, fam_map.loc[f])
-
+            if f and f in fam_map.index: _assign_from_price_row(merged,i, fam_map.loc[f])
     _final_backstops(merged, price_df)
 
     # Strings säubern
