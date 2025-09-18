@@ -29,7 +29,8 @@ warnings.filterwarnings("ignore", message="invalid value encountered in multiply
 
 # ---------- Global ----------
 np.seterr(all='ignore')
-st.set_page_config(page_title="Galaxus Sellout Analyse", layout="wide")
+# 🔁 angepasst: Seitentitel jetzt "Analyse"
+st.set_page_config(page_title="Analyse", layout="wide")
 
 # Altair große Datensätze erlauben
 try:
@@ -723,7 +724,8 @@ def _find_data_dir() -> Path:
 DATA_DIR = _find_data_dir()
 DEFAULT_SELL_PATH  = DATA_DIR / "sellout.xlsx"
 DEFAULT_PRICE_PATH = DATA_DIR / "preisliste.xlsx"
-st.caption(f"📁 Datenordner: {DATA_DIR}")
+# 🔁 angepasst: Datenordner-Hinweis entfernt
+# st.caption(f"📁 Datenordner: {DATA_DIR}")
 
 def _persist_upload(uploaded_file, target_path: Path):
     if uploaded_file is None: return
@@ -769,6 +771,7 @@ def _pick_default_files_from_dir(folder: Path) -> tuple[io.BytesIO|None, io.Byte
 # =========================
 # UI
 # =========================
+# 🔁 Überschrift bleibt "Analyse" (war bei dir bereits geändert)
 st.title("Analyse")
 
 c1, c2 = st.columns(2)
