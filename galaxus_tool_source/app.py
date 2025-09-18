@@ -141,10 +141,9 @@ logout_button()
 THOUSANDS_SEP = "'"
 NUM_COLS_DEFAULT = [
     "Einkaufsmenge","Einkaufswert (CHF)",
-    "Verkaufsmenge","Verkäufe in CHF",   # hier ergänzen
+    "Verkaufsmenge","Verkaufswert (CHF)",
     "Lagermenge","Lagerwert (CHF)"
 ]
-
 
 def _fmt_thousands(x, sep=THOUSANDS_SEP):
     if pd.isna(x): return ""
@@ -153,26 +152,13 @@ def _fmt_thousands(x, sep=THOUSANDS_SEP):
     except Exception:
         return str(x)
 
-def style_numeric(df: pd.DataFrame, num_cols=NUM_COLS_DEFAULT, sep=THOUSANDS_SEP, no_sep_cols=None):
-    """
-    Formatiert numerische Spalten:
-    - rundet auf 0 Dezimalstellen und castet auf Int64
-    - verwendet Apostroph als Tausendertrennzeichen
-    - Spalten in no_sep_cols werden OHNE Tausendertrennzeichen formatiert
-    """
-    no_sep_cols = set(no_sep_cols or [])
+def style_numeric(df: pd.DataFrame, num_cols=NUM_COLS_DEFAULT, sep=THOUSANDS_SEP):
     out = df.copy()
     present = [c for c in num_cols if c in out.columns]
     for c in present:
         out[c] = pd.to_numeric(out[c], errors="coerce").round(0).astype("Int64")
-
-    def _mkfmt(col):
-        use_sep = "" if col in no_sep_cols else sep
-        return (lambda v, s=use_sep: _fmt_thousands(v, s))
-
-    fmt = {c: _mkfmt(c) for c in present}
+    fmt = {c: (lambda v, s=sep: _fmt_thousands(v, s)) for c in present}
     return out, out.style.format(fmt)
-
 
 def append_total_row_for_display(df: pd.DataFrame) -> pd.DataFrame:
     """Σ-Gesamt ans Ende anhängen (nur UI-Anzeige)."""
@@ -477,9 +463,6 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
     out["Bezeichnung"]     = df[col_name].astype(str) if col_name else ""
     out["Bezeichnung_key"] = out["Bezeichnung"].map(normalize_key)
     out["Familie"]         = out["Bezeichnung"].map(make_family_key)
-
-    # 🔧 NEU: ST-Präfix aus ArtikelNr_key entfernen, damit ST-F-xxx zu F-xxx wird
-    out["ArtikelNr_key"] = out["ArtikelNr_key"].str.replace(r'^st','', regex=True)
 
     hints = out["Bezeichnung"].map(_apply_hints_to_row)
     out["Hint_Family"]   = hints.map(lambda h: h["hint_family"])
@@ -960,13 +943,12 @@ if (raw_sell is not None) and (raw_price is not None):
         st.subheader("Summen pro Artikel")
         totals_renamed = totals.rename(columns={
             "Einkaufswert":"Einkaufswert (CHF)",
-            "Verkaufswert":"Verkäufe in CHF",
+            "Verkaufswert":"Verkaufswert (CHF)",
             "Lagerwert":"Lagerwert (CHF)"
         })
         totals_display = append_total_row_for_display(totals_renamed)
-        t_rounded, t_styler = style_numeric(totals_display, sep="")  # sep="" entfernt Tausendertrennzeichen
+        t_rounded, t_styler = style_numeric(totals_display)
         st.dataframe(t_styler, use_container_width=True)
-
 
         # ------- Downloads (ohne Σ-Gesamtzeile) -------
         dl1, dl2 = st.columns(2)
