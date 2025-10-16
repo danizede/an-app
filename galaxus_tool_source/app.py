@@ -672,9 +672,28 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
 
     # Merge für Umsatz
     merged = filtered_sell_df.merge(price_df, on=["ArtikelNr_key"], how="left", suffixes=("", "_pl"))
-
     # Merge für Lagerstand (UNGEFILTERTE Basis)
     stock_merged = sell_for_stock.merge(price_df, on=["ArtikelNr_key"], how="left", suffixes=("", "_pl"))
+
+    # Nach dem initialen Merge können einige Spalten aus der Preisliste (Suffix "_pl")
+    # für nicht vorhandene Werte im Sell-out-Report übernommen werden. Insbesondere
+    # sollen Kategorie, Bezeichnung, Farbe und Familie sowie die Artikelnummer
+    # aus der Preisliste verwendet werden, wenn diese im Sell-out leer sind.
+    for df_tmp in (merged, stock_merged):
+        for col in ["Bezeichnung", "Familie", "Farbe", "Kategorie", "ArtikelNr"]:
+            pl_col = f"{col}_pl"
+            if pl_col in df_tmp.columns:
+                # Für die Bezeichnung wird grundsätzlich der Wert aus der Preisliste bevorzugt,
+                # da dieser in der Regel die korrekte Produktbenennung inklusive Farbe enthält.
+                if col == "Bezeichnung":
+                    df_tmp[col] = df_tmp[pl_col]
+                else:
+                    # Für andere Spalten (Familie, Farbe, Kategorie, ArtikelNr):
+                    # Nur ersetzen, wenn der aktuelle Wert leer oder NaN ist.
+                    mask_valid = df_tmp[col].astype(str).str.strip().ne("") & df_tmp[col].notna()
+                    df_tmp[col] = df_tmp[col].where(mask_valid, df_tmp[pl_col])
+                # Nach Übernahme kann die _pl-Spalte entfernt werden, um spätere Verwechslungen zu verhindern
+                df_tmp.drop(columns=[pl_col], inplace=True, errors="ignore")
 
     # Hilfsdatum
     def _row_date(df):
