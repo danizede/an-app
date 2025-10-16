@@ -243,17 +243,66 @@ def normalize_key(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", s)
 
 def find_column(df: pd.DataFrame, candidates, purpose: str, required=True) -> str | None:
+    """
+    Find a column in ``df`` whose header matches one of the provided ``candidates``.
+
+    This helper normalises both the DataFrame column names and the candidate names
+    by stripping whitespace and punctuation (including various hyphen/dash characters)
+    before comparison. This makes the matching robust to differences like
+    ``Hersteller-Nr``, ``Hersteller‑Nr.`` (with non-breaking hyphen), or
+    ``Hersteller Nr``.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        The DataFrame whose columns are to be searched.
+    candidates : list[str]
+        A list of potential column names to search for.
+    purpose : str
+        A human-friendly description of the column's intended purpose. Only used
+        for error messages.
+    required : bool, default True
+        Whether to raise a ``KeyError`` if no matching column is found.
+
+    Returns
+    -------
+    str | None
+        The name of the matching column in ``df``, or ``None`` if no match is
+        found and ``required`` is False.
+    """
     cols = list(df.columns)
+    # Try exact matches first to avoid false positives
     for cand in candidates:
         if cand in cols:
             return cand
-    canon = {re.sub(r"[\s\-*/.]+", "", c).lower(): c for c in cols}
+
+    # Normalise function: collapse whitespace, translate dash-like characters to '-', remove
+    # separators (-, /, *, .) and convert to lowercase. This allows matching
+    # between e.g. "Hersteller‑Nr." and "Hersteller-Nr".
+    def _norm(s: str) -> str:
+        tmp = re.sub(r"\s+", "", str(s))
+        tmp = tmp.translate(str.maketrans({
+            "\u2010": "-",  # hyphen
+            "\u2011": "-",  # non-breaking hyphen
+            "\u2012": "-",  # figure dash
+            "\u2013": "-",  # en dash
+            "\u2014": "-",  # em dash
+            "\u2015": "-",  # horizontal bar
+        }))
+        tmp = re.sub(r"[\-*/.]+", "", tmp)
+        return tmp.lower()
+
+    canon = {_norm(c): c for c in cols}
     for cand in candidates:
-        key = re.sub(r"[\s\-*/.]+", "", cand).lower()
+        key = _norm(cand)
         if key in canon:
             return canon[key]
+
     if required:
-        raise KeyError(f"Spalte für «{purpose}» fehlt – gesucht unter {candidates}.\nVerfügbare Spalten: {cols}")
+        raise KeyError(
+            f"Spalte für «{purpose}» fehlt – gesucht unter {candidates}.\n"
+            f"Verfügbare Spalten: {cols}"
+        )
     return None
 
 def parse_number_series(s: pd.Series) -> pd.Series:
@@ -372,6 +421,7 @@ ARTNR_CANDIDATES = [
     "Produktnr", "Produktnummer",
     "erstelle"
     ,"Hersteller Nr.", "Hersteller Nr", "HerstellerNr.", "Herstellernr."
+    ,"Hersteller-Nr", "HerstellerNr"
 ]
 EAN_CANDIDATES  = ["EAN","GTIN","BarCode","Barcode"]
 NAME_CANDIDATES_PL = ["Bezeichnung","Produktname","Name","Titel","Artikelname"]
@@ -385,16 +435,20 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     col_ean   = find_column(df, EAN_CANDIDATES,  "EAN/GTIN", required=False)
     col_name  = find_column(df, NAME_CANDIDATES_PL, "Bezeichnung")
 
-    # Kategorie primär aus Spalte G (Index 6), sonst heuristisch
-    col_cat = None
-    try:
-        maybe_g = df.columns[6]
-        if maybe_g in df.columns:
-            col_cat = maybe_g
-    except Exception:
-        pass
+    # Kategorie-Spalte bestimmen: suche zunächst anhand gängiger Kandidatennamen wie
+    # "Kategorie", "Warengruppe" oder "KategorieName". Nur wenn nichts gefunden
+    # wird, fällt das System auf die 7. Spalte (Index 6) zurück. Die vorherige
+    # Strategie, zuerst blind die Spalte an Position 6 zu wählen, führte dazu,
+    # dass in manchen Preislisten fälschlich z.B. der Preis oder die Zusatz-
+    # spalte als Kategorie interpretiert wurde. Durch diese Änderung werden
+    # Kategorien zuverlässiger erkannt.
+    col_cat = find_column(df, CAT_CANDIDATES, "Kategorie", required=False)
     if not col_cat:
-        col_cat = find_column(df, CAT_CANDIDATES, "Kategorie", required=False)
+        try:
+            maybe_g = df.columns[6]
+            col_cat = maybe_g
+        except Exception:
+            col_cat = None
 
     col_stock = find_column(df, STOCK_CANDIDATES, "Bestand/Lager", required=False)
     col_buy   = find_column(df, BUY_PRICE_CANDIDATES,  "Einkaufspreis", required=False)
