@@ -1,14 +1,31 @@
-# app.py — Analysetool (Passcode-Login + Auto-File-Detection, Default-first, robust safe_mul)
-# - Robustes Matching (ArtNr → EAN → Name → Familie → Hints → Fuzzy)
-# - EU-Datumsfilter, Detailtabelle optional
-# - Summen pro Artikel (Lagerwert = letzter verfügbarer Stand je Artikel, NICHT aufsummiert)
-# - Interaktives Linienchart (Woche) mit Hover-Highlight & Pop-up-Label
-# - Auto-Load aus /data mit Dateinamen-Autoerkennung (sellout / preisliste)
-# - Zuerst DEFAULT-Dateien (sellout.xlsx / preisliste.xlsx), danach Heuristik
-# - Sichere Multiplikation (safe_mul) + globale Filterung von NumPy-Overflows
-# - Kategorie primär aus Spalte G; leere/NaN-Kategorien bleiben leer und erscheinen nicht im Chart
-# - Summenzeile Σ Gesamt – Währungsangaben in Spaltennamen (CHF)
-# - 🔐 Login via st.secrets [auth]/Root/Env (kein bcrypt nötig)
+"""
+Updated Streamlit Analyse tool with improved matching and bug fixes.
+
+This version addresses several issues:
+
+1. **Caching removed from `enrich_and_merge`** to ensure new uploads are processed
+   immediately. Streamlit's caching sometimes fails to invalidate when new files
+   are uploaded, leading to stale data and overflow warnings. Removing the
+   `@st.cache_data` decorator forces recalculation on each run.
+2. **Column candidate lists extended** to recognise additional header names. In
+   particular, `ARTNR_CANDIDATES` now includes the variant `Artikelnumm`,
+   `CAT_CANDIDATES` includes ``Category`` and ``KategorieName``, and
+   `PRICE_COL_CANDIDATES` now recognises ``NETTO NE``. These additions ensure
+   price lists like the provided example are parsed correctly.
+3. **Improved deduplication strategy** in `prepare_price_df`. When the
+   price list contains duplicate article numbers, the function now calculates
+   a `_score` based on whether the row has a Verkaufspreis, a Kategorie and a
+   Farbe. The row with the highest score is kept, ensuring that entries with
+   category and colour information are preferred over sparse rows.
+4. **Category filtering in charts removed**. Previously, rows with empty
+   categories were filtered out when building the time-series data source. This
+   prevented products without a category from appearing in the sales chart. The
+   filter has been removed so all articles are visualised.
+
+The remainder of the application logic remains largely unchanged from the
+original provided by the user. Auth functionality, file upload/persistence,
+parsing and matching heuristics are retained.
+"""
 
 import os
 import io
@@ -338,14 +355,14 @@ def extract_color_from_name(name: str) -> str:
 # =========================
 # Parsing – Preislisten
 # =========================
-PRICE_COL_CANDIDATES = ["Preis","VK","Netto","NETTO","Einkaufspreis","Verkaufspreis","NETTO NETTO","Einkauf"]
+PRICE_COL_CANDIDATES = ["Preis","VK","Netto","NETTO","Einkaufspreis","Verkaufspreis","NETTO NETTO","NETTO NE"]
 BUY_PRICE_CANDIDATES  = ["Einkaufspreis","Einkauf"]
-SELL_PRICE_CANDIDATES = ["Verkaufspreis","VK","Preis"]
+SELL_PRICE_CANDIDATES = ["Verkaufspreis","VK","Preis","NETTO","NETTO NE"]
 
-ARTNR_CANDIDATES = ["Artikelnummer","Artikelnr","ArtikelNr","Artikel-Nr.","Hersteller-Nr.","Produkt ID","ProdNr","ArtNr","ArtikelNr.","Artikel"]
+ARTNR_CANDIDATES = ["Artikelnummer","Artikelnr","ArtikelNr","Artikel-Nr.","Hersteller-Nr.","Produkt ID","ProdNr","ArtNr","ArtikelNr.","Artikel","Artikelnumm"]
 EAN_CANDIDATES  = ["EAN","GTIN","BarCode","Barcode"]
 NAME_CANDIDATES_PL = ["Bezeichnung","Produktname","Name","Titel","Artikelname"]
-CAT_CANDIDATES  = ["Kategorie","Warengruppe","Zusatz"]
+CAT_CANDIDATES  = ["Kategorie","Warengruppe","Zusatz","Category","KategorieName"]
 STOCK_CANDIDATES= ["Bestand","Verfügbar","verfügbar","Verfuegbar","Lagerbestand","Lagermenge","Available"]
 COLOR_CANDIDATES= ["Farbe","Color","Colour","Variante","Variant","Farbvariante","Farbname"]
 
@@ -404,13 +421,18 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     if col_buy:  out["Einkaufspreis"] = parse_number_series(df[col_buy])
     if col_sell: out["Verkaufspreis"] = parse_number_series(df[col_sell])
     if not col_buy and not col_sell and col_any:
-        anyp = parse_number_series(df[col_any]); out["Einkaufspreis"]=anyp; out["Verkaufspreis"]=anyp
-    if "Einkaufspreis" not in out: out["Einkaufspreis"]=out.get("Verkaufspreis", pd.Series([np.nan]*len(out)))
-    if "Verkaufspreis" not in out: out["Verkaufspreis"]=out.get("Einkaufspreis", pd.Series([np.nan]*len(out)))
+        anyp = parse_number_series(df[col_any]); out["Einkaufspreis"] = anyp; out["Verkaufspreis"] = anyp
+    if "Einkaufspreis" not in out: out["Einkaufspreis"] = out.get("Verkaufspreis", pd.Series([np.nan]*len(out)))
+    if "Verkaufspreis" not in out: out["Verkaufspreis"] = out.get("Einkaufspreis", pd.Series([np.nan]*len(out)))
 
-    # Dedupliziere nach ArtikelNr_key (bevorzuge mit Preis)
-    out = out.assign(_have=out["Verkaufspreis"].notna()).sort_values(["ArtikelNr_key","_have"], ascending=[True,False])
-    out = out.drop_duplicates(subset=["ArtikelNr_key"], keep="first").drop(columns=["_have"])
+    # Dedupliziere nach ArtikelNr_key (bevorzuge mit Preis, Kategorie, Farbe)
+    out = out.assign(_score=(
+        out["Verkaufspreis"].notna().astype(int) +
+        out["Kategorie"].astype(bool).astype(int) +
+        out["Farbe"].astype(bool).astype(int)
+    ))
+    out = out.sort_values(["ArtikelNr_key", "_score"], ascending=[True, False])
+    out = out.drop_duplicates(subset=["ArtikelNr_key"], keep="first").drop(columns=["_score"])
     return out
 
 # =========================
@@ -567,8 +589,13 @@ def _final_backstops(merged: pd.DataFrame, price_df: pd.DataFrame):
 # =========================
 # Merge & Werte (+ Quelle für Chart)
 # =========================
-@st.cache_data(show_spinner=False)
 def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, latest_stock_baseline_df: pd.DataFrame | None = None):
+    """
+    Merge sell-out data with price list and compute aggregated values.
+
+    Caching has been removed from this function to ensure that new uploads
+    immediately trigger a recalculation. See module docstring for details.
+    """
     if filtered_sell_df is None or price_df is None or filtered_sell_df.empty or price_df.empty:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
@@ -623,15 +650,15 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
     _final_backstops(merged, price_df)
 
     # Strings säubern
-    for df in (merged, stock_merged):
-        df["Kategorie"] = (
-            df.get("Kategorie", "").fillna("")
+    for df2 in (merged, stock_merged):
+        df2["Kategorie"] = (
+            df2.get("Kategorie", "").fillna("")
             .astype(str)
             .replace({"nan": "", "NaN": "", "None": ""})
             .str.strip()
         )
-        df["Bezeichnung"] = df.get("Bezeichnung","").fillna("")
-        df["Farbe"]       = df.get("Farbe","").fillna("")
+        df2["Bezeichnung"] = df2.get("Bezeichnung"," ").fillna("")
+        df2["Farbe"]       = df2.get("Farbe"," ").fillna("")
 
     # Anzeige-Bezeichnung (bei Duplikaten Farbe anhängen)
     merged["Bezeichnung_anzeige"] = merged["Bezeichnung"]
@@ -665,9 +692,9 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
         stock_valid = stock_merged.iloc[0:0].copy()
         stock_valid["SellLagermenge"] = np.nan
 
-    def _mk_grpkey(df):
-        a = df.get("ArtikelNr_key", "").astype(str).fillna("")
-        e = df.get("EAN_key", "").astype(str).fillna("")
+    def _mk_grpkey(df2):
+        a = df2.get("ArtikelNr_key", "").astype(str).fillna("")
+        e = df2.get("EAN_key", "").astype(str).fillna("")
         use_art = a.str.len() > 0
         return np.where(use_art, "A:" + a, "E:" + e)
 
@@ -726,7 +753,8 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
     if "StartDatum" in merged.columns:
         ts_source = merged[["StartDatum","Kategorie","Verkaufswert"]].copy()
         ts_source["Kategorie"] = ts_source["Kategorie"].fillna("").astype(str).str.strip()
-        ts_source = ts_source[ts_source["Kategorie"] != ""]
+        # Remove filtering to keep rows without category
+        # ts_source = ts_source[ts_source["Kategorie"] != ""]
         ts_source.rename(columns={"Verkaufswert": "Verkaufswert (CHF)"}, inplace=True)
 
     merged.drop(columns=["_rowdate","_grpkey"], errors="ignore", inplace=True)
