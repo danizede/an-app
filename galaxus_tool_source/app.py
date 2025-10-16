@@ -359,7 +359,20 @@ PRICE_COL_CANDIDATES = ["Preis","VK","Netto","NETTO","Einkaufspreis","Verkaufspr
 BUY_PRICE_CANDIDATES  = ["Einkaufspreis","Einkauf"]
 SELL_PRICE_CANDIDATES = ["Verkaufspreis","VK","Preis","NETTO","NETTO NE"]
 
-ARTNR_CANDIDATES = ["Artikelnummer","Artikelnr","ArtikelNr","Artikel-Nr.","Hersteller-Nr.","Produkt ID","ProdNr","ArtNr","ArtikelNr.","Artikel","Artikelnumm"]
+# Erweitere Kandidaten für Artikelnummer. Neben den klassischen Bezeichnungen
+# (Artikelnummer, Artikelnr usw.) treten in einigen Reports auch die Begriffe
+# "Herstellerartikelnummer" oder "Herstellerartikel" auf. Ebenso kann
+# "Produktnr" oder "Produktnummer" verwendet werden. Diese Liste wird
+# verwendet, um die Artikelnummernspalte im Sell-out- und Preislisten-Report
+# zuverlässig zu finden.
+ARTNR_CANDIDATES = [
+    "Artikelnummer", "Artikelnr", "ArtikelNr", "Artikel-Nr.", "Hersteller-Nr.",
+    "Produkt ID", "ProdNr", "ArtNr", "ArtikelNr.", "Artikel", "Artikelnumm",
+    "Herstellerartikelnummer", "Herstellerartikel", "Hersteller Artikelnummer", "Herstellernr",
+    "Produktnr", "Produktnummer",
+    "erstelle"
+    ,"Hersteller Nr.", "Hersteller Nr", "HerstellerNr.", "Herstellernr."
+]
 EAN_CANDIDATES  = ["EAN","GTIN","BarCode","Barcode"]
 NAME_CANDIDATES_PL = ["Bezeichnung","Produktname","Name","Titel","Artikelname"]
 CAT_CANDIDATES  = ["Kategorie","Warengruppe","Zusatz","Category","KategorieName"]
@@ -425,14 +438,16 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     if "Einkaufspreis" not in out: out["Einkaufspreis"] = out.get("Verkaufspreis", pd.Series([np.nan]*len(out)))
     if "Verkaufspreis" not in out: out["Verkaufspreis"] = out.get("Einkaufspreis", pd.Series([np.nan]*len(out)))
 
-    # Dedupliziere nach ArtikelNr_key (bevorzuge mit Preis, Kategorie, Farbe)
-    out = out.assign(_score=(
-        out["Verkaufspreis"].notna().astype(int) +
-        out["Kategorie"].astype(bool).astype(int) +
-        out["Farbe"].astype(bool).astype(int)
-    ))
-    out = out.sort_values(["ArtikelNr_key", "_score"], ascending=[True, False])
-    out = out.drop_duplicates(subset=["ArtikelNr_key"], keep="first").drop(columns=["_score"])
+    # Dedupliziere nach ArtikelNr_key.
+    # Bevorzuge Zeilen mit einer Kategorie, dann mit Verkaufspreis, dann mit Farbe.
+    # Diese Priorisierung verhindert, dass Einträge ohne Kategorie gewählt werden, selbst wenn sie einen Preis haben.
+    out = out.assign(
+        _cat=out["Kategorie"].astype(bool).astype(int),
+        _price=out["Verkaufspreis"].notna().astype(int),
+        _color=out["Farbe"].astype(bool).astype(int)
+    )
+    out = out.sort_values(["ArtikelNr_key", "_cat", "_price", "_color"], ascending=[True, False, False, False])
+    out = out.drop_duplicates(subset=["ArtikelNr_key"], keep="first").drop(columns=["_cat","_price","_color"])
     return out
 
 # =========================
