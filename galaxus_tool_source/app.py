@@ -565,7 +565,7 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 # =====================
-# Matching-Funktionen (NEU)
+# Matching-Funktionen
 # =====================
 def _tokenize_name_for_match(name: str) -> set[str]:
     if not isinstance(name, str):
@@ -602,25 +602,21 @@ def _match_best_row_for_single_item(row_sell: pd.Series, price_df: pd.DataFrame)
                 df = df.loc[df[k].astype(str).str.strip().str.lower() == v.strip().lower()]
         return df
 
-    # Stufe 1: ArtikelNr_key + Farbe
+    # 1: ArtikelNr_key + Farbe
     if art_key and sell_color_hint_low:
         hit = pf_by({"ArtikelNr_key": art_key, "Farbe": sell_color_hint_low})
         if len(hit) >= 1:
             return hit.iloc[0]
-
-    # Stufe 2: ArtikelNr_key
+    # 2: ArtikelNr_key
     if art_key:
         hit = pf_by({"ArtikelNr_key": art_key})
         if len(hit) >= 1:
             if len(hit) > 1 and sell_color_hint_low:
-                sub = hit.loc[
-                    hit["Farbe"].str.strip().str.lower() == sell_color_hint_low
-                ]
+                sub = hit.loc[hit["Farbe"].str.strip().str.lower() == sell_color_hint_low]
                 if not sub.empty:
                     return sub.iloc[0]
             return hit.iloc[0]
-
-    # Stufe 3: EAN_key + Farbe
+    # 3: EAN + Farbe
     if ean_key and sell_color_hint_low:
         hit = price_df.loc[
             (price_df["EAN_key"].str.strip() == ean_key) &
@@ -628,40 +624,29 @@ def _match_best_row_for_single_item(row_sell: pd.Series, price_df: pd.DataFrame)
         ]
         if len(hit) >= 1:
             return hit.iloc[0]
-
-    # Stufe 4: EAN_key
+    # 4: EAN
     if ean_key:
         hit = price_df.loc[price_df["EAN_key"].str.strip() == ean_key]
         if len(hit) >= 1:
             if len(hit) > 1 and sell_color_hint_low:
-                sub = hit.loc[
-                    hit["Farbe"].str.strip().str.lower() == sell_color_hint_low
-                ]
+                sub = hit.loc[hit["Farbe"].str.strip().str.lower() == sell_color_hint_low]
                 if not sub.empty:
                     return sub.iloc[0]
             return hit.iloc[0]
-
-    # Stufe 5: Familie (+ evtl. Farbe)
-    fam_candidate = hint_fam or fam_sell
-    fam_candidate = fam_candidate.strip().lower()
+    # 5: Familie (+evtl. Farbe)
+    fam_candidate = (hint_fam or fam_sell).strip().lower()
     if fam_candidate:
-        fam_hit = price_df.loc[
-            price_df["Familie"].str.strip().str.lower() == fam_candidate
-        ]
+        fam_hit = price_df.loc[price_df["Familie"].str.strip().str.lower() == fam_candidate]
         if not fam_hit.empty:
             if sell_color_hint_low:
-                sub = fam_hit.loc[
-                    fam_hit["Farbe"].str.strip().str.lower() == sell_color_hint_low
-                ]
+                sub = fam_hit.loc[fam_hit["Farbe"].str.strip().str.lower() == sell_color_hint_low]
                 if not sub.empty:
                     fam_hit = sub
             return fam_hit.iloc[0]
-
-    # Stufe 6: fuzzy Name
+    # 6: Fuzzy Name
     sell_tokens = _tokenize_name_for_match(str(row_sell.get("Bezeichnung","")))
     if sell_tokens:
-        best_idx = None
-        best_score = 0.0
+        best_idx, best_score = None, 0.0
         for idx_price, row_price in price_df.iterrows():
             price_tokens = _tokenize_name_for_match(str(row_price.get("Bezeichnung","")))
             if not price_tokens:
@@ -669,71 +654,34 @@ def _match_best_row_for_single_item(row_sell: pd.Series, price_df: pd.DataFrame)
             inter = len(sell_tokens & price_tokens)
             union = len(sell_tokens | price_tokens)
             score = inter / union if union else 0.0
-
-            # Bonus für passende Farbe
-            same_color = False
             if sell_color_hint_low and str(row_price.get("Farbe","")).strip():
-                same_color = (
-                    str(row_price["Farbe"]).strip().lower()
-                    == sell_color_hint_low
-                )
-            if same_color:
-                score += 0.15
-
+                if str(row_price["Farbe"]).strip().lower() == sell_color_hint_low:
+                    score += 0.15
             if score > best_score:
-                best_score = score
-                best_idx = idx_price
-
+                best_score, best_idx = score, idx_price
         if best_idx is not None and best_score >= 0.5:
             return price_df.loc[best_idx]
-
-    return None  # kein Match gefunden
+    return None
 
 def match_sell_to_price(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Für jede Zeile im Sellout die passende Zeile aus der Preisliste suchen.
-    Übernimmt Kategorie, Farbe, ArtikelNr, Familie, Einkaufspreis, Verkaufspreis.
-    Markiert Zeilen ohne Match mit MatchFehler = True.
-    """
     sell_df = sell_df.copy()
-
-    # Stelle sicher, dass folgende Spalten existieren
-    for col in [
-        "Einkaufspreis","Verkaufspreis","Kategorie","Farbe",
-        "ArtikelNr","ArtikelNr_key","Familie","Lagermenge"
-    ]:
+    for col in ["Einkaufspreis","Verkaufspreis","Kategorie","Farbe","ArtikelNr","ArtikelNr_key","Familie","Lagermenge"]:
         if col not in sell_df.columns:
             sell_df[col] = np.nan
 
-    match_flags = []
-    cat_list = []
-    col_list = []
-    art_list = []
-    fam_list = []
-    ekpreis_list = []
-    vkpreis_list = []
-    stock_list = []
+    match_flags, cat_list, col_list, art_list, fam_list, ekpreis_list, vkpreis_list, stock_list = ([] for _ in range(8))
 
-    for idx, row in sell_df.iterrows():
+    for _, row in sell_df.iterrows():
         hit = _match_best_row_for_single_item(row, price_df)
-
         if hit is None:
-            match_flags.append(True)
-            cat_list.append("")
-            col_list.append("")
-            art_list.append(row.get("ArtikelNr", ""))
-            fam_list.append(row.get("Familie", ""))
-            ekpreis_list.append(np.nan)
-            vkpreis_list.append(np.nan)
-            stock_list.append(np.nan)
+            match_flags.append(True);  cat_list.append(""); col_list.append("")
+            art_list.append(row.get("ArtikelNr", "")); fam_list.append(row.get("Familie", ""))
+            ekpreis_list.append(np.nan); vkpreis_list.append(np.nan); stock_list.append(np.nan)
         else:
             match_flags.append(False)
-            cat_list.append(hit.get("Kategorie",""))
-            col_list.append(hit.get("Farbe",""))
-            art_list.append(hit.get("ArtikelNr",""))
-            fam_list.append(hit.get("Familie",""))
-            ekpreis_list.append(hit.get("Einkaufspreis", np.nan))
-            vkpreis_list.append(hit.get("Verkaufspreis", np.nan))
+            cat_list.append(hit.get("Kategorie","")); col_list.append(hit.get("Farbe",""))
+            art_list.append(hit.get("ArtikelNr",""));  fam_list.append(hit.get("Familie",""))
+            ekpreis_list.append(hit.get("Einkaufspreis", np.nan)); vkpreis_list.append(hit.get("Verkaufspreis", np.nan))
             stock_list.append(hit.get("Lagermenge", np.nan))
 
     sell_df["MatchFehler"]    = match_flags
@@ -744,24 +692,7 @@ def match_sell_to_price(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> pd.Dat
     sell_df["Einkaufspreis"]  = ekpreis_list
     sell_df["Verkaufspreis"]  = vkpreis_list
     sell_df["Lagermenge_PL"]  = stock_list
-
     return sell_df
-
-# =====================
-# Backstop Matching (legacy fallback inside enrich)
-# =====================
-def _assign_from_price_row(merged: pd.DataFrame, i, row: pd.Series):
-    for col in [
-        "Einkaufspreis","Verkaufspreis","Lagermenge",
-        "Bezeichnung","Familie","Farbe","Kategorie",
-        "ArtikelNr","ArtikelNr_key"
-    ]:
-        if col in row:
-            merged.at[i, col] = row.get(col, merged.at[i, col])
-
-def _final_backstops(merged: pd.DataFrame, price_df: pd.DataFrame):
-    # Platzhalter – Hauptmatching deckt bereits fast alles ab.
-    pass
 
 # =====================
 # Merge + Werte
@@ -779,7 +710,7 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame,
     merged = filtered_sell_df.copy()
     stock_merged = sell_for_stock.copy()
 
-    # Preis-/Stammdaten-Fallback pro ArtikelNr_key
+    # Fallback aus Preisliste pro ArtikelNr_key
     price_keyed = price_df.drop_duplicates("ArtikelNr_key").set_index("ArtikelNr_key")
 
     def enrich_missing_from_price(df2: pd.DataFrame):
@@ -840,13 +771,12 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame,
             d = pd.to_datetime(pd.NaT)
         return pd.to_datetime(d, errors="coerce")
 
-    # Datums-/Gruppenschlüssel
     merged["_rowdate"]       = _row_date(merged)
     stock_merged["_rowdate"] = _row_date(stock_merged)
     merged["_grpkey"]        = _mk_grpkey(merged)
     stock_merged["_grpkey"]  = _mk_grpkey(stock_merged)
 
-    # SellLagermenge vorbereiten
+    # SellLagermenge vorbereiten & stock_valid erzeugen
     if "SellLagermenge" in stock_merged.columns:
         stock_merged["SellLagermenge"] = (
             pd.to_numeric(stock_merged["SellLagermenge"], errors="coerce")
@@ -855,12 +785,14 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame,
         stock_valid = stock_merged.loc[stock_merged["SellLagermenge"].notna()].copy()
     else:
         stock_valid = stock_merged.iloc[0:0].copy()
-        stock_valid["SellLagermenge"] = np.nan
 
-    # *** FIX: _rowdate auch in stock_valid verfügbar machen ***
+    # *** Robustheit: fehlende Pflichtspalten sicherstellen ***
+    if "SellLagermenge" not in stock_valid.columns:
+        stock_valid["SellLagermenge"] = np.nan
     if "_rowdate" not in stock_valid.columns:
-        stock_valid["_rowdate"] = stock_merged.loc[stock_valid.index, "_rowdate"] \
-            if len(stock_valid.index) else pd.to_datetime(pd.NaT)
+        stock_valid["_rowdate"] = pd.to_datetime(pd.Series(pd.NaT, index=stock_valid.index))
+    if "_grpkey" not in stock_valid.columns:
+        stock_valid["_grpkey"] = ""
 
     # Zeitraumfenster
     period_min = pd.to_datetime(merged["_rowdate"]).min()
@@ -1134,80 +1066,46 @@ if not ts_source.empty:
     )
     ts_agg["Periode"]    = pd.to_datetime(ts_agg["Periode"])
     ts_agg["Kategorie"]  = ts_agg["Kategorie"].astype(str)
-    ts_agg["Wert (CHF)"] = pd.to_numeric(
-        ts_agg["Wert (CHF)"],
-        errors="coerce"
-    ).fillna(0.0).astype(float)
+    ts_agg["Wert (CHF)"] = pd.to_numeric(ts_agg["Wert (CHF)"], errors="coerce").fillna(0.0).astype(float)
 
-    hover_cat = alt.selection_single(
-        fields=["Kategorie"], on="mouseover", nearest=True, empty="none"
-    )
-    hover_pt  = alt.selection_single(
-        fields=["Periode","Kategorie"], on="mouseover", nearest=True, empty="none"
-    )
+    hover_cat = alt.selection_single(fields=["Kategorie"], on="mouseover", nearest=True, empty="none")
+    hover_pt  = alt.selection_single(fields=["Periode","Kategorie"], on="mouseover", nearest=True, empty="none")
 
     base = alt.Chart(ts_agg)
     lines = (
         base.mark_line(point=alt.OverlayMarkDef(size=30), interpolate="linear")
             .encode(
                 x=alt.X("Periode:T", title="Woche"),
-                y=alt.Y(
-                    "Wert (CHF):Q",
-                    title="Verkaufswert (CHF) pro Woche",
-                    stack=None
-                ),
+                y=alt.Y("Wert (CHF):Q", title="Verkaufswert (CHF) pro Woche", stack=None),
                 color=alt.Color("Kategorie:N", title="Kategorie"),
                 opacity=alt.condition(hover_cat, alt.value(1.0), alt.value(0.25)),
                 strokeWidth=alt.condition(hover_cat, alt.value(3), alt.value(1.5)),
                 tooltip=[
                     alt.Tooltip("Periode:T", title="Woche"),
                     alt.Tooltip("Kategorie:N", title="Kategorie"),
-                    alt.Tooltip(
-                        "Wert (CHF):Q",
-                        title="Verkaufswert (CHF)",
-                        format=",.0f"
-                    ),
+                    alt.Tooltip("Wert (CHF):Q", title="Verkaufswert (CHF)", format=",.0f"),
                 ],
             )
             .add_selection(hover_cat)
     )
     points = (
         base.mark_point(size=70, opacity=0)
-            .encode(
-                x="Periode:T",
-                y="Wert (CHF):Q",
-                color="Kategorie:N"
-            )
+            .encode(x="Periode:T", y="Wert (CHF):Q", color="Kategorie:N")
             .add_selection(hover_pt)
     )
     popup = (
         base.transform_filter(hover_pt)
-            .mark_text(
-                align='left', dx=6, dy=-8,
-                fontSize=12, fontWeight='bold'
-            )
-            .encode(
-                x="Periode:T",
-                y="Wert (CHF):Q",
-                text="Kategorie:N",
-                color="Kategorie:N",
-            )
+            .mark_text(align='left', dx=6, dy=-8, fontSize=12, fontWeight='bold')
+            .encode(x="Periode:T", y="Wert (CHF):Q", text="Kategorie:N", color="Kategorie:N")
     )
     end_labels = (
-        base.transform_window(
-                row_number='row_number()',
-                sort=[alt.SortField(field='Periode', order='descending')],
-                groupby=['Kategorie']
-            )
+        base.transform_window(row_number='row_number()',
+                              sort=[alt.SortField(field='Periode', order='descending')],
+                              groupby=['Kategorie'])
             .transform_filter(alt.datum.row_number == 0)
             .mark_text(align='left', dx=6, dy=-6, fontSize=11)
-            .encode(
-                x='Periode:T',
-                y='Wert (CHF):Q',
-                text='Kategorie:N',
-                color='Kategorie:N',
-                opacity=alt.condition(hover_cat, alt.value(1.0), alt.value(0.6))
-            )
+            .encode(x='Periode:T', y='Wert (CHF):Q', text='Kategorie:N',
+                    color='Kategorie:N', opacity=alt.condition(hover_cat, alt.value(1.0), alt.value(0.6)))
     )
     chart = (lines + points + popup + end_labels).properties(height=400)
     st.altair_chart(chart, use_container_width=True)
