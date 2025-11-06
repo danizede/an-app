@@ -786,11 +786,13 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame,
     else:
         stock_valid = stock_merged.iloc[0:0].copy()
 
-    # *** Robustheit: fehlende Pflichtspalten sicherstellen ***
+    # Fehlt SellLagermenge? -> trotzdem Spalte anlegen
     if "SellLagermenge" not in stock_valid.columns:
         stock_valid["SellLagermenge"] = np.nan
+    # Fehlt _rowdate? -> anlegen (NaT)
     if "_rowdate" not in stock_valid.columns:
         stock_valid["_rowdate"] = pd.to_datetime(pd.Series(pd.NaT, index=stock_valid.index))
+    # Fehlt _grpkey? -> leere Strings anlegen
     if "_grpkey" not in stock_valid.columns:
         stock_valid["_grpkey"] = ""
 
@@ -798,13 +800,15 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame,
     period_min = pd.to_datetime(merged["_rowdate"]).min()
     period_max = pd.to_datetime(merged["_rowdate"]).max()
 
-    sv_in = stock_valid
-    if pd.notna(period_min) and pd.notna(period_max):
-        sv_in = stock_valid.loc[
-            (stock_valid["_rowdate"] >= period_min) & (stock_valid["_rowdate"] <= period_max)
-        ]
-    if sv_in.empty and pd.notna(period_max):
-        sv_in = stock_valid.loc[(stock_valid["_rowdate"] <= period_max)]
+    sv_in = stock_valid.copy()
+    # Nur filtern, wenn _rowdate vorhanden (Schutz gegen KeyError)
+    if "_rowdate" in sv_in.columns:
+        if pd.notna(period_min) and pd.notna(period_max):
+            sv_in = sv_in.loc[
+                (sv_in["_rowdate"] >= period_min) & (sv_in["_rowdate"] <= period_max)
+            ]
+        elif pd.notna(period_max):
+            sv_in = sv_in.loc[sv_in["_rowdate"] <= period_max]
 
     # Letzter Bestand pro Artikel
     if sv_in.empty:
