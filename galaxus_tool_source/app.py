@@ -776,47 +776,42 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame,
     merged["_grpkey"]        = _mk_grpkey(merged)
     stock_merged["_grpkey"]  = _mk_grpkey(stock_merged)
 
-    # SellLagermenge vorbereiten & stock_valid erzeugen
-    if "SellLagermenge" in stock_merged.columns:
-        stock_merged["SellLagermenge"] = (
-            pd.to_numeric(stock_merged["SellLagermenge"], errors="coerce")
-            .clip(lower=0, upper=MAX_QTY).astype("float64")
-        )
-        stock_valid = stock_merged.loc[stock_merged["SellLagermenge"].notna()].copy()
-    else:
-        stock_valid = stock_merged.iloc[0:0].copy()
+    # Für die Lagerberechnung: SellLagermenge numerisch; fehlende Spalte initialisieren mit NaN
+    stock_merged["SellLagermenge"] = pd.to_numeric(stock_merged.get("SellLagermenge", np.nan), errors="coerce")
 
-    # Fehlt SellLagermenge? -> trotzdem Spalte anlegen
-    if "SellLagermenge" not in stock_valid.columns:
-        stock_valid["SellLagermenge"] = np.nan
-    # Fehlt _rowdate? -> anlegen (NaT)
-    if "_rowdate" not in stock_valid.columns:
-        stock_valid["_rowdate"] = pd.to_datetime(pd.Series(pd.NaT, index=stock_valid.index))
-    # Fehlt _grpkey? -> leere Strings anlegen
-    if "_grpkey" not in stock_valid.columns:
-        stock_valid["_grpkey"] = ""
-
-    # Zeitraumfenster
+    # Zeitraumfenster bestimmen (für die Lagerlogik)
     period_min = pd.to_datetime(merged["_rowdate"]).min()
     period_max = pd.to_datetime(merged["_rowdate"]).max()
 
-    sv_in = stock_valid.copy()
-    # Nur filtern, wenn _rowdate vorhanden (Schutz gegen KeyError)
-    if "_rowdate" in sv_in.columns:
-        if pd.notna(period_min) and pd.notna(period_max):
-            sv_in = sv_in.loc[
-                (sv_in["_rowdate"] >= period_min) & (sv_in["_rowdate"] <= period_max)
-            ]
-        elif pd.notna(period_max):
-            sv_in = sv_in.loc[sv_in["_rowdate"] <= period_max]
+    # Nur Zeilen mit gültiger SellLagermenge berücksichtigen
+    sv = stock_merged.loc[stock_merged["SellLagermenge"].notna()].copy()
 
-    # Letzter Bestand pro Artikel
-    if sv_in.empty:
-        latest_qty_map = {}
+    if not sv.empty:
+        # Nach Datum filtern, wenn Datumsspalte vorhanden und gültig
+        if "_rowdate" in sv.columns:
+            if pd.notna(period_min) and pd.notna(period_max):
+                sv = sv.loc[
+                    (sv["_rowdate"] >= period_min) &
+                    (sv["_rowdate"] <= period_max)
+                ]
+            elif pd.notna(period_max):
+                sv = sv.loc[sv["_rowdate"] <= period_max]
+
+        # Falls Filter zu keinem Ergebnis führt, die jüngsten Zeilen nehmen
+        if sv.empty and "_rowdate" in stock_merged.columns and pd.notna(period_max):
+            sv = stock_merged.loc[
+                stock_merged["SellLagermenge"].notna() &
+                (stock_merged["_rowdate"] <= period_max)
+            ].copy()
+        # Wenn immer noch leer, dann einfach alle Zeilen mit SellLagermenge
+        if sv.empty:
+            sv = stock_merged.loc[stock_merged["SellLagermenge"].notna()].copy()
+
+        sv = sv.sort_values(["_grpkey","_rowdate"], ascending=[True, True])
+        last_rows = sv.groupby("_grpkey", as_index=False).tail(1)
+        latest_qty_map = dict(zip(last_rows["_grpkey"], last_rows["SellLagermenge"]))
     else:
-        sv_in = sv_in.sort_values(["_grpkey","_rowdate"], ascending=[True, True])
-        last_rows = sv_in.groupby("_grpkey", as_index=False).tail(1)
-        latest_qty_map = last_rows.set_index("_grpkey")["SellLagermenge"].to_dict()
+        latest_qty_map = {}
 
     # Fallback Preis pro ArtikelNr_key
     price_map = (
