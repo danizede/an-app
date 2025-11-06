@@ -793,11 +793,20 @@ merged["_grpkey"]      = _mk_grpkey(merged)
 period_min = pd.to_datetime(merged["_rowdate"]).min()
 period_max = pd.to_datetime(merged["_rowdate"]).max()
 
-sv_in = stock_valid
-if pd.notna(period_min) and pd.notna(period_max):
-sv_in = stock_valid.loc[(stock_valid["_rowdate"] >= period_min) & (stock_valid["_rowdate"] <= period_max)]
-if sv_in.empty and pd.notna(period_max):
-sv_in = stock_valid.loc[(stock_valid["_rowdate"] <= period_max)]
+# --- robustes Zeitfenster-Filtering für Lager-Snapshot ---
+sv_in = stock_valid.copy()
+
+# Falls _rowdate noch nicht existiert (z. B. alte Uploads ohne Datum):
+if "_rowdate" not in sv_in.columns:
+    sv_in["_rowdate"] = pd.to_datetime(pd.NaT)
+
+# Jetzt Schritt für Schritt filtern, ohne KeyError-Risiko:
+if pd.notna(period_min):
+    sv_in = sv_in.loc[sv_in["_rowdate"] >= period_min]
+if pd.notna(period_max):
+    sv_in = sv_in.loc[sv_in["_rowdate"] <= period_max]
+# ---------------------------------------------------------
+
 
 if sv_in.empty:
 latest_qty_map = {}
