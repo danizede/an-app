@@ -718,7 +718,6 @@ def match_sell_to_price(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> pd.Dat
         hit = _match_best_row_for_single_item(row, price_df)
 
         if hit is None:
-            # Kein Match -> markieren
             match_flags.append(True)
             cat_list.append("")
             col_list.append("")
@@ -746,7 +745,6 @@ def match_sell_to_price(sell_df: pd.DataFrame, price_df: pd.DataFrame) -> pd.Dat
     sell_df["Verkaufspreis"]  = vkpreis_list
     sell_df["Lagermenge_PL"]  = stock_list
 
-    # Kategorie aus PL ist jetzt fix auf dem Datensatz.
     return sell_df
 
 # =====================
@@ -762,15 +760,7 @@ def _assign_from_price_row(merged: pd.DataFrame, i, row: pd.Series):
             merged.at[i, col] = row.get(col, merged.at[i, col])
 
 def _final_backstops(merged: pd.DataFrame, price_df: pd.DataFrame):
-    # Wir behalten das Konstrukt für den absoluten Notfall.
-    # Nach match_sell_to_price sollte fast nichts mehr hier landen.
-    need = merged["Verkaufspreis"].isna()
-    if not need.any():
-        return
-
-    # einfache Heuristik auf Basis Familien / Äquivalenzen etc.
-    # (reduziert für Klarheit, könnte bei Bedarf wieder erweitert werden)
-    # Hier lassen wir bewusst minimal, weil das Hauptmatching jetzt oben passiert.
+    # Platzhalter – Hauptmatching deckt bereits fast alles ab.
     pass
 
 # =====================
@@ -786,32 +776,22 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame,
 
     sell_for_stock = latest_stock_baseline_df if latest_stock_baseline_df is not None else filtered_sell_df
 
-    # WICHTIG:
-    # filtered_sell_df IST bereits durch match_sell_to_price gelaufen.
-    # price_df wird hier nur noch für Fallback benutzt und für Preis pro ArtikelNr_key.
     merged = filtered_sell_df.copy()
     stock_merged = sell_for_stock.copy()
 
-    # Wir holen uns für jede ArtikelNr_key den (zur Zeit) "offiziellen" Verkaufspreis
-    # und die Stammdaten aus price_df, falls beim Matching etwas leer blieb.
+    # Preis-/Stammdaten-Fallback pro ArtikelNr_key
     price_keyed = price_df.drop_duplicates("ArtikelNr_key").set_index("ArtikelNr_key")
 
     def enrich_missing_from_price(df2: pd.DataFrame):
         for idx, row in df2.iterrows():
             key = str(row.get("ArtikelNr_key","")).strip().lower()
-            if not key:
+            if not key or key not in price_keyed.index:
                 continue
-            if key in price_keyed.index:
-                plrow = price_keyed.loc[key]
-                # für jede Spalte, wenn leer -> ergänzen
-                for tgt in [
-                    "Einkaufspreis","Verkaufspreis",
-                    "Kategorie","Farbe","Familie","ArtikelNr"
-                ]:
-                    if (tgt in df2.columns and
-                        (pd.isna(df2.at[idx, tgt]) or str(df2.at[idx, tgt]).strip() == "")):
-                        if tgt in plrow and not pd.isna(plrow[tgt]):
-                            df2.at[idx, tgt] = plrow[tgt]
+            plrow = price_keyed.loc[key]
+            for tgt in ["Einkaufspreis","Verkaufspreis","Kategorie","Farbe","Familie","ArtikelNr"]:
+                if tgt in df2.columns and (pd.isna(df2.at[idx, tgt]) or str(df2.at[idx, tgt]).strip() == ""):
+                    if tgt in plrow and not pd.isna(plrow[tgt]):
+                        df2.at[idx, tgt] = plrow[tgt]
         return df2
 
     merged = enrich_missing_from_price(merged)
@@ -820,70 +800,35 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame,
     # Strings säubern
     for df2 in (merged, stock_merged):
         df2["Kategorie"] = (
-            df2.get("Kategorie","").fillna("")
-            .astype(str)
-            .replace({"nan":"","NaN":"","None":""})
-            .str.strip()
+            df2.get("Kategorie","").fillna("").astype(str).replace({"nan":"","NaN":"","None":""}).str.strip()
         )
         df2["Bezeichnung"] = df2.get("Bezeichnung"," ").fillna("")
         df2["Farbe"]       = df2.get("Farbe"," ").fillna("")
 
-    # Anzeige-Name (Farbe anhängen nur wenn nötig)
+    # Anzeige-Name (Farbe bei Duplikaten anhängen)
     merged["Bezeichnung_anzeige"] = merged["Bezeichnung"]
-
     def _invalid_color(token: str) -> bool:
         t = (token or "").strip().lower()
-        return (
-            (not t) or
-            (t in {"eu","ch","us","uk"}) or
-            any(x in t for x in ["ml","db","m²","m2"]) or
-            bool(re.search(r"\d", t))
-        )
-
+        return (not t) or (t in {"eu","ch","us","uk"}) or any(x in t for x in ["ml","db","m²","m2"]) or bool(re.search(r"\d", t))
     dup = merged.duplicated(subset=["Bezeichnung"], keep=False)
-    valid_color = merged["Farbe"].astype(str).str.strip().map(
-        lambda t: (t != "") and (not _invalid_color(t))
-    )
+    valid_color = merged["Farbe"].astype(str).str.strip().map(lambda t: (t != "") and (not _invalid_color(t)))
     merged.loc[dup & valid_color, "Bezeichnung_anzeige"] = (
-        merged.loc[dup & valid_color, "Bezeichnung"] + " – " +
-        merged.loc[dup & valid_color, "Farbe"].astype(str).str.strip()
+        merged.loc[dup & valid_color, "Bezeichnung"] + " – " + merged.loc[dup & valid_color, "Farbe"].astype(str).str.strip()
     )
 
     # Werte berechnen
-    q_buy,  p_buy  = sanitize_numbers(
-        merged.get("Einkaufsmenge", 0),
-        merged.get("Einkaufspreis", 0)
-    )
-    q_sell, p_sell = sanitize_numbers(
-        merged.get("Verkaufsmenge", 0),
-        merged.get("Verkaufspreis", 0)
-    )
+    q_buy,  p_buy  = sanitize_numbers(merged.get("Einkaufsmenge", 0), merged.get("Einkaufspreis", 0))
+    q_sell, p_sell = sanitize_numbers(merged.get("Verkaufsmenge", 0), merged.get("Verkaufspreis", 0))
     merged["Einkaufswert"] = safe_mul(q_buy.fillna(0.0),  p_buy.fillna(0.0))
     merged["Verkaufswert"] = safe_mul(q_sell.fillna(0.0), p_sell.fillna(0.0))
 
-    # Aktueller Lagerstand pro Artikel:
-    # Idee bleibt: "letzter bekannter Bestand je Artikel über gesamte Historie"
-    stock_merged = stock_merged.copy()
-    if "SellLagermenge" in stock_merged.columns:
-        stock_valid = stock_merged.loc[
-            stock_merged["SellLagermenge"].notna()
-        ].copy()
-        stock_valid["SellLagermenge"] = (
-            pd.to_numeric(stock_valid["SellLagermenge"], errors="coerce")
-            .clip(lower=0, upper=MAX_QTY)
-            .astype("float64")
-        )
-    else:
-        stock_valid = stock_merged.iloc[0:0].copy()
-        stock_valid["SellLagermenge"] = np.nan
-
+    # === Lagerstand-Logik ===
     def _mk_grpkey(df2):
         a = df2.get("ArtikelNr_key","").astype(str).fillna("")
         e = df2.get("EAN_key","").astype(str).fillna("")
         use_art = a.str.len() > 0
         return np.where(use_art, "A:" + a, "E:" + e)
 
-    # Hilfsdatum für "neuester Bestand"
     def _row_date(df2):
         if ("EndDatum" in df2.columns) and ("StartDatum" in df2.columns):
             d = df2["EndDatum"].fillna(df2["StartDatum"])
@@ -895,24 +840,41 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame,
             d = pd.to_datetime(pd.NaT)
         return pd.to_datetime(d, errors="coerce")
 
-    merged["_rowdate"] = _row_date(merged)
+    # Datums-/Gruppenschlüssel
+    merged["_rowdate"]       = _row_date(merged)
     stock_merged["_rowdate"] = _row_date(stock_merged)
+    merged["_grpkey"]        = _mk_grpkey(merged)
+    stock_merged["_grpkey"]  = _mk_grpkey(stock_merged)
 
-    stock_valid["_grpkey"] = _mk_grpkey(stock_valid)
-    merged["_grpkey"]      = _mk_grpkey(merged)
+    # SellLagermenge vorbereiten
+    if "SellLagermenge" in stock_merged.columns:
+        stock_merged["SellLagermenge"] = (
+            pd.to_numeric(stock_merged["SellLagermenge"], errors="coerce")
+            .clip(lower=0, upper=MAX_QTY).astype("float64")
+        )
+        stock_valid = stock_merged.loc[stock_merged["SellLagermenge"].notna()].copy()
+    else:
+        stock_valid = stock_merged.iloc[0:0].copy()
+        stock_valid["SellLagermenge"] = np.nan
 
+    # *** FIX: _rowdate auch in stock_valid verfügbar machen ***
+    if "_rowdate" not in stock_valid.columns:
+        stock_valid["_rowdate"] = stock_merged.loc[stock_valid.index, "_rowdate"] \
+            if len(stock_valid.index) else pd.to_datetime(pd.NaT)
+
+    # Zeitraumfenster
     period_min = pd.to_datetime(merged["_rowdate"]).min()
     period_max = pd.to_datetime(merged["_rowdate"]).max()
 
     sv_in = stock_valid
     if pd.notna(period_min) and pd.notna(period_max):
         sv_in = stock_valid.loc[
-            (stock_valid["_rowdate"] >= period_min) &
-            (stock_valid["_rowdate"] <= period_max)
+            (stock_valid["_rowdate"] >= period_min) & (stock_valid["_rowdate"] <= period_max)
         ]
     if sv_in.empty and pd.notna(period_max):
         sv_in = stock_valid.loc[(stock_valid["_rowdate"] <= period_max)]
 
+    # Letzter Bestand pro Artikel
     if sv_in.empty:
         latest_qty_map = {}
     else:
@@ -920,16 +882,12 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame,
         last_rows = sv_in.groupby("_grpkey", as_index=False).tail(1)
         latest_qty_map = last_rows.set_index("_grpkey")["SellLagermenge"].to_dict()
 
-    # Verkaufspreis pro ArtikelNr_key als Fallback
+    # Fallback Preis pro ArtikelNr_key
     price_map = (
         pd.to_numeric(
-            price_df.drop_duplicates("ArtikelNr_key")
-            .set_index("ArtikelNr_key")["Verkaufspreis"],
+            price_df.drop_duplicates("ArtikelNr_key").set_index("ArtikelNr_key")["Verkaufspreis"],
             errors="coerce"
-        )
-        .fillna(0.0)
-        .clip(lower=0, upper=MAX_PRICE)
-        .to_dict()
+        ).fillna(0.0).clip(lower=0, upper=MAX_PRICE).to_dict()
     )
 
     merged["Lagermenge_latest"] = (
@@ -939,48 +897,29 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame,
     merged["Verkaufspreis_latest"] = (
         pd.to_numeric(merged["ArtikelNr_key"].map(price_map), errors="coerce")
         .fillna(pd.to_numeric(merged.get("Verkaufspreis", np.nan), errors="coerce"))
-        .fillna(0.0)
-        .clip(lower=0, upper=MAX_PRICE)
-        .astype("float64")
+        .fillna(0.0).clip(lower=0, upper=MAX_PRICE).astype("float64")
     )
-    merged["Lagerwert_latest"] = safe_mul(
-        merged["Lagermenge_latest"], merged["Verkaufspreis_latest"]
-    )
+    merged["Lagerwert_latest"] = safe_mul(merged["Lagermenge_latest"], merged["Verkaufspreis_latest"])
 
-    # Tabellen
+    # === Ausgabe-Tabellen ===
     detail = merged[[
         "ArtikelNr","Bezeichnung_anzeige","Kategorie",
-        "Einkaufsmenge","Einkaufswert",
-        "Verkaufsmenge","Verkaufswert"
+        "Einkaufsmenge","Einkaufswert","Verkaufsmenge","Verkaufswert"
     ]].copy()
     detail["Lagermenge"] = merged["Lagermenge_latest"]
     detail["Lagerwert"]  = merged["Lagerwert_latest"]
 
     totals = (
-        detail.groupby(
-            ["ArtikelNr","Bezeichnung_anzeige","Kategorie"],
-            dropna=False, as_index=False
-        )
-        .agg({
-            "Einkaufsmenge":"sum",
-            "Einkaufswert":"sum",
-            "Verkaufsmenge":"sum",
-            "Verkaufswert":"sum",
-            "Lagermenge":"max",
-            "Lagerwert":"max"
-        })
+        detail.groupby(["ArtikelNr","Bezeichnung_anzeige","Kategorie"], dropna=False, as_index=False)
+              .agg({"Einkaufsmenge":"sum","Einkaufswert":"sum","Verkaufsmenge":"sum","Verkaufswert":"sum",
+                    "Lagermenge":"max","Lagerwert":"max"})
     )
 
     ts_source = pd.DataFrame()
     if "StartDatum" in merged.columns:
         ts_source = merged[["StartDatum","Kategorie","Verkaufswert"]].copy()
-        ts_source["Kategorie"] = (
-            ts_source["Kategorie"].fillna("").astype(str).str.strip()
-        )
-        ts_source.rename(
-            columns={"Verkaufswert":"Verkaufswert (CHF)"},
-            inplace=True
-        )
+        ts_source["Kategorie"] = ts_source["Kategorie"].fillna("").astype(str).str.strip()
+        ts_source.rename(columns={"Verkaufswert":"Verkaufswert (CHF)"}, inplace=True)
 
     merged.drop(columns=["_rowdate","_grpkey"], errors="ignore", inplace=True)
     return detail, totals, ts_source
@@ -1069,7 +1008,7 @@ if sell_file is not None:
 if price_file is not None:
     uploaded_price_raw = read_excel_flat(price_file)
     parsed_new_price   = prepare_price_df(uploaded_price_raw)
-    master_price_df    = parsed_new_price.copy()  # wir ersetzen die Preisliste immer mit der neuesten Version
+    master_price_df    = parsed_new_price.copy()  # neueste PL ersetzt
     save_master_pricelist(master_price_df)
     new_price_df = parsed_new_price
 
@@ -1144,7 +1083,7 @@ if {"StartDatum","EndDatum"}.issubset(sell_df_all.columns) and not sell_df_all["
 else:
     filtered_sell_df = sell_df_all.copy()
 
-# 6. ZUERST das neue Matching pro Zeile, dann Berechnung/Werte
+# 6. Neues Matching, dann Berechnung/Werte
 with st.spinner("🔗 Matche & berechne Werte…"):
     matched_filtered = match_sell_to_price(filtered_sell_df, master_price_df)
     matched_all      = match_sell_to_price(sell_df_all,      master_price_df)
