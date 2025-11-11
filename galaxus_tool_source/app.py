@@ -1,14 +1,15 @@
 # app.py
-# Updated Streamlit Analyse-Tool – robuste Persistenz & _rowdate-Fix + Wetter-Overlay (Zug, Mo 12:00, optional)
+# Updated Streamlit Analyse-Tool – robuste Persistenz & _rowdate-Fix + Wetter-Overlay (Meteostat)
 # - Persistenz: Zuletzt hochgeladene sellout.xlsx / preisliste.xlsx werden gespeichert
 #   und bei Neustart/Laden automatisch verwendet. Überschreiben nur bei echtem Upload.
 # - _rowdate-Fix: Kein KeyError mehr bei Zeitfenster-Filterung (schrittweise Filterung auf sv_in).
-# - Wetter-Overlay: sauber gekapselt & optional; App stürzt nicht ab, wenn meteostat fehlt.
+# - Erweiterte Kandidatenlisten & stabilere Parser.
+# - Keine Caches in enrich_and_merge, damit neue Uploads sofort berechnet werden.
+# - Wetter: Montag 12:00 (Zug/CH) via meteostat 1.7.x (ohne tz-Argument), Overlay im Wochen-Chart.
 
 import os
 import io
 import re
-import sys
 import unicodedata
 import numpy as np
 import pandas as pd
@@ -19,20 +20,12 @@ from datetime import datetime
 from collections.abc import Mapping
 import warnings
 
-# ==============================
-# Optionaler Import: Meteostat
-# ==============================
-METEOSTAT_OK = False
+# ===== Meteostat optional laden (Fallback, falls nicht installiert) =====
 try:
-    from meteostat import Hourly, Point  # type: ignore
-    from zoneinfo import ZoneInfo
+    from meteostat import Hourly, Point  # meteostat >= 1.7.x (ohne tz-Argument)
     METEOSTAT_OK = True
 except Exception:
-    # Fallback ohne Absturz – UI Hinweis folgt weiter unten
-    try:
-        from zoneinfo import ZoneInfo  # ist Teil der Stdlib (Py3.9+)
-    except Exception:
-        ZoneInfo = None  # sehr seltene Python-Version
+    METEOSTAT_OK = False
 
 # ================
 # Globale Settings
@@ -59,6 +52,8 @@ MAX_QTY, MAX_PRICE = 1_000_000, 1_000_000
 # =========================
 # 🔐 Auth – Passcode only
 # =========================
+from typing import Optional, List
+
 def _to_plain_mapping(obj) -> dict:
     if obj is None:
         return {}
@@ -83,7 +78,7 @@ def _auth_cfg() -> dict:
 def auth_enabled() -> bool:
     return bool(_auth_cfg().get("require_login", True))
 
-def _get_passcode() -> str | None:
+def _get_passcode() -> Optional[str]:
     # 1) Query-Parameter (1.40+)
     try:
         qp = st.query_params
@@ -175,6 +170,7 @@ def style_numeric(df: pd.DataFrame, num_cols=NUM_COLS_DEFAULT, sep=THOUSANDS_SEP
     return out, out.style.format(fmt)
 
 def append_total_row_for_display(df: pd.DataFrame) -> pd.DataFrame:
+    """Σ-Gesamt ans Ende anhängen (nur UI-Anzeige)."""
     if df is None or df.empty:
         return df
     cols = list(df.columns)
@@ -236,12 +232,13 @@ def normalize_key(s: str) -> str:
     s = s.lower()
     return re.sub(r"[^a-z0-9]+", "", s)
 
-def find_column(df: pd.DataFrame, candidates, purpose: str, required=True) -> str | None:
+def find_column(df: pd.DataFrame, candidates, purpose: str, required=True) -> Optional[str]:
     cols = list(df.columns)
     # 1) exakte Matches
     for cand in candidates:
         if cand in cols:
             return cand
+
     # 2) normalisierte Matches (Dashes/Spaces/Points egal)
     def _norm(s: str) -> str:
         tmp = re.sub(r"\s+", "", str(s))
@@ -255,11 +252,13 @@ def find_column(df: pd.DataFrame, candidates, purpose: str, required=True) -> st
         }))
         tmp = re.sub(r"[\-*/.]+", "", tmp)
         return tmp.lower()
+
     canon = {_norm(c): c for c in cols}
     for cand in candidates:
         key = _norm(cand)
         if key in canon:
             return canon[key]
+
     if required:
         raise KeyError(
             f"Spalte für «{purpose}» fehlt – gesucht unter {candidates}.\n"
@@ -350,11 +349,13 @@ def make_family_key(name: str) -> str:
 
 def extract_color_from_name(name: str) -> str:
     if not isinstance(name, str): return ""
+    # 1) explizite Farbangabe am Ende nach Bindestrich oder Slash
     m = re.search(r"(?:-|/)\s*([A-Za-z äöüÄÖÜß]+)\s*$", name.strip())
     if m:
         cand = m.group(1).strip().lower()
         if not _looks_like_not_a_color(cand):
             return _COLOR_MAP.get(cand, cand.title())
+    # 2) innerhalb des Namens
     for w in sorted(_COLOR_WORDS, key=len, reverse=True):
         if re.search(rf"\b{re.escape(w)}\b", name, flags=re.I):
             if not _looks_like_not_a_color(w):
@@ -411,6 +412,7 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     out["Bezeichnung_key"] = out["Bezeichnung"].map(normalize_key)
     out["Familie"]         = out["Bezeichnung"].map(make_family_key)
 
+    # Kategorie bereinigen
     if col_cat:
         out["Kategorie"] = (
             df[col_cat].astype(str)
@@ -420,6 +422,7 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     else:
         out["Kategorie"] = ""
 
+    # Farbe
     col_color = find_column(df, COLOR_CANDIDATES, "Farbe/Variante", required=False)
     if col_color:
         out["Farbe"] = df[col_color].astype(str).map(lambda v: _COLOR_MAP.get(str(v).lower(), str(v)))
@@ -435,6 +438,7 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     if "Einkaufspreis" not in out: out["Einkaufspreis"] = out.get("Verkaufspreis", pd.Series([np.nan]*len(out)))
     if "Verkaufspreis" not in out: out["Verkaufspreis"] = out.get("Einkaufspreis", pd.Series([np.nan]*len(out)))
 
+    # Dedupe: Kategorie > Preis > Farbe
     out = out.assign(
         _cat=out["Kategorie"].astype(bool).astype(int),
         _price=out["Verkaufspreis"].notna().astype(int),
@@ -476,7 +480,7 @@ def _apply_hints_to_row(name_raw: str) -> dict:
         if "mia" in s and "m-057" in s: h["hint_art_exact"]="m057"
     return h
 
-def _fallback_col_by_index(df: pd.DataFrame, idx0: int) -> str | None:
+def _fallback_col_by_index(df: pd.DataFrame, idx0: int) -> Optional[str]:
     try:
         return df.columns[idx0]
     except Exception:
@@ -599,6 +603,10 @@ def _final_backstops(merged: pd.DataFrame, price_df: pd.DataFrame):
 # Merge & Werte (+ Quelle für Chart)
 # =========================
 def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, latest_stock_baseline_df: pd.DataFrame | None = None):
+    """
+    Merge sell-out data with price list and compute aggregated values.
+    (ohne Cache – damit neue Uploads sofort berechnet werden)
+    """
     if filtered_sell_df is None or price_df is None or filtered_sell_df.empty or price_df.empty:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
@@ -780,6 +788,94 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
     return detail, totals, ts_source
 
 # =========================
+# Wetter: Mo 12:00 (Zug/CH) – meteostat 1.7.x
+# =========================
+def _classify_condition(coco, prcp, cldc) -> str:
+    # sehr einfache Klassifizierung
+    try:
+        coco = int(coco) if coco is not None and not pd.isna(coco) else None
+    except Exception:
+        coco = None
+    if prcp and prcp > 0.0:
+        return "Regen"
+    if cldc is not None and not pd.isna(cldc):
+        if cldc >= 0.7:
+            return "Bewölkt"
+        if cldc <= 0.3:
+            return "Sonnig"
+    if coco in {0, 1}:
+        return "Sonnig"
+    if coco in {2, 3}:
+        return "Bewölkt"
+    if coco in {5, 6, 7, 8, 9}:
+        return "Regen"
+    return "—"
+
+def fetch_monday_noon_weather(period_starts: List[pd.Timestamp],
+                              lat: float = 47.166, lon: float = 8.516) -> pd.DataFrame:
+    """
+    Liefert Wetter für Zug (CH) Montag 12:00 zu gegebenen Wochenstarts.
+    Rückgabe: DataFrame mit Spalten ['Periode','temp12','cond','prcp','cldc'].
+    Falls meteostat nicht verfügbar -> leeres DF.
+    """
+    if not period_starts:
+        return pd.DataFrame(columns=["Periode","temp12","cond","prcp","cldc"])
+    if not METEOSTAT_OK:
+        return pd.DataFrame(columns=["Periode","temp12","cond","prcp","cldc"])
+
+    tz_str = "Europe/Zurich"
+
+    # Periode -> Montag 12:00 (lokal, später tz-konvertiert)
+    def _to_monday_noon(p):
+        ts = pd.Timestamp(p).floor("D")
+        return ts + pd.Timedelta(hours=12)
+
+    mondays_local = [_to_monday_noon(p) for p in period_starts]
+    start = min(mondays_local) - pd.Timedelta(hours=2)
+    end   = max(mondays_local) + pd.Timedelta(hours=2)
+
+    # meteostat 1.7.x: KEIN tz-Argument
+    zug = Point(lat, lon, 425)
+    df_h = Hourly(zug, start, end).fetch()
+    if df_h is None or df_h.empty:
+        return pd.DataFrame(columns=["Periode","temp12","cond","prcp","cldc"])
+
+    # Zeitzone korrekt anwenden
+    if df_h.index.tz is None:
+        df_h.index = df_h.index.tz_localize("UTC").tz_convert(tz_str)
+    else:
+        df_h.index = df_h.index.tz_convert(tz_str)
+
+    rows = []
+    for m in mondays_local:
+        m_zrh = pd.Timestamp(m, tz=tz_str)
+        exact = df_h.loc[df_h.index.floor("H") == m_zrh.floor("H")]
+        if exact.empty:
+            win = df_h.loc[(df_h.index >= m_zrh - pd.Timedelta(hours=2)) &
+                           (df_h.index <= m_zrh + pd.Timedelta(hours=2))]
+            if win.empty:
+                continue
+            idx = (win.index - m_zrh).abs().argmin()
+            r = win.loc[idx]
+        else:
+            r = exact.iloc[0]
+
+        temp = float(r.get("temp")) if r.get("temp") is not None else np.nan
+        prcp = float(r.get("prcp")) if r.get("prcp") is not None else 0.0
+        cldc = float(r.get("cldc")) if r.get("cldc") is not None else np.nan
+        coco = r.get("coco")
+
+        rows.append({
+            "Periode": pd.Timestamp(m).to_pydatetime(),  # naive -> passt zu ts_agg['Periode']
+            "temp12": temp,
+            "prcp": prcp,
+            "cldc": cldc,
+            "cond": _classify_condition(coco, prcp, cldc)
+        })
+
+    return pd.DataFrame(rows, columns=["Periode","temp12","cond","prcp","cldc"])
+
+# =========================
 # Datenquellen / Persistieren (robust, Auto-Erkennung)
 # =========================
 BASE_DIR = Path(__file__).resolve().parent
@@ -818,7 +914,7 @@ def _persist_upload(uploaded_file, target_path: Path):
     with open(target_path, "wb") as f:
         f.write(content)
 
-def _guess_role_from_name(name: str) -> str | None:
+def _guess_role_from_name(name: str) -> Optional[str]:
     n = name.lower()
     if any(k in n for k in ["sell-out", "sellout", "sell", "sales", "report"]):
         return "sell"
@@ -826,7 +922,7 @@ def _guess_role_from_name(name: str) -> str | None:
         return "price"
     return None
 
-def _pick_default_files_from_dir(folder: Path) -> tuple[io.BytesIO | None, io.BytesIO | None, str | None, str | None]:
+def _pick_default_files_from_dir(folder: Path) -> tuple[io.BytesIO | None, io.BytesIO | None, Optional[str], Optional[str]]:
     sell_bytes = price_bytes = None
     sell_name = price_name = None
     xlsx_files = sorted([p for p in folder.glob("*.xlsx") if p.is_file()])
@@ -854,16 +950,6 @@ def _pick_default_files_from_dir(folder: Path) -> tuple[io.BytesIO | None, io.By
 # UI
 # =====
 st.title("Analyse")
-
-# Sidebar: Wetter-Overlay Toggle & Install-Hinweis
-with st.sidebar:
-    st.markdown("### Wetter-Overlay")
-    want_weather = st.checkbox("Wetter (Zug, Mo 12:00) anzeigen", value=True)
-    if want_weather and not METEOSTAT_OK:
-        st.warning(
-            "Meteostat ist nicht installiert – Wetter-Overlay wird übersprungen.\n\n"
-            "Lösung: `pip install meteostat` **oder** füge `meteostat` zur `requirements.txt` hinzu."
-        )
 
 c1, c2 = st.columns(2)
 with c1:
@@ -905,91 +991,6 @@ if raw_sell is None or raw_price is None:
         raw_sell = read_excel_flat(sbytes); used_sell_name = sname
     if raw_price is None and pbytes is not None:
         raw_price = read_excel_flat(pbytes); used_price_name = pname
-
-# =========================
-# Wetter-Helfer (robust)
-# =========================
-def _classify_condition(coco: float | int | None, prcp: float | None, cldc: float | None) -> str:
-    try:
-        c = int(coco) if coco is not None else None
-    except Exception:
-        c = None
-    p = float(prcp) if prcp is not None else 0.0
-    cc = float(cldc) if cldc is not None else None
-
-    if p and p > 0:
-        return "Regnerisch"
-    if c is not None and c >= 7:
-        return "Regnerisch"
-    if c in (1, 2):
-        return "Sonnig"
-    if cc is not None and cc <= 30:
-        return "Sonnig"
-    return "Bewölkt"
-
-def fetch_monday_noon_weather(period_starts: list[pd.Timestamp],
-                              lat: float = 47.166, lon: float = 8.516) -> pd.DataFrame:
-    """Gibt DataFrame ['Periode','temp12','cond','prcp','cldc'] zurück. Leeres DF bei fehlendem meteostat."""
-    if not period_starts:
-        return pd.DataFrame(columns=["Periode","temp12","cond","prcp","cldc"])
-    if not METEOSTAT_OK:
-        return pd.DataFrame(columns=["Periode","temp12","cond","prcp","cldc"])
-
-    tz_str = "Europe/Zurich"
-
-    # Periode -> Montag 12:00 in Europe/Zurich (naiv -> später konvertiert)
-    def _to_monday_noon(p):
-        ts = pd.Timestamp(p).floor("D")
-        # 'W' Periodenstart ist Montag; setze 12:00
-        return ts + pd.Timedelta(hours=12)
-
-    mondays_local = [_to_monday_noon(p) for p in period_starts]
-    start = min(mondays_local) - pd.Timedelta(hours=2)
-    end   = max(mondays_local) + pd.Timedelta(hours=2)
-
-    # Meteostat: kein tz-Argument mehr in 1.7.x
-    zug = Point(lat, lon, 425)
-    df_h = Hourly(zug, start, end).fetch()
-    if df_h is None or df_h.empty:
-        return pd.DataFrame(columns=["Periode","temp12","cond","prcp","cldc"])
-
-    # Zeitzone auf Europe/Zurich bringen
-    if df_h.index.tz is None:
-        df_h.index = df_h.index.tz_localize("UTC").tz_convert(tz_str)
-    else:
-        df_h.index = df_h.index.tz_convert(tz_str)
-
-    # Exakt Mo 12:00 suchen (bzw. nächster Wert ±2h)
-    pick = df_h.copy()
-    rows = []
-    for m in mondays_local:
-        m_zurich = pd.Timestamp(m, tz=tz_str)
-        # idealer Treffer
-        exact = pick.loc[pick.index.floor("H") == m_zurich.floor("H")]
-        if exact.empty:
-            around = pick.loc[(pick.index >= m_zurich - pd.Timedelta(hours=2)) &
-                              (pick.index <= m_zurich + pd.Timedelta(hours=2))]
-            if around.empty:
-                continue
-            idx = (around.index - m_zurich).abs().argmin()
-            r = around.loc[idx]
-        else:
-            r = exact.iloc[0]
-
-        temp = float(r.get("temp")) if r.get("temp") is not None else np.nan
-        prcp = float(r.get("prcp")) if r.get("prcp") is not None else 0.0
-        cldc = float(r.get("cldc")) if r.get("cldc") is not None else np.nan
-        coco = r.get("coco")
-
-        rows.append({
-            "Periode": pd.Timestamp(m).to_pydatetime(),  # naive, wie deine ts_agg['Periode']
-            "temp12": temp,
-            "prcp": prcp,
-            "cldc": cldc,
-            "cond": _classify_condition(coco, prcp, cldc)
-        })
-
-    return pd.DataFrame(rows, columns=["Periode","temp12","cond","prcp","cldc"])
 
 # Verarbeitung
 if (raw_sell is not None) and (raw_price is not None):
@@ -1045,7 +1046,7 @@ if (raw_sell is not None) and (raw_price is not None):
         st.markdown("### 📈 Verkaufsverlauf nach Kategorie (Woche)")
         if not ts_source.empty:
             ts = ts_source.dropna(subset=["StartDatum"]).copy()
-            ts["Periode"]   = ts["StartDatum"].dt.to_period("W").dt.start_time  # Montag
+            ts["Periode"]   = ts["StartDatum"].dt.to_period("W").dt.start_time
             ts["Kategorie"] = ts["Kategorie"].astype("string")
 
             all_cats = sorted(ts["Kategorie"].unique())
@@ -1060,20 +1061,19 @@ if (raw_sell is not None) and (raw_price is not None):
             ts_agg["Kategorie"]  = ts_agg["Kategorie"].astype(str)
             ts_agg["Wert (CHF)"] = pd.to_numeric(ts_agg["Wert (CHF)"], errors="coerce").fillna(0.0).astype(float)
 
-            # >>> Wetter holen & mergen (Zug, Montag 12:00), nur wenn aktiviert & verfügbar
-            if want_weather and METEOSTAT_OK:
-                period_starts = sorted(pd.to_datetime(ts_agg["Periode"]).dropna().unique().tolist())
-                wx = fetch_monday_noon_weather(period_starts, lat=47.166, lon=8.516)  # Zug
-                ts_plot = ts_agg.merge(wx, on="Periode", how="left")
-            else:
-                ts_plot = ts_agg.copy()
-                ts_plot["temp12"] = np.nan
-                ts_plot["cond"]   = None
+            # ---------- Wetterdaten (Montag 12:00) ----------
+            unique_weeks = sorted(ts_agg["Periode"].dropna().unique().tolist())
+            weather_df = fetch_monday_noon_weather([pd.Timestamp(x) for x in unique_weeks])
+            # y-Position der Wettermarker leicht oberhalb der max. Linie
+            y_max = float(ts_agg["Wert (CHF)"].max() or 0.0)
+            if not weather_df.empty:
+                weather_plot = weather_df.copy()
+                weather_plot["ypos"] = y_max * 1.05 if y_max > 0 else 1.0
 
             hover_cat = alt.selection_single(fields=["Kategorie"], on="mouseover", nearest=True, empty="none")
-            base = alt.Chart(ts_plot)
+            hover_pt  = alt.selection_single(fields=["Periode","Kategorie"], on="mouseover", nearest=True, empty="none")
 
-            # Linien (Sales)
+            base = alt.Chart(ts_agg)
             lines = (
                 base.mark_line(point=alt.OverlayMarkDef(size=30), interpolate="linear")
                 .encode(
@@ -1086,50 +1086,67 @@ if (raw_sell is not None) and (raw_price is not None):
                         alt.Tooltip("Periode:T", title="Woche"),
                         alt.Tooltip("Kategorie:N", title="Kategorie"),
                         alt.Tooltip("Wert (CHF):Q", title="Verkaufswert (CHF)", format=",.0f"),
-                        alt.Tooltip("temp12:Q", title="Montag 12:00 (°C)", format=".1f"),
-                        alt.Tooltip("cond:N", title="Wetter (Mo 12:00)"),
                     ],
                 )
                 .add_selection(hover_cat)
             )
+            points = (
+                base.mark_point(size=70, opacity=0)
+                .encode(x="Periode:T", y="Wert (CHF):Q", color="Kategorie:N")
+                .add_selection(hover_pt)
+            )
+            popup = (
+                base.transform_filter(hover_pt)
+                .mark_text(align='left', dx=6, dy=-8, fontSize=12, fontWeight='bold')
+                .encode(x="Periode:T", y="Wert (CHF):Q", text="Kategorie:N", color="Kategorie:N")
+            )
+            end_labels = (
+                base.transform_window(
+                    row_number='row_number()',
+                    sort=[alt.SortField(field='Periode', order='descending')],
+                    groupby=['Kategorie']
+                )
+                .transform_filter(alt.datum.row_number == 0)
+                .mark_text(align='left', dx=6, dy=-6, fontSize=11)
+                .encode(x='Periode:T', y='Wert (CHF):Q', text='Kategorie:N', color='Kategorie:N',
+                        opacity=alt.condition(hover_cat, alt.value(1.0), alt.value(0.6)))
+            )
 
-            layers = [lines]
+            chart = (lines + points + popup + end_labels)
 
-            # Wetterpunkte + Labels nur zeichnen, wenn Daten vorhanden
-            if want_weather and METEOSTAT_OK:
-                cond_scale = alt.Scale(domain=["Sonnig","Bewölkt","Regnerisch"],
-                                       range=["#FFD700","#A0A0A0","#3A83C0"])
+            # Wetter-Layer (wenn vorhanden)
+            if METEOSTAT_OK and ('weather_plot' in locals()) and not weather_plot.empty:
+                wx_shape_scale = alt.Scale(domain=["Sonnig","Bewölkt","Regen","—"],
+                                           range=["triangle-up","circle","square","diamond"])
                 wx_points = (
-                    base.mark_point(filled=True, size=90, opacity=0.85)
+                    alt.Chart(weather_plot)
+                    .mark_point(size=100, filled=True, opacity=0.9)
                     .encode(
-                        x="Periode:T",
-                        y="Wert (CHF):Q",
-                        shape=alt.value("circle"),
-                        color=alt.Color("cond:N", title="Wetter (Mo 12:00)", scale=cond_scale),
+                        x=alt.X("Periode:T"),
+                        y=alt.Y("ypos:Q"),
+                        shape=alt.Shape("cond:N", title="Wetter", scale=wx_shape_scale),
                         tooltip=[
                             alt.Tooltip("Periode:T", title="Woche"),
-                            alt.Tooltip("temp12:Q", title="Montag 12:00 (°C)", format=".1f"),
-                            alt.Tooltip("cond:N", title="Wetter (Mo 12:00)"),
+                            alt.Tooltip("temp12:Q", title="Temp 12:00°C", format=".1f"),
+                            alt.Tooltip("cond:N",  title="Wetter"),
+                            alt.Tooltip("prcp:Q",  title="Niederschlag (mm)", format=".1f"),
                         ],
                     )
                 )
-                wx_labels = (
-                    base.mark_text(dy=-12, fontSize=11)
+                wx_text = (
+                    alt.Chart(weather_plot)
+                    .mark_text(dy=-12, fontSize=11, fontWeight='bold')
                     .encode(
                         x="Periode:T",
-                        y="Wert (CHF):Q",
-                        text=alt.Text("temp12:Q", format=".0f"),
-                        color=alt.value("black"),
+                        y="ypos:Q",
+                        text=alt.Text("temp12:Q", format=".1f")
                     )
-                    .transform_filter(alt.datum.temp12 != None)
                 )
-                layers += [wx_points, wx_labels]
+                chart = (chart + wx_points + wx_text).properties(height=420)
+            else:
+                chart = chart.properties(height=400)
 
-            chart = alt.layer(*layers).properties(height=400)
             st.altair_chart(chart, use_container_width=True)
-
-            if want_weather and not METEOSTAT_OK:
-                st.caption("Wetter deaktiviert: Paket `meteostat` nicht installiert.")
 
         else:
             st.info("Für den Verlauf werden gültige Startdaten benötigt.")
