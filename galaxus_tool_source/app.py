@@ -935,57 +935,61 @@ def fetch_monday_noon_weather(period_starts: list[pd.Timestamp],
     if not METEOSTAT_OK:
         return pd.DataFrame(columns=["Periode","temp12","cond","prcp","cldc"])
 
-    # Periode -> Montag 12:00 (Europe/Zurich)
-    tz = ZoneInfo("Europe/Zurich") if ZoneInfo else None
+    tz_str = "Europe/Zurich"
+
+    # Periode -> Montag 12:00 in Europe/Zurich (naiv -> später konvertiert)
     def _to_monday_noon(p):
-        ts = pd.Timestamp(p)
-        if tz:
-            if ts.tzinfo is None:
-                ts = ts.tz_localize(tz, nonexistent="shift_forward", ambiguous="NaT")
-            else:
-                ts = ts.tz_convert(tz)
-        return ts.replace(hour=12, minute=0, second=0, microsecond=0)
+        ts = pd.Timestamp(p).floor("D")
+        # 'W' Periodenstart ist Montag; setze 12:00
+        return ts + pd.Timedelta(hours=12)
 
-    mondays = [ _to_monday_noon(p) for p in period_starts ]
+    mondays_local = [_to_monday_noon(p) for p in period_starts]
+    start = min(mondays_local) - pd.Timedelta(hours=2)
+    end   = max(mondays_local) + pd.Timedelta(hours=2)
 
+    # Meteostat: kein tz-Argument mehr in 1.7.x
     zug = Point(lat, lon, 425)
-    start = min(mondays)
-    end   = max(mondays) + pd.Timedelta(hours=12)
-
-    df_h = Hourly(zug, start, end, tz="Europe/Zurich").fetch()
+    df_h = Hourly(zug, start, end).fetch()
     if df_h is None or df_h.empty:
         return pd.DataFrame(columns=["Periode","temp12","cond","prcp","cldc"])
 
-    # Index lokal
-    df_h = df_h.copy()
-    df_h.index = pd.to_datetime(df_h.index)
+    # Zeitzone auf Europe/Zurich bringen
+    if df_h.index.tz is None:
+        df_h.index = df_h.index.tz_localize("UTC").tz_convert(tz_str)
+    else:
+        df_h.index = df_h.index.tz_convert(tz_str)
 
-    pick = df_h.loc[df_h.index.hour == 12].copy()
+    # Exakt Mo 12:00 suchen (bzw. nächster Wert ±2h)
+    pick = df_h.copy()
     rows = []
-    for m in mondays:
-        cand = pick.loc[pick.index.date == m.date()]
-        if cand.empty:
-            around = df_h.loc[(df_h.index >= m - pd.Timedelta(hours=2)) & (df_h.index <= m + pd.Timedelta(hours=2))]
+    for m in mondays_local:
+        m_zurich = pd.Timestamp(m, tz=tz_str)
+        # idealer Treffer
+        exact = pick.loc[pick.index.floor("H") == m_zurich.floor("H")]
+        if exact.empty:
+            around = pick.loc[(pick.index >= m_zurich - pd.Timedelta(hours=2)) &
+                              (pick.index <= m_zurich + pd.Timedelta(hours=2))]
             if around.empty:
                 continue
-            idx = (around.index - m).abs().argmin()
-            row = around.loc[[idx]]
+            idx = (around.index - m_zurich).abs().argmin()
+            r = around.loc[idx]
         else:
-            row = cand.iloc[[0]]
+            r = exact.iloc[0]
 
-        r = row.iloc[0]
         temp = float(r.get("temp")) if r.get("temp") is not None else np.nan
         prcp = float(r.get("prcp")) if r.get("prcp") is not None else 0.0
         cldc = float(r.get("cldc")) if r.get("cldc") is not None else np.nan
         coco = r.get("coco")
+
         rows.append({
-            "Periode": pd.Timestamp(m).tz_localize(None) if hasattr(pd.Timestamp(m), "tz_localize") else pd.Timestamp(m),
+            "Periode": pd.Timestamp(m).to_pydatetime(),  # naive, wie deine ts_agg['Periode']
             "temp12": temp,
             "prcp": prcp,
             "cldc": cldc,
             "cond": _classify_condition(coco, prcp, cldc)
         })
-    return pd.DataFrame(rows)
+
+    return pd.DataFrame(rows, columns=["Periode","temp12","cond","prcp","cldc"])
 
 # Verarbeitung
 if (raw_sell is not None) and (raw_price is not None):
