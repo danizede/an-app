@@ -1,15 +1,14 @@
 # app.py
-# Updated Streamlit Analyse-Tool – robuste Persistenz & _rowdate-Fix + Wetter-Overlay (Zug, Mo 12:00)
+# Updated Streamlit Analyse-Tool – robuste Persistenz & _rowdate-Fix + Wetter-Overlay (Zug, Mo 12:00, optional)
 # - Persistenz: Zuletzt hochgeladene sellout.xlsx / preisliste.xlsx werden gespeichert
 #   und bei Neustart/Laden automatisch verwendet. Überschreiben nur bei echtem Upload.
 # - _rowdate-Fix: Kein KeyError mehr bei Zeitfenster-Filterung (schrittweise Filterung auf sv_in).
-# - Erweiterte Kandidatenlisten & stabilere Parser.
-# - Keine Caches in enrich_and_merge, damit neue Uploads sofort berechnet werden.
-# - Wetter-Overlay: Temperatur (°C) & Zustand (Sonnig/Bewölkt/Regnerisch) am Montag 12:00 in Zug.
+# - Wetter-Overlay: sauber gekapselt & optional; App stürzt nicht ab, wenn meteostat fehlt.
 
 import os
 import io
 import re
+import sys
 import unicodedata
 import numpy as np
 import pandas as pd
@@ -20,9 +19,20 @@ from datetime import datetime
 from collections.abc import Mapping
 import warnings
 
-# >>> Wetter-Integration
-from meteostat import Hourly, Point
-from zoneinfo import ZoneInfo
+# ==============================
+# Optionaler Import: Meteostat
+# ==============================
+METEOSTAT_OK = False
+try:
+    from meteostat import Hourly, Point  # type: ignore
+    from zoneinfo import ZoneInfo
+    METEOSTAT_OK = True
+except Exception:
+    # Fallback ohne Absturz – UI Hinweis folgt weiter unten
+    try:
+        from zoneinfo import ZoneInfo  # ist Teil der Stdlib (Py3.9+)
+    except Exception:
+        ZoneInfo = None  # sehr seltene Python-Version
 
 # ================
 # Globale Settings
@@ -184,6 +194,7 @@ def read_excel_flat(upload) -> pd.DataFrame:
     raw = pd.read_excel(upload, header=None, dtype=object)
     if raw.empty:
         return pd.DataFrame()
+    # Header-Zeile heuristisch: Zeile mit den meisten Non-NaNs
     header_idx = int(raw.notna().mean(axis=1).idxmax())
     headers = raw.iloc[header_idx].fillna("").astype(str).tolist()
     headers = [re.sub(r"\s+", " ", h).strip() for h in headers]
@@ -194,6 +205,7 @@ def read_excel_flat(upload) -> pd.DataFrame:
         headers = headers[:n]
     df = raw.iloc[header_idx + 1:].reset_index(drop=True)
     df.columns = headers
+    # doppelte Spalten entschärfen
     seen, newcols = {}, []
     for c in df.columns:
         if c in seen:
@@ -226,13 +238,20 @@ def normalize_key(s: str) -> str:
 
 def find_column(df: pd.DataFrame, candidates, purpose: str, required=True) -> str | None:
     cols = list(df.columns)
+    # 1) exakte Matches
     for cand in candidates:
         if cand in cols:
             return cand
+    # 2) normalisierte Matches (Dashes/Spaces/Points egal)
     def _norm(s: str) -> str:
         tmp = re.sub(r"\s+", "", str(s))
         tmp = tmp.translate(str.maketrans({
-            "\u2010": "-", "\u2011": "-", "\u2012": "-", "\u2013": "-", "\u2014": "-", "\u2015": "-",
+            "\u2010": "-",  # hyphen
+            "\u2011": "-",  # non-breaking hyphen
+            "\u2012": "-",  # figure dash
+            "\u2013": "-",  # en dash
+            "\u2014": "-",  # em dash
+            "\u2015": "-",  # horizontal bar
         }))
         tmp = re.sub(r"[\-*/.]+", "", tmp)
         return tmp.lower()
@@ -591,7 +610,7 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
     # Merge für Lagerstand (UNGEFILTERTE Basis)
     stock_merged = sell_for_stock.merge(price_df, on=["ArtikelNr_key"], how="left", suffixes=("", "_pl"))
 
-    # Preisliste-Felder übernehmen
+    # Preisliste-Felder übernehmen (nur wenn leer, ausser Bezeichnung -> immer PL)
     for df_tmp in (merged, stock_merged):
         for col in ["Bezeichnung", "Familie", "Farbe", "Kategorie", "ArtikelNr"]:
             pl_col = f"{col}_pl"
@@ -603,6 +622,7 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
                     df_tmp[col] = df_tmp[col].where(mask_valid, df_tmp[pl_col])
                 df_tmp.drop(columns=[pl_col], inplace=True, errors="ignore")
 
+    # Hilfsdatum
     def _row_date(df):
         if ("EndDatum" in df.columns) and ("StartDatum" in df.columns):
             d = df["EndDatum"].fillna(df["StartDatum"])
@@ -617,7 +637,7 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
     merged["_rowdate"]       = _row_date(merged)
     stock_merged["_rowdate"] = _row_date(stock_merged)
 
-    # Fallbacks (EAN)
+    # Fallback-Matches (nur auf Umsatz-Merge)
     need = merged["Verkaufspreis"].isna() & merged["EAN_key"].astype(bool)
     if need.any():
         tmp = merged.loc[need, ["EAN_key"]].merge(
@@ -644,6 +664,7 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
 
     _final_backstops(merged, price_df)
 
+    # Strings säubern
     for df2 in (merged, stock_merged):
         df2["Kategorie"] = (
             df2.get("Kategorie", "").fillna("")
@@ -654,6 +675,7 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
         df2["Bezeichnung"] = df2.get("Bezeichnung"," ").fillna("")
         df2["Farbe"]       = df2.get("Farbe"," ").fillna("")
 
+    # Anzeige-Bezeichnung (bei Duplikaten Farbe anhängen)
     merged["Bezeichnung_anzeige"] = merged["Bezeichnung"]
     def _looks_like_not_a_color2(token: str) -> bool:
         t = (token or "").strip().lower()
@@ -664,11 +686,13 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
         merged.loc[dup & valid_color, "Bezeichnung"] + " – " + merged.loc[dup & valid_color, "Farbe"].astype(str).str.strip()
     )
 
+    # Umsatz-Werte
     q_buy,  p_buy  = sanitize_numbers(merged.get("Einkaufsmenge", 0), merged.get("Einkaufspreis", 0))
     q_sell, p_sell = sanitize_numbers(merged.get("Verkaufsmenge", 0), merged.get("Verkaufspreis", 0))
     merged["Einkaufswert"] = safe_mul(q_buy.fillna(0.0),  p_buy.fillna(0.0))
     merged["Verkaufswert"] = safe_mul(q_sell.fillna(0.0), p_sell.fillna(0.0))
 
+    # Aktuellster Lagerstand aus Sell-out (nicht aufsummieren)
     stock_merged = stock_merged.copy()
     if "SellLagermenge" in stock_merged.columns:
         stock_valid = stock_merged.loc[stock_merged["SellLagermenge"].notna()].copy()
@@ -681,6 +705,7 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
         stock_valid = stock_merged.iloc[0:0].copy()
         stock_valid["SellLagermenge"] = np.nan
 
+    # >>> _rowdate-Absicherung, falls noch nicht vorhanden
     if "_rowdate" not in stock_valid.columns:
         stock_valid["_rowdate"] = pd.to_datetime(pd.NaT)
 
@@ -696,6 +721,7 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
     period_min = pd.to_datetime(merged["_rowdate"]).min()
     period_max = pd.to_datetime(merged["_rowdate"]).max()
 
+    # --- robustes Zeitfenster-Filtering für Lager-Snapshot ---
     sv_in = stock_valid.copy()
     if "_rowdate" not in sv_in.columns:
         sv_in["_rowdate"] = pd.to_datetime(pd.NaT)
@@ -703,6 +729,7 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
         sv_in = sv_in.loc[sv_in["_rowdate"] >= period_min]
     if pd.notna(period_max):
         sv_in = sv_in.loc[sv_in["_rowdate"] <= period_max]
+    # ---------------------------------------------------------
 
     if sv_in.empty:
         latest_qty_map = {}
@@ -727,6 +754,7 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
     )
     merged["Lagerwert_latest"] = safe_mul(merged["Lagermenge_latest"], merged["Verkaufspreis_latest"])
 
+    # Tabellen
     detail = merged[["ArtikelNr","Bezeichnung_anzeige","Kategorie",
                      "Einkaufsmenge","Einkaufswert","Verkaufsmenge","Verkaufswert"]].copy()
     detail["Lagermenge"] = merged["Lagermenge_latest"]
@@ -758,8 +786,8 @@ BASE_DIR = Path(__file__).resolve().parent
 
 def _find_data_dir() -> Path:
     candidates = [
-        BASE_DIR / "data",
-        BASE_DIR.parent / "data",
+        BASE_DIR / "data",        # ./data neben app.py
+        BASE_DIR.parent / "data", # eine Ebene höher
     ]
     for p in candidates:
         if p.exists():
@@ -772,6 +800,7 @@ DEFAULT_SELL_PATH  = DATA_DIR / "sellout.xlsx"
 DEFAULT_PRICE_PATH = DATA_DIR / "preisliste.xlsx"
 
 def _persist_upload(uploaded_file, target_path: Path):
+    """Speichert nur, wenn echter Upload bzw. geänderter Inhalt."""
     if uploaded_file is None:
         return
     try:
@@ -782,7 +811,7 @@ def _persist_upload(uploaded_file, target_path: Path):
     if target_path.exists():
         try:
             if target_path.read_bytes() == content:
-                return
+                return  # identisch -> nichts tun
         except Exception:
             pass
 
@@ -803,12 +832,14 @@ def _pick_default_files_from_dir(folder: Path) -> tuple[io.BytesIO | None, io.By
     xlsx_files = sorted([p for p in folder.glob("*.xlsx") if p.is_file()])
     if not xlsx_files:
         return None, None, None, None
+    # 1) per Keywords
     for p in xlsx_files:
         role = _guess_role_from_name(p.name)
         if role == "sell" and sell_bytes is None:
             sell_bytes = io.BytesIO(p.read_bytes()); sell_name = p.name
         elif role == "price" and price_bytes is None:
             price_bytes = io.BytesIO(p.read_bytes()); price_name = p.name
+    # 2) Rest auffüllen
     leftovers = [p for p in xlsx_files if p.name not in {sell_name, price_name}]
     for p in leftovers:
         if sell_bytes is None:
@@ -824,6 +855,16 @@ def _pick_default_files_from_dir(folder: Path) -> tuple[io.BytesIO | None, io.By
 # =====
 st.title("Analyse")
 
+# Sidebar: Wetter-Overlay Toggle & Install-Hinweis
+with st.sidebar:
+    st.markdown("### Wetter-Overlay")
+    want_weather = st.checkbox("Wetter (Zug, Mo 12:00) anzeigen", value=True)
+    if want_weather and not METEOSTAT_OK:
+        st.warning(
+            "Meteostat ist nicht installiert – Wetter-Overlay wird übersprungen.\n\n"
+            "Lösung: `pip install meteostat` **oder** füge `meteostat` zur `requirements.txt` hinzu."
+        )
+
 c1, c2 = st.columns(2)
 with c1:
     st.subheader("Sell-out-Report (.xlsx)")
@@ -832,12 +873,13 @@ with c2:
     st.subheader("Preisliste (.xlsx)")
     price_file = st.file_uploader("Drag & drop oder Datei wählen", type=["xlsx"], key="price")
 
+# Auto-Load + Fallback (Default-first, dann Auto-Erkennung)
 raw_sell = None
 raw_price = None
 used_sell_name = None
 used_price_name = None
 
-# Uploads -> Persistieren
+# 0) Uploads – sofort verwenden und als DEFAULT_* persistieren
 if sell_file is not None:
     raw_sell = read_excel_flat(sell_file)
     used_sell_name = sell_file.name
@@ -848,7 +890,7 @@ if price_file is not None:
     used_price_name = price_file.name
     _persist_upload(price_file, DEFAULT_PRICE_PATH)
 
-# Defaults laden, falls nichts hochgeladen
+# 1) Falls im aktuellen Run nichts hochgeladen wurde: zuerst Standardnamen
 if raw_sell is None and DEFAULT_SELL_PATH.exists():
     raw_sell = read_excel_flat(io.BytesIO(DEFAULT_SELL_PATH.read_bytes()))
     used_sell_name = DEFAULT_SELL_PATH.name
@@ -856,7 +898,7 @@ if raw_price is None and DEFAULT_PRICE_PATH.exists():
     raw_price = read_excel_flat(io.BytesIO(DEFAULT_PRICE_PATH.read_bytes()))
     used_price_name = DEFAULT_PRICE_PATH.name
 
-# Heuristik im data/-Ordner
+# 2) Falls immer noch etwas fehlt: heuristische Auto-Erkennung im data/-Ordner
 if raw_sell is None or raw_price is None:
     sbytes, pbytes, sname, pname = _pick_default_files_from_dir(DATA_DIR)
     if raw_sell is None and sbytes is not None:
@@ -865,10 +907,8 @@ if raw_sell is None or raw_price is None:
         raw_price = read_excel_flat(pbytes); used_price_name = pname
 
 # =========================
-# >>> Wetter-Helfer (neu)
+# Wetter-Helfer (robust)
 # =========================
-TZ_CH = ZoneInfo("Europe/Zurich")
-
 def _classify_condition(coco: float | int | None, prcp: float | None, cldc: float | None) -> str:
     try:
         c = int(coco) if coco is not None else None
@@ -889,12 +929,24 @@ def _classify_condition(coco: float | int | None, prcp: float | None, cldc: floa
 
 def fetch_monday_noon_weather(period_starts: list[pd.Timestamp],
                               lat: float = 47.166, lon: float = 8.516) -> pd.DataFrame:
+    """Gibt DataFrame ['Periode','temp12','cond','prcp','cldc'] zurück. Leeres DF bei fehlendem meteostat."""
     if not period_starts:
         return pd.DataFrame(columns=["Periode","temp12","cond","prcp","cldc"])
-    mondays = [pd.Timestamp(p).tz_localize(TZ_CH, nonexistent="shift_forward", ambiguous="NaT").replace(
-                  hour=12, minute=0, second=0, microsecond=0) if pd.Timestamp(p).tzinfo is None
-               else pd.Timestamp(p).astimezone(TZ_CH).replace(hour=12, minute=0, second=0, microsecond=0)
-               for p in period_starts]
+    if not METEOSTAT_OK:
+        return pd.DataFrame(columns=["Periode","temp12","cond","prcp","cldc"])
+
+    # Periode -> Montag 12:00 (Europe/Zurich)
+    tz = ZoneInfo("Europe/Zurich") if ZoneInfo else None
+    def _to_monday_noon(p):
+        ts = pd.Timestamp(p)
+        if tz:
+            if ts.tzinfo is None:
+                ts = ts.tz_localize(tz, nonexistent="shift_forward", ambiguous="NaT")
+            else:
+                ts = ts.tz_convert(tz)
+        return ts.replace(hour=12, minute=0, second=0, microsecond=0)
+
+    mondays = [ _to_monday_noon(p) for p in period_starts ]
 
     zug = Point(lat, lon, 425)
     start = min(mondays)
@@ -904,10 +956,11 @@ def fetch_monday_noon_weather(period_starts: list[pd.Timestamp],
     if df_h is None or df_h.empty:
         return pd.DataFrame(columns=["Periode","temp12","cond","prcp","cldc"])
 
+    # Index lokal
     df_h = df_h.copy()
-    df_h.index = pd.to_datetime(df_h.index).tz_convert(TZ_CH)
-    pick = df_h.loc[df_h.index.hour == 12].copy()
+    df_h.index = pd.to_datetime(df_h.index)
 
+    pick = df_h.loc[df_h.index.hour == 12].copy()
     rows = []
     for m in mondays:
         cand = pick.loc[pick.index.date == m.date()]
@@ -915,18 +968,18 @@ def fetch_monday_noon_weather(period_starts: list[pd.Timestamp],
             around = df_h.loc[(df_h.index >= m - pd.Timedelta(hours=2)) & (df_h.index <= m + pd.Timedelta(hours=2))]
             if around.empty:
                 continue
-            # nächste Stunde zu 12:00
             idx = (around.index - m).abs().argmin()
             row = around.loc[[idx]]
         else:
             row = cand.iloc[[0]]
+
         r = row.iloc[0]
         temp = float(r.get("temp")) if r.get("temp") is not None else np.nan
         prcp = float(r.get("prcp")) if r.get("prcp") is not None else 0.0
         cldc = float(r.get("cldc")) if r.get("cldc") is not None else np.nan
         coco = r.get("coco")
         rows.append({
-            "Periode": pd.Timestamp(m).tz_convert(None),  # naive für Merge mit ts_agg
+            "Periode": pd.Timestamp(m).tz_localize(None) if hasattr(pd.Timestamp(m), "tz_localize") else pd.Timestamp(m),
             "temp12": temp,
             "prcp": prcp,
             "cldc": cldc,
@@ -1003,14 +1056,17 @@ if (raw_sell is not None) and (raw_price is not None):
             ts_agg["Kategorie"]  = ts_agg["Kategorie"].astype(str)
             ts_agg["Wert (CHF)"] = pd.to_numeric(ts_agg["Wert (CHF)"], errors="coerce").fillna(0.0).astype(float)
 
-            # >>> Wetter holen & mergen (Zug, Montag 12:00)
-            period_starts = sorted(pd.to_datetime(ts_agg["Periode"]).dropna().unique().tolist())
-            wx = fetch_monday_noon_weather(period_starts, lat=47.166, lon=8.516)  # Zug
-            ts_plot = ts_agg.merge(wx, on="Periode", how="left")
+            # >>> Wetter holen & mergen (Zug, Montag 12:00), nur wenn aktiviert & verfügbar
+            if want_weather and METEOSTAT_OK:
+                period_starts = sorted(pd.to_datetime(ts_agg["Periode"]).dropna().unique().tolist())
+                wx = fetch_monday_noon_weather(period_starts, lat=47.166, lon=8.516)  # Zug
+                ts_plot = ts_agg.merge(wx, on="Periode", how="left")
+            else:
+                ts_plot = ts_agg.copy()
+                ts_plot["temp12"] = np.nan
+                ts_plot["cond"]   = None
 
             hover_cat = alt.selection_single(fields=["Kategorie"], on="mouseover", nearest=True, empty="none")
-            hover_pt  = alt.selection_single(fields=["Periode","Kategorie"], on="mouseover", nearest=True, empty="none")
-
             base = alt.Chart(ts_plot)
 
             # Linien (Sales)
@@ -1033,51 +1089,44 @@ if (raw_sell is not None) and (raw_price is not None):
                 .add_selection(hover_cat)
             )
 
-            # Wetterpunkte (Farbe = Wetterzustand)
-            cond_scale = alt.Scale(domain=["Sonnig","Bewölkt","Regnerisch"],
-                                   range=["#FFD700","#A0A0A0","#3A83C0"])
-            wx_points = (
-                base.mark_point(filled=True, size=90, opacity=0.85)
-                .encode(
-                    x="Periode:T",
-                    y="Wert (CHF):Q",
-                    shape=alt.value("circle"),
-                    color=alt.Color("cond:N", title="Wetter (Mo 12:00)", scale=cond_scale),
-                    tooltip=[
-                        alt.Tooltip("Periode:T", title="Woche"),
-                        alt.Tooltip("temp12:Q", title="Montag 12:00 (°C)", format=".1f"),
-                        alt.Tooltip("cond:N", title="Wetter (Mo 12:00)"),
-                    ],
-                )
-            )
+            layers = [lines]
 
-            # Temperatur-Label direkt auf dem Punkt
-            wx_labels = (
-                base.mark_text(dy=-12, fontSize=11)
-                .encode(
-                    x="Periode:T",
-                    y="Wert (CHF):Q",
-                    text=alt.Text("temp12:Q", format=".0f"),
-                    color=alt.value("black"),
+            # Wetterpunkte + Labels nur zeichnen, wenn Daten vorhanden
+            if want_weather and METEOSTAT_OK:
+                cond_scale = alt.Scale(domain=["Sonnig","Bewölkt","Regnerisch"],
+                                       range=["#FFD700","#A0A0A0","#3A83C0"])
+                wx_points = (
+                    base.mark_point(filled=True, size=90, opacity=0.85)
+                    .encode(
+                        x="Periode:T",
+                        y="Wert (CHF):Q",
+                        shape=alt.value("circle"),
+                        color=alt.Color("cond:N", title="Wetter (Mo 12:00)", scale=cond_scale),
+                        tooltip=[
+                            alt.Tooltip("Periode:T", title="Woche"),
+                            alt.Tooltip("temp12:Q", title="Montag 12:00 (°C)", format=".1f"),
+                            alt.Tooltip("cond:N", title="Wetter (Mo 12:00)"),
+                        ],
+                    )
                 )
-                .transform_filter(alt.datum.temp12 != None)
-            )
-
-            # Ende-Labels pro Kategorie (wie gehabt)
-            end_labels = (
-                base.transform_window(
-                    row_number='row_number()',
-                    sort=[alt.SortField(field='Periode', order='descending')],
-                    groupby=['Kategorie']
+                wx_labels = (
+                    base.mark_text(dy=-12, fontSize=11)
+                    .encode(
+                        x="Periode:T",
+                        y="Wert (CHF):Q",
+                        text=alt.Text("temp12:Q", format=".0f"),
+                        color=alt.value("black"),
+                    )
+                    .transform_filter(alt.datum.temp12 != None)
                 )
-                .transform_filter(alt.datum.row_number == 0)
-                .mark_text(align='left', dx=6, dy=-6, fontSize=11)
-                .encode(x='Periode:T', y='Wert (CHF):Q', text='Kategorie:N', color='Kategorie:N',
-                        opacity=alt.condition(hover_cat, alt.value(1.0), alt.value(0.6)))
-            )
+                layers += [wx_points, wx_labels]
 
-            chart = (lines + wx_points + wx_labels + end_labels).properties(height=400)
+            chart = alt.layer(*layers).properties(height=400)
             st.altair_chart(chart, use_container_width=True)
+
+            if want_weather and not METEOSTAT_OK:
+                st.caption("Wetter deaktiviert: Paket `meteostat` nicht installiert.")
+
         else:
             st.info("Für den Verlauf werden gültige Startdaten benötigt.")
 
@@ -1104,7 +1153,7 @@ if (raw_sell is not None) and (raw_price is not None):
         t_rounded, t_styler = style_numeric(totals_display)
         st.dataframe(t_styler, use_container_width=True)
 
-        # ------- Downloads -------
+        # ------- Downloads (ohne Σ-Gesamtzeile) -------
         dl1, dl2 = st.columns(2)
         with dl1:
             st.download_button(
