@@ -1,11 +1,6 @@
 # app.py
-# Updated Streamlit Analyse-Tool – robuste Persistenz & _rowdate-Fix + Wetter-Overlay (Meteostat)
-# - Persistenz: Zuletzt hochgeladene sellout.xlsx / preisliste.xlsx werden gespeichert
-#   und bei Neustart/Laden automatisch verwendet. Überschreiben nur bei echtem Upload.
-# - _rowdate-Fix: Kein KeyError mehr bei Zeitfenster-Filterung (schrittweise Filterung auf sv_in).
-# - Erweiterte Kandidatenlisten & stabilere Parser.
-# - Keine Caches in enrich_and_merge, damit neue Uploads sofort berechnet werden.
-# - Wetter: Montag 12:00 (Zug/CH) via meteostat 1.7.x (ohne tz-Argument), Overlay im Wochen-Chart.
+# Analyse-Tool mit robuster Persistenz, Fixes & Wetter-Overlay (Meteostat, Mo 12:00 in Zug/CH)
+# WICHTIG: Meteostat ohne tz-Argument verwenden (Zeitzone nach fetch setzen)
 
 import os
 import io
@@ -19,17 +14,16 @@ from pathlib import Path
 from datetime import datetime
 from collections.abc import Mapping
 import warnings
+from typing import Optional, List
 
-# ===== Meteostat optional laden (Fallback, falls nicht installiert) =====
+# ---------- Meteostat optional ----------
 try:
-    from meteostat import Hourly, Point  # meteostat >= 1.7.x (ohne tz-Argument)
+    from meteostat import Hourly, Point
     METEOSTAT_OK = True
 except Exception:
     METEOSTAT_OK = False
 
-# ================
-# Globale Settings
-# ================
+# ---------- Global ----------
 warnings.filterwarnings("ignore", message="overflow encountered in multiply")
 warnings.filterwarnings("ignore", message="invalid value encountered in multiply")
 warnings.filterwarnings("ignore", message="divide by zero encountered")
@@ -52,8 +46,6 @@ MAX_QTY, MAX_PRICE = 1_000_000, 1_000_000
 # =========================
 # 🔐 Auth – Passcode only
 # =========================
-from typing import Optional, List
-
 def _to_plain_mapping(obj) -> dict:
     if obj is None:
         return {}
@@ -63,7 +55,7 @@ def _to_plain_mapping(obj) -> dict:
         except Exception:
             pass
         try:
-            return {k: obj[k] for k in obj.keys()}  # type: ignore[attr-defined]
+            return {k: obj[k] for k in obj.keys()}
         except Exception:
             return {}
     return {}
@@ -79,33 +71,28 @@ def auth_enabled() -> bool:
     return bool(_auth_cfg().get("require_login", True))
 
 def _get_passcode() -> Optional[str]:
-    # 1) Query-Parameter (1.40+)
     try:
         qp = st.query_params
         if "code" in qp and str(qp["code"]).strip():
             return str(qp["code"]).strip()
     except Exception:
         pass
-    # 2) Secrets [auth]
     auth = _auth_cfg()
-    aliases = ("code", "password", "passcode", "pw", "passwort", "secret")
-    for k in aliases:
+    for k in ("code","password","passcode","pw","passwort","secret"):
         v = auth.get(k)
-        if isinstance(v, (str, int)) and str(v).strip():
+        if isinstance(v,(str,int)) and str(v).strip():
             return str(v).strip()
-    # 3) Root-Secrets
     try:
         root = _to_plain_mapping(st.secrets)
-        for k in aliases:
+        for k in ("code","password","passcode","pw","passwort","secret"):
             v = root.get(k)
-            if isinstance(v, (str, int)) and str(v).strip():
+            if isinstance(v,(str,int)) and str(v).strip():
                 return str(v).strip()
     except Exception:
         pass
-    # 4) Environment
-    for k in ("AUTH_CODE", "AUTH_PASSWORD", "AUTH_PASSCODE", "STREAMLIT_AUTH_CODE"):
+    for k in ("AUTH_CODE","AUTH_PASSWORD","AUTH_PASSCODE","STREAMLIT_AUTH_CODE"):
         v = os.environ.get(k)
-        if isinstance(v, (str, int)) and str(v).strip():
+        if isinstance(v,(str,int)) and str(v).strip():
             return str(v).strip()
     return None
 
@@ -114,12 +101,10 @@ def _login_view():
     with st.form("login-passcode", clear_on_submit=False):
         code = st.text_input("Code / Passwort", type="password")
         ok = st.form_submit_button("Anmelden")
-
     expected = _get_passcode()
     if expected is None:
-        st.error("Kein Passcode in den Secrets/Env gefunden. Bitte in st.secrets (auth.code) oder Env hinterlegen.")
+        st.error("Kein Passcode in Secrets/Env gefunden (auth.code).")
         return
-
     if ok:
         if code.strip() == expected:
             st.session_state["auth_ok"] = True
@@ -141,11 +126,10 @@ def ensure_auth():
 def logout_button():
     with st.sidebar:
         if st.button("Logout"):
-            for k in ("auth_ok", "auth_user", "auth_ts"):
+            for k in ("auth_ok","auth_user","auth_ts"):
                 st.session_state.pop(k, None)
             st.rerun()
 
-# 🚪 Login-Gate
 if not ensure_auth():
     st.stop()
 logout_button()
@@ -170,7 +154,6 @@ def style_numeric(df: pd.DataFrame, num_cols=NUM_COLS_DEFAULT, sep=THOUSANDS_SEP
     return out, out.style.format(fmt)
 
 def append_total_row_for_display(df: pd.DataFrame) -> pd.DataFrame:
-    """Σ-Gesamt ans Ende anhängen (nur UI-Anzeige)."""
     if df is None or df.empty:
         return df
     cols = list(df.columns)
@@ -190,7 +173,6 @@ def read_excel_flat(upload) -> pd.DataFrame:
     raw = pd.read_excel(upload, header=None, dtype=object)
     if raw.empty:
         return pd.DataFrame()
-    # Header-Zeile heuristisch: Zeile mit den meisten Non-NaNs
     header_idx = int(raw.notna().mean(axis=1).idxmax())
     headers = raw.iloc[header_idx].fillna("").astype(str).tolist()
     headers = [re.sub(r"\s+", " ", h).strip() for h in headers]
@@ -201,7 +183,6 @@ def read_excel_flat(upload) -> pd.DataFrame:
         headers = headers[:n]
     df = raw.iloc[header_idx + 1:].reset_index(drop=True)
     df.columns = headers
-    # doppelte Spalten entschärfen
     seen, newcols = {}, []
     for c in df.columns:
         if c in seen:
@@ -234,31 +215,21 @@ def normalize_key(s: str) -> str:
 
 def find_column(df: pd.DataFrame, candidates, purpose: str, required=True) -> Optional[str]:
     cols = list(df.columns)
-    # 1) exakte Matches
     for cand in candidates:
         if cand in cols:
             return cand
-
-    # 2) normalisierte Matches (Dashes/Spaces/Points egal)
     def _norm(s: str) -> str:
         tmp = re.sub(r"\s+", "", str(s))
         tmp = tmp.translate(str.maketrans({
-            "\u2010": "-",  # hyphen
-            "\u2011": "-",  # non-breaking hyphen
-            "\u2012": "-",  # figure dash
-            "\u2013": "-",  # en dash
-            "\u2014": "-",  # em dash
-            "\u2015": "-",  # horizontal bar
+            "\u2010": "-", "\u2011": "-", "\u2012": "-", "\u2013": "-", "\u2014": "-", "\u2015": "-"
         }))
         tmp = re.sub(r"[\-*/.]+", "", tmp)
         return tmp.lower()
-
     canon = {_norm(c): c for c in cols}
     for cand in candidates:
         key = _norm(cand)
         if key in canon:
             return canon[key]
-
     if required:
         raise KeyError(
             f"Spalte für «{purpose}» fehlt – gesucht unter {candidates}.\n"
@@ -349,13 +320,11 @@ def make_family_key(name: str) -> str:
 
 def extract_color_from_name(name: str) -> str:
     if not isinstance(name, str): return ""
-    # 1) explizite Farbangabe am Ende nach Bindestrich oder Slash
     m = re.search(r"(?:-|/)\s*([A-Za-z äöüÄÖÜß]+)\s*$", name.strip())
     if m:
         cand = m.group(1).strip().lower()
         if not _looks_like_not_a_color(cand):
             return _COLOR_MAP.get(cand, cand.title())
-    # 2) innerhalb des Namens
     for w in sorted(_COLOR_WORDS, key=len, reverse=True):
         if re.search(rf"\b{re.escape(w)}\b", name, flags=re.I):
             if not _looks_like_not_a_color(w):
@@ -412,7 +381,6 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     out["Bezeichnung_key"] = out["Bezeichnung"].map(normalize_key)
     out["Familie"]         = out["Bezeichnung"].map(make_family_key)
 
-    # Kategorie bereinigen
     if col_cat:
         out["Kategorie"] = (
             df[col_cat].astype(str)
@@ -422,7 +390,6 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     else:
         out["Kategorie"] = ""
 
-    # Farbe
     col_color = find_column(df, COLOR_CANDIDATES, "Farbe/Variante", required=False)
     if col_color:
         out["Farbe"] = df[col_color].astype(str).map(lambda v: _COLOR_MAP.get(str(v).lower(), str(v)))
@@ -438,7 +405,6 @@ def prepare_price_df(df: pd.DataFrame) -> pd.DataFrame:
     if "Einkaufspreis" not in out: out["Einkaufspreis"] = out.get("Verkaufspreis", pd.Series([np.nan]*len(out)))
     if "Verkaufspreis" not in out: out["Verkaufspreis"] = out.get("Einkaufspreis", pd.Series([np.nan]*len(out)))
 
-    # Dedupe: Kategorie > Preis > Farbe
     out = out.assign(
         _cat=out["Kategorie"].astype(bool).astype(int),
         _price=out["Verkaufspreis"].notna().astype(int),
@@ -471,7 +437,7 @@ def _apply_hints_to_row(name_raw: str) -> dict:
         if fam in s:
             h["hint_family"] = h["hint_family"] or fam
         if "tim" in s and "schwarz" in s: h["hint_color"]="weiss"
-        if "mia" in s and "gold" in s:    h["hint_color"]="schwarz"
+        if "mia" in s und "gold" in s:    h["hint_color"]="schwarz"
         if "oskar" in s and "little" in s: h["hint_art_prefix"]="o061"
         if "simon" in s: h["hint_art_exact"]="s054"
         if "otto"  in s: h["hint_art_prefix"]="o013"
@@ -496,7 +462,7 @@ def prepare_sell_df(df: pd.DataFrame) -> pd.DataFrame:
 
     col_stock_so = find_column(df, STOCK_SO_CANDIDATES, "Lagermenge (Sell-out)", required=False)
     if not col_stock_so and df.shape[1] >= 7:
-        col_stock_so = _fallback_col_by_index(df, 6)  # Spalte G
+        col_stock_so = _fallback_col_by_index(df, 6)
 
     col_start = find_column(df, DATE_START_CANDS, "Startdatum (Spalte I)", required=False)
     col_end   = find_column(df, DATE_END_CANDS,   "Enddatum (Spalte J)",   required=False)
@@ -603,22 +569,14 @@ def _final_backstops(merged: pd.DataFrame, price_df: pd.DataFrame):
 # Merge & Werte (+ Quelle für Chart)
 # =========================
 def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, latest_stock_baseline_df: pd.DataFrame | None = None):
-    """
-    Merge sell-out data with price list and compute aggregated values.
-    (ohne Cache – damit neue Uploads sofort berechnet werden)
-    """
     if filtered_sell_df is None or price_df is None or filtered_sell_df.empty or price_df.empty:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
     sell_for_stock = latest_stock_baseline_df if latest_stock_baseline_df is not None else filtered_sell_df
 
-    # Merge für Umsatz
     merged = filtered_sell_df.merge(price_df, on=["ArtikelNr_key"], how="left", suffixes=("", "_pl"))
-
-    # Merge für Lagerstand (UNGEFILTERTE Basis)
     stock_merged = sell_for_stock.merge(price_df, on=["ArtikelNr_key"], how="left", suffixes=("", "_pl"))
 
-    # Preisliste-Felder übernehmen (nur wenn leer, ausser Bezeichnung -> immer PL)
     for df_tmp in (merged, stock_merged):
         for col in ["Bezeichnung", "Familie", "Farbe", "Kategorie", "ArtikelNr"]:
             pl_col = f"{col}_pl"
@@ -630,7 +588,6 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
                     df_tmp[col] = df_tmp[col].where(mask_valid, df_tmp[pl_col])
                 df_tmp.drop(columns=[pl_col], inplace=True, errors="ignore")
 
-    # Hilfsdatum
     def _row_date(df):
         if ("EndDatum" in df.columns) and ("StartDatum" in df.columns):
             d = df["EndDatum"].fillna(df["StartDatum"])
@@ -645,7 +602,6 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
     merged["_rowdate"]       = _row_date(merged)
     stock_merged["_rowdate"] = _row_date(stock_merged)
 
-    # Fallback-Matches (nur auf Umsatz-Merge)
     need = merged["Verkaufspreis"].isna() & merged["EAN_key"].astype(bool)
     if need.any():
         tmp = merged.loc[need, ["EAN_key"]].merge(
@@ -672,7 +628,6 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
 
     _final_backstops(merged, price_df)
 
-    # Strings säubern
     for df2 in (merged, stock_merged):
         df2["Kategorie"] = (
             df2.get("Kategorie", "").fillna("")
@@ -683,7 +638,6 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
         df2["Bezeichnung"] = df2.get("Bezeichnung"," ").fillna("")
         df2["Farbe"]       = df2.get("Farbe"," ").fillna("")
 
-    # Anzeige-Bezeichnung (bei Duplikaten Farbe anhängen)
     merged["Bezeichnung_anzeige"] = merged["Bezeichnung"]
     def _looks_like_not_a_color2(token: str) -> bool:
         t = (token or "").strip().lower()
@@ -694,13 +648,11 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
         merged.loc[dup & valid_color, "Bezeichnung"] + " – " + merged.loc[dup & valid_color, "Farbe"].astype(str).str.strip()
     )
 
-    # Umsatz-Werte
     q_buy,  p_buy  = sanitize_numbers(merged.get("Einkaufsmenge", 0), merged.get("Einkaufspreis", 0))
     q_sell, p_sell = sanitize_numbers(merged.get("Verkaufsmenge", 0), merged.get("Verkaufspreis", 0))
     merged["Einkaufswert"] = safe_mul(q_buy.fillna(0.0),  p_buy.fillna(0.0))
     merged["Verkaufswert"] = safe_mul(q_sell.fillna(0.0), p_sell.fillna(0.0))
 
-    # Aktuellster Lagerstand aus Sell-out (nicht aufsummieren)
     stock_merged = stock_merged.copy()
     if "SellLagermenge" in stock_merged.columns:
         stock_valid = stock_merged.loc[stock_merged["SellLagermenge"].notna()].copy()
@@ -713,7 +665,6 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
         stock_valid = stock_merged.iloc[0:0].copy()
         stock_valid["SellLagermenge"] = np.nan
 
-    # >>> _rowdate-Absicherung, falls noch nicht vorhanden
     if "_rowdate" not in stock_valid.columns:
         stock_valid["_rowdate"] = pd.to_datetime(pd.NaT)
 
@@ -729,7 +680,6 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
     period_min = pd.to_datetime(merged["_rowdate"]).min()
     period_max = pd.to_datetime(merged["_rowdate"]).max()
 
-    # --- robustes Zeitfenster-Filtering für Lager-Snapshot ---
     sv_in = stock_valid.copy()
     if "_rowdate" not in sv_in.columns:
         sv_in["_rowdate"] = pd.to_datetime(pd.NaT)
@@ -737,7 +687,6 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
         sv_in = sv_in.loc[sv_in["_rowdate"] >= period_min]
     if pd.notna(period_max):
         sv_in = sv_in.loc[sv_in["_rowdate"] <= period_max]
-    # ---------------------------------------------------------
 
     if sv_in.empty:
         latest_qty_map = {}
@@ -762,7 +711,6 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
     )
     merged["Lagerwert_latest"] = safe_mul(merged["Lagermenge_latest"], merged["Verkaufspreis_latest"])
 
-    # Tabellen
     detail = merged[["ArtikelNr","Bezeichnung_anzeige","Kategorie",
                      "Einkaufsmenge","Einkaufswert","Verkaufsmenge","Verkaufswert"]].copy()
     detail["Lagermenge"] = merged["Lagermenge_latest"]
@@ -788,10 +736,9 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
     return detail, totals, ts_source
 
 # =========================
-# Wetter: Mo 12:00 (Zug/CH) – meteostat 1.7.x
+# Wetter: Mo 12:00 (Zug/CH) – ohne tz-Argument
 # =========================
 def _classify_condition(coco, prcp, cldc) -> str:
-    # sehr einfache Klassifizierung
     try:
         coco = int(coco) if coco is not None and not pd.isna(coco) else None
     except Exception:
@@ -799,25 +746,15 @@ def _classify_condition(coco, prcp, cldc) -> str:
     if prcp and prcp > 0.0:
         return "Regen"
     if cldc is not None and not pd.isna(cldc):
-        if cldc >= 0.7:
-            return "Bewölkt"
-        if cldc <= 0.3:
-            return "Sonnig"
-    if coco in {0, 1}:
-        return "Sonnig"
-    if coco in {2, 3}:
-        return "Bewölkt"
-    if coco in {5, 6, 7, 8, 9}:
-        return "Regen"
+        if cldc >= 0.7: return "Bewölkt"
+        if cldc <= 0.3: return "Sonnig"
+    if coco in {0, 1}: return "Sonnig"
+    if coco in {2, 3}: return "Bewölkt"
+    if coco in {5, 6, 7, 8, 9}: return "Regen"
     return "—"
 
 def fetch_monday_noon_weather(period_starts: List[pd.Timestamp],
                               lat: float = 47.166, lon: float = 8.516) -> pd.DataFrame:
-    """
-    Liefert Wetter für Zug (CH) Montag 12:00 zu gegebenen Wochenstarts.
-    Rückgabe: DataFrame mit Spalten ['Periode','temp12','cond','prcp','cldc'].
-    Falls meteostat nicht verfügbar -> leeres DF.
-    """
     if not period_starts:
         return pd.DataFrame(columns=["Periode","temp12","cond","prcp","cldc"])
     if not METEOSTAT_OK:
@@ -825,22 +762,21 @@ def fetch_monday_noon_weather(period_starts: List[pd.Timestamp],
 
     tz_str = "Europe/Zurich"
 
-    # Periode -> Montag 12:00 (lokal, später tz-konvertiert)
     def _to_monday_noon(p):
-        ts = pd.Timestamp(p).floor("D")
-        return ts + pd.Timedelta(hours=12)
+        ts = pd.Timestamp(p).to_period("W").start_time  # Wochenstart
+        return (ts + pd.Timedelta(days=0, hours=12))    # Montag 12:00 (Period 'W' beginnt montags)
 
     mondays_local = [_to_monday_noon(p) for p in period_starts]
     start = min(mondays_local) - pd.Timedelta(hours=2)
     end   = max(mondays_local) + pd.Timedelta(hours=2)
 
-    # meteostat 1.7.x: KEIN tz-Argument
     zug = Point(lat, lon, 425)
+    # >>> KEIN tz-Argument!
     df_h = Hourly(zug, start, end).fetch()
     if df_h is None or df_h.empty:
         return pd.DataFrame(columns=["Periode","temp12","cond","prcp","cldc"])
 
-    # Zeitzone korrekt anwenden
+    # Zeitzone nachträglich setzen/konvertieren
     if df_h.index.tz is None:
         df_h.index = df_h.index.tz_localize("UTC").tz_convert(tz_str)
     else:
@@ -859,12 +795,10 @@ def fetch_monday_noon_weather(period_starts: List[pd.Timestamp],
             r = win.loc[idx]
         else:
             r = exact.iloc[0]
-
         temp = float(r.get("temp")) if r.get("temp") is not None else np.nan
         prcp = float(r.get("prcp")) if r.get("prcp") is not None else 0.0
         cldc = float(r.get("cldc")) if r.get("cldc") is not None else np.nan
         coco = r.get("coco")
-
         rows.append({
             "Periode": pd.Timestamp(m).to_pydatetime(),  # naive -> passt zu ts_agg['Periode']
             "temp12": temp,
@@ -872,19 +806,15 @@ def fetch_monday_noon_weather(period_starts: List[pd.Timestamp],
             "cldc": cldc,
             "cond": _classify_condition(coco, prcp, cldc)
         })
-
     return pd.DataFrame(rows, columns=["Periode","temp12","cond","prcp","cldc"])
 
 # =========================
-# Datenquellen / Persistieren (robust, Auto-Erkennung)
+# Datenquellen / Persistieren
 # =========================
 BASE_DIR = Path(__file__).resolve().parent
 
 def _find_data_dir() -> Path:
-    candidates = [
-        BASE_DIR / "data",        # ./data neben app.py
-        BASE_DIR.parent / "data", # eine Ebene höher
-    ]
+    candidates = [BASE_DIR / "data", BASE_DIR.parent / "data"]
     for p in candidates:
         if p.exists():
             return p
@@ -896,30 +826,25 @@ DEFAULT_SELL_PATH  = DATA_DIR / "sellout.xlsx"
 DEFAULT_PRICE_PATH = DATA_DIR / "preisliste.xlsx"
 
 def _persist_upload(uploaded_file, target_path: Path):
-    """Speichert nur, wenn echter Upload bzw. geänderter Inhalt."""
     if uploaded_file is None:
         return
     try:
         content = uploaded_file.getvalue()
     except Exception:
         content = uploaded_file.read()
-
     if target_path.exists():
         try:
             if target_path.read_bytes() == content:
-                return  # identisch -> nichts tun
+                return
         except Exception:
             pass
-
     with open(target_path, "wb") as f:
         f.write(content)
 
 def _guess_role_from_name(name: str) -> Optional[str]:
     n = name.lower()
-    if any(k in n for k in ["sell-out", "sellout", "sell", "sales", "report"]):
-        return "sell"
-    if any(k in n for k in ["preisliste", "preis", "price", "vk", "pl "]):
-        return "price"
+    if any(k in n for k in ["sell-out","sellout","sell","sales","report"]): return "sell"
+    if any(k in n for k in ["preisliste","preis","price","vk","pl "]):       return "price"
     return None
 
 def _pick_default_files_from_dir(folder: Path) -> tuple[io.BytesIO | None, io.BytesIO | None, Optional[str], Optional[str]]:
@@ -928,14 +853,12 @@ def _pick_default_files_from_dir(folder: Path) -> tuple[io.BytesIO | None, io.By
     xlsx_files = sorted([p for p in folder.glob("*.xlsx") if p.is_file()])
     if not xlsx_files:
         return None, None, None, None
-    # 1) per Keywords
     for p in xlsx_files:
         role = _guess_role_from_name(p.name)
         if role == "sell" and sell_bytes is None:
             sell_bytes = io.BytesIO(p.read_bytes()); sell_name = p.name
         elif role == "price" and price_bytes is None:
             price_bytes = io.BytesIO(p.read_bytes()); price_name = p.name
-    # 2) Rest auffüllen
     leftovers = [p for p in xlsx_files if p.name not in {sell_name, price_name}]
     for p in leftovers:
         if sell_bytes is None:
@@ -946,9 +869,7 @@ def _pick_default_files_from_dir(folder: Path) -> tuple[io.BytesIO | None, io.By
             break
     return sell_bytes, price_bytes, sell_name, price_name
 
-# =====
-# UI
-# =====
+# ===== UI =====
 st.title("Analyse")
 
 c1, c2 = st.columns(2)
@@ -959,13 +880,11 @@ with c2:
     st.subheader("Preisliste (.xlsx)")
     price_file = st.file_uploader("Drag & drop oder Datei wählen", type=["xlsx"], key="price")
 
-# Auto-Load + Fallback (Default-first, dann Auto-Erkennung)
 raw_sell = None
 raw_price = None
 used_sell_name = None
 used_price_name = None
 
-# 0) Uploads – sofort verwenden und als DEFAULT_* persistieren
 if sell_file is not None:
     raw_sell = read_excel_flat(sell_file)
     used_sell_name = sell_file.name
@@ -976,7 +895,6 @@ if price_file is not None:
     used_price_name = price_file.name
     _persist_upload(price_file, DEFAULT_PRICE_PATH)
 
-# 1) Falls im aktuellen Run nichts hochgeladen wurde: zuerst Standardnamen
 if raw_sell is None and DEFAULT_SELL_PATH.exists():
     raw_sell = read_excel_flat(io.BytesIO(DEFAULT_SELL_PATH.read_bytes()))
     used_sell_name = DEFAULT_SELL_PATH.name
@@ -984,7 +902,6 @@ if raw_price is None and DEFAULT_PRICE_PATH.exists():
     raw_price = read_excel_flat(io.BytesIO(DEFAULT_PRICE_PATH.read_bytes()))
     used_price_name = DEFAULT_PRICE_PATH.name
 
-# 2) Falls immer noch etwas fehlt: heuristische Auto-Erkennung im data/-Ordner
 if raw_sell is None or raw_price is None:
     sbytes, pbytes, sname, pname = _pick_default_files_from_dir(DATA_DIR)
     if raw_sell is None and sbytes is not None:
@@ -992,14 +909,12 @@ if raw_sell is None or raw_price is None:
     if raw_price is None and pbytes is not None:
         raw_price = read_excel_flat(pbytes); used_price_name = pname
 
-# Verarbeitung
 if (raw_sell is not None) and (raw_price is not None):
     try:
         with st.spinner("📖 Lese & prüfe Spalten…"):
             sell_df  = prepare_sell_df(raw_sell)
             price_df = prepare_price_df(raw_price)
 
-        # Zeitraumfilter
         filtered_sell_df = sell_df
         if {"StartDatum","EndDatum"}.issubset(sell_df.columns) and not sell_df["StartDatum"].isna().all():
             st.subheader("Periode wählen")
@@ -1064,7 +979,6 @@ if (raw_sell is not None) and (raw_price is not None):
             # ---------- Wetterdaten (Montag 12:00) ----------
             unique_weeks = sorted(ts_agg["Periode"].dropna().unique().tolist())
             weather_df = fetch_monday_noon_weather([pd.Timestamp(x) for x in unique_weeks])
-            # y-Position der Wettermarker leicht oberhalb der max. Linie
             y_max = float(ts_agg["Wert (CHF)"].max() or 0.0)
             if not weather_df.empty:
                 weather_plot = weather_df.copy()
@@ -1105,8 +1019,7 @@ if (raw_sell is not None) and (raw_price is not None):
                     row_number='row_number()',
                     sort=[alt.SortField(field='Periode', order='descending')],
                     groupby=['Kategorie']
-                )
-                .transform_filter(alt.datum.row_number == 0)
+                ).transform_filter(alt.datum.row_number == 0)
                 .mark_text(align='left', dx=6, dy=-6, fontSize=11)
                 .encode(x='Periode:T', y='Wert (CHF):Q', text='Kategorie:N', color='Kategorie:N',
                         opacity=alt.condition(hover_cat, alt.value(1.0), alt.value(0.6)))
@@ -1114,7 +1027,6 @@ if (raw_sell is not None) and (raw_price is not None):
 
             chart = (lines + points + popup + end_labels)
 
-            # Wetter-Layer (wenn vorhanden)
             if METEOSTAT_OK and ('weather_plot' in locals()) and not weather_plot.empty:
                 wx_shape_scale = alt.Scale(domain=["Sonnig","Bewölkt","Regen","—"],
                                            range=["triangle-up","circle","square","diamond"])
@@ -1136,18 +1048,13 @@ if (raw_sell is not None) and (raw_price is not None):
                 wx_text = (
                     alt.Chart(weather_plot)
                     .mark_text(dy=-12, fontSize=11, fontWeight='bold')
-                    .encode(
-                        x="Periode:T",
-                        y="ypos:Q",
-                        text=alt.Text("temp12:Q", format=".1f")
-                    )
+                    .encode(x="Periode:T", y="ypos:Q", text=alt.Text("temp12:Q", format=".1f"))
                 )
                 chart = (chart + wx_points + wx_text).properties(height=420)
             else:
                 chart = chart.properties(height=400)
 
             st.altair_chart(chart, use_container_width=True)
-
         else:
             st.info("Für den Verlauf werden gültige Startdaten benötigt.")
 
@@ -1174,7 +1081,7 @@ if (raw_sell is not None) and (raw_price is not None):
         t_rounded, t_styler = style_numeric(totals_display)
         st.dataframe(t_styler, use_container_width=True)
 
-        # ------- Downloads (ohne Σ-Gesamtzeile) -------
+        # ------- Downloads -------
         dl1, dl2 = st.columns(2)
         with dl1:
             st.download_button(
@@ -1194,7 +1101,5 @@ if (raw_sell is not None) and (raw_price is not None):
     except Exception as e:
         st.error(f"Unerwarteter Fehler: {e}")
 else:
-    st.info(
-        "Bitte beide Dateien hochladen oder in den Ordner `data/` legen. "
-        "Es werden zuerst `sellout.xlsx`/`preisliste.xlsx` geladen, sonst Auto-Erkennung."
-    )
+    st.info("Bitte beide Dateien hochladen oder in den Ordner `data/` legen. "
+            "Es werden zuerst `sellout.xlsx`/`preisliste.xlsx` geladen, sonst Auto-Erkennung.")
