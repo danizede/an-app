@@ -278,6 +278,27 @@ def safe_mul(a: pd.Series, b: pd.Series, max_a=MAX_QTY, max_b=MAX_PRICE) -> pd.S
     return pd.Series(out, index=a.index)
 
 # =========================
+# Hilfsfunktionen – NA robust für Altair/float()
+# =========================
+def sanitize_for_float(df: pd.DataFrame | None) -> pd.DataFrame | None:
+    """Ersetzt pandas.NA/pd.NA in einem DataFrame durch np.nan.
+
+    Hintergrund: Altair und verschiedene Bibliotheken rufen intern float() auf
+    einzelne Zellwerte. Bei pandas.NA führt dies zu
+    "float() argument must be a string or a real number, not 'NAType'".
+    np.nan ist dagegen unproblematisch.
+    """
+    if df is None:
+        return None
+    try:
+        return df.replace({pd.NA: np.nan})
+    except Exception:
+        # Fallback: unverändert zurückgeben
+        return df
+
+
+
+# =========================
 # Farben & Familie
 # =========================
 _COLOR_MAP = {
@@ -874,10 +895,9 @@ def fetch_monday_noon_weather(period_starts: List[pd.Timestamp],
             "cond": cond
         })
     df_out = pd.DataFrame(rows, columns=["Periode","temp12","cond","prcp","cldc"])
-    # Konvertiere numerische Spalten explizit zu float, um pd.NA zu vermeiden
+    # Sicherstellen, dass numerische Spalten reine floats mit np.nan (statt pd.NA) sind
     for col in ["temp12", "prcp", "cldc"]:
         if col in df_out.columns:
-            # pd.to_numeric wandelt pd.NA zu NaN, anschließend dtype cast auf float64
             df_out[col] = pd.to_numeric(df_out[col], errors="coerce").astype(float)
     return df_out
 
@@ -1047,33 +1067,28 @@ if (raw_sell is not None) and (raw_price is not None):
                         .rename(columns={"Verkaufswert (CHF)":"Wert (CHF)"}))
             ts_agg["Periode"]    = pd.to_datetime(ts_agg["Periode"])
             ts_agg["Kategorie"]  = ts_agg["Kategorie"].astype(str)
-            ts_agg["Wert (CHF)"] = pd.to_numeric(ts_agg["Wert (CHF)"], errors="coerce").fillna(0.0).astype(float)
+            # Numerik + NA-Bereinigung für Altair
+            ts_agg["Wert (CHF)"] = pd.to_numeric(ts_agg["Wert (CHF)"], errors="coerce").astype(float)
+            ts_agg = sanitize_for_float(ts_agg)
 
             # ---------- Wetterdaten (Montag 12:00) ----------
             unique_weeks = sorted(ts_agg["Periode"].dropna().unique().tolist())
             weather_df = fetch_monday_noon_weather([pd.Timestamp(x) for x in unique_weeks])
-            # Berechnung des maximalen Y-Wertes robust gegenüber pd.NA/NaN und leeren Serien
-            y_max_series = ts_agg["Wert (CHF)"]
-            if y_max_series.empty or y_max_series.dropna().empty:
+            weather_df = sanitize_for_float(weather_df)
+
+            # y-Maximum robust bestimmen, ohne pd.NA
+            if ts_agg["Wert (CHF)"].dropna().empty:
                 y_max = 0.0
             else:
                 try:
-                    _tmp_max = y_max_series.max()
-                    # pd.NA oder NaN abfangen
-                    if _tmp_max is not None and not pd.isna(_tmp_max):
-                        y_max = float(_tmp_max)
-                    else:
-                        y_max = 0.0
+                    y_candidate = ts_agg["Wert (CHF)"].max()
+                    y_max = float(y_candidate) if y_candidate is not None and not pd.isna(y_candidate) else 0.0
                 except Exception:
                     y_max = 0.0
 
-            if not weather_df.empty:
+            if weather_df is not None and not weather_df.empty:
                 weather_plot = weather_df.copy()
-                # Oberhalb des höchsten Balkens platzieren; falls kein Y-Wert (>0) vorhanden, fixe 1.0
-                if y_max and not pd.isna(y_max) and y_max > 0:
-                    weather_plot["ypos"] = y_max * 1.05
-                else:
-                    weather_plot["ypos"] = 1.0
+                weather_plot["ypos"] = y_max * 1.05 if y_max > 0 else 1.0
 
             hover_cat = alt.selection_single(fields=["Kategorie"], on="mouseover", nearest=True, empty="none")
             hover_pt  = alt.selection_single(fields=["Periode","Kategorie"], on="mouseover", nearest=True, empty="none")
