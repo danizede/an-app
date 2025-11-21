@@ -755,22 +755,45 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
 # Wetter: Mo 12:00 (Zug/CH) – ohne tz-Argument
 # =========================
 def _classify_condition(coco, prcp, cldc) -> str:
+    """Klassifiziert Wetterbedingungen anhand des Meteostat-Codes und Niederschlag/Cloudcover.
+
+    Das Meteostat-API kann fehlende Werte als pd.NA zurückliefern. Damit float() nicht mit
+    NAType kollidiert, sollte diese Funktion nur mit numerischen oder None-Werten aufgerufen
+    werden. Siehe fetch_monday_noon_weather für die Aufbereitung.
+    """
     try:
-        coco = int(coco) if coco is not None and not pd.isna(coco) else None
+        coco_int = int(coco) if coco is not None and not pd.isna(coco) else None
     except Exception:
-        coco = None
-    if prcp and prcp > 0.0:
-        return "Regen"
+        coco_int = None
+    # Prüfe auf Niederschlag
+    try:
+        if prcp and prcp > 0.0:
+            return "Regen"
+    except Exception:
+        pass
+    # Prüfe auf Bewölkung
     if cldc is not None and not pd.isna(cldc):
-        if cldc >= 0.7: return "Bewölkt"
-        if cldc <= 0.3: return "Sonnig"
-    if coco in {0, 1}: return "Sonnig"
-    if coco in {2, 3}: return "Bewölkt"
-    if coco in {5, 6, 7, 8, 9}: return "Regen"
+        try:
+            cldc_val = float(cldc)
+            if cldc_val >= 0.7: return "Bewölkt"
+            if cldc_val <= 0.3: return "Sonnig"
+        except Exception:
+            pass
+    if coco_int in {0, 1}: return "Sonnig"
+    if coco_int in {2, 3}: return "Bewölkt"
+    if coco_int in {5, 6, 7, 8, 9}: return "Regen"
     return "—"
 
 def fetch_monday_noon_weather(period_starts: List[pd.Timestamp],
                               lat: float = 47.166, lon: float = 8.516) -> pd.DataFrame:
+    """Ermittelt Wetterdaten für die angegebenen Wochenperioden.
+
+    Für jede Woche in period_starts wird der nächstgelegene Messpunkt am Montag um 12:00 Uhr
+    im Raum Zug (Schweiz) gesucht. Meteostat liefert gelegentlich pd.NA als fehlenden Wert.
+    Diese Funktion wandelt solche NA-Werte in np.nan oder 0.0 um, bevor sie mit float() oder
+    int() gecastet werden, um "float() argument must be a string or a real number, not
+    'NAType'" zu vermeiden.
+    """
     if not period_starts:
         return pd.DataFrame(columns=["Periode","temp12","cond","prcp","cldc"])
     if not METEOSTAT_OK:
@@ -807,20 +830,48 @@ def fetch_monday_noon_weather(period_starts: List[pd.Timestamp],
                            (df_h.index <= m_zrh + pd.Timedelta(hours=2))]
             if win.empty:
                 continue
+            # Index des Datums mit minimalem Abstand zu m_zrh ermitteln
             idx = (win.index - m_zrh).abs().argmin()
             r = win.loc[idx]
         else:
             r = exact.iloc[0]
-        temp = float(r.get("temp")) if r.get("temp") is not None else np.nan
-        prcp = float(r.get("prcp")) if r.get("prcp") is not None else 0.0
-        cldc = float(r.get("cldc")) if r.get("cldc") is not None else np.nan
+
+        # Temperatur: fehlende Werte (pd.NA) in np.nan umwandeln
+        temp_val = r.get("temp")
+        if temp_val is not None and not pd.isna(temp_val):
+            try:
+                temp = float(temp_val)
+            except Exception:
+                temp = np.nan
+        else:
+            temp = np.nan
+        # Niederschlag: fehlende Werte gelten als 0.0
+        prcp_val = r.get("prcp")
+        if prcp_val is not None and not pd.isna(prcp_val):
+            try:
+                prcp = float(prcp_val)
+            except Exception:
+                prcp = 0.0
+        else:
+            prcp = 0.0
+        # Bewölkung: fehlende Werte bleiben np.nan
+        cldc_val = r.get("cldc")
+        if cldc_val is not None and not pd.isna(cldc_val):
+            try:
+                cldc = float(cldc_val)
+            except Exception:
+                cldc = np.nan
+        else:
+            cldc = np.nan
         coco = r.get("coco")
+        # Klassifiziere Bedingungen (funktion übernimmt None/np.nan korrekt)
+        cond = _classify_condition(coco, prcp, cldc)
         rows.append({
             "Periode": pd.Timestamp(m).to_pydatetime(),  # naive -> passt zu ts_agg['Periode']
             "temp12": temp,
             "prcp": prcp,
             "cldc": cldc,
-            "cond": _classify_condition(coco, prcp, cldc)
+            "cond": cond
         })
     return pd.DataFrame(rows, columns=["Periode","temp12","cond","prcp","cldc"])
 
