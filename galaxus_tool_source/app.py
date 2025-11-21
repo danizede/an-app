@@ -1046,10 +1046,28 @@ if (raw_sell is not None) and (raw_price is not None):
             # ---------- Wetterdaten (Montag 12:00) ----------
             unique_weeks = sorted(ts_agg["Periode"].dropna().unique().tolist())
             weather_df = fetch_monday_noon_weather([pd.Timestamp(x) for x in unique_weeks])
-            y_max = float(ts_agg["Wert (CHF)"].max() or 0.0)
+            # Berechnung des maximalen Y-Wertes robust gegenüber pd.NA/NaN und leeren Serien
+            y_max_series = ts_agg["Wert (CHF)"]
+            if y_max_series.empty or y_max_series.dropna().empty:
+                y_max = 0.0
+            else:
+                try:
+                    _tmp_max = y_max_series.max()
+                    # pd.NA oder NaN abfangen
+                    if _tmp_max is not None and not pd.isna(_tmp_max):
+                        y_max = float(_tmp_max)
+                    else:
+                        y_max = 0.0
+                except Exception:
+                    y_max = 0.0
+
             if not weather_df.empty:
                 weather_plot = weather_df.copy()
-                weather_plot["ypos"] = y_max * 1.05 if y_max > 0 else 1.0
+                # Oberhalb des höchsten Balkens platzieren; falls kein Y-Wert (>0) vorhanden, fixe 1.0
+                if y_max and not pd.isna(y_max) and y_max > 0:
+                    weather_plot["ypos"] = y_max * 1.05
+                else:
+                    weather_plot["ypos"] = 1.0
 
             hover_cat = alt.selection_single(fields=["Kategorie"], on="mouseover", nearest=True, empty="none")
             hover_pt  = alt.selection_single(fields=["Periode","Kategorie"], on="mouseover", nearest=True, empty="none")
