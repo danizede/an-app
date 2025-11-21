@@ -873,7 +873,13 @@ def fetch_monday_noon_weather(period_starts: List[pd.Timestamp],
             "cldc": cldc,
             "cond": cond
         })
-    return pd.DataFrame(rows, columns=["Periode","temp12","cond","prcp","cldc"])
+    df_out = pd.DataFrame(rows, columns=["Periode","temp12","cond","prcp","cldc"])
+    # Konvertiere numerische Spalten explizit zu float, um pd.NA zu vermeiden
+    for col in ["temp12", "prcp", "cldc"]:
+        if col in df_out.columns:
+            # pd.to_numeric wandelt pd.NA zu NaN, anschließend dtype cast auf float64
+            df_out[col] = pd.to_numeric(df_out[col], errors="coerce").astype(float)
+    return df_out
 
 # =========================
 # Datenquellen / Persistieren
