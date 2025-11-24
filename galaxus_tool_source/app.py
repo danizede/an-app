@@ -801,9 +801,9 @@ def fetch_monday_noon_weather(period_starts: List[pd.Timestamp],
 
     tz_str = "Europe/Zurich"
 
-def _to_monday_noon(p):
-    ts = pd.Timestamp(p).to_period("W").start_time
-    return ts + pd.Timedelta(hours=13)
+    def _to_monday_noon(p):
+        ts = pd.Timestamp(p).to_period("W").start_time  # Wochenstart
+        return (ts + pd.Timedelta(days=0, hours=12))    # Montag 12:00 (Period 'W' beginnt montags)
 
     mondays_local = [_to_monday_noon(p) for p in period_starts]
     start = min(mondays_local) - pd.Timedelta(hours=2)
@@ -1062,7 +1062,12 @@ if (raw_sell is not None) and (raw_price is not None):
 
             # ---------- Wetterdaten (Montag 12:00) ----------
             unique_weeks = sorted(ts_agg["Periode"].dropna().unique().tolist())
-            weather_df = fetch_monday_noon_weather([pd.Timestamp(x) for x in unique_weeks])
+            # Wetterdaten für jede Woche abrufen. Fehler (z.B. AmbiguousTimeError) abfangen, damit der Chart
+            # auch ohne Wetterdaten gerendert wird.
+            try:
+                weather_df = fetch_monday_noon_weather([pd.Timestamp(x) for x in unique_weeks])
+            except Exception:
+                weather_df = pd.DataFrame(columns=["Periode","temp12","cond","prcp","cldc"])
             # Berechnung des maximalen Y-Wertes robust gegenüber pd.NA/NaN und leeren Serien
             y_max_series = ts_agg["Wert (CHF)"]
             if y_max_series.empty or y_max_series.dropna().empty:
