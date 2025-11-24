@@ -823,11 +823,24 @@ def fetch_monday_noon_weather(period_starts: List[pd.Timestamp],
 
     # Zeitzonenverarbeitung ebenfalls defensiv behandeln
     try:
-        if df_h.index.tz is None:
-            # Meteostat liefert in vielen Fällen UTC ohne TZ; das ist nie mehrdeutig
-            df_h.index = df_h.index.tz_localize("UTC").tz_convert(tz_str)
-        else:
-            df_h.index = df_h.index.tz_convert(tz_str)
+        # Zeitzone nachträglich setzen/konvertieren
+# Diese Operation kann bei der Zeitumstellung (z.B. 2025-10-26 02:00) zu einer AmbiguousTimeError führen.
+# Um zu verhindern, dass der gesamte Chart abstürzt, kapseln wir sie in einen try/except.
+try:
+    if df_h.index.tz is None:
+        # Lokalisieren als UTC und anschließende Konvertierung in die lokale Zeitzone.
+        # ambiguous="infer" ordnet doppelte Uhrzeiten automatisch zu; nonexistent="shift_forward" verschiebt nicht existente
+        # Uhrzeiten beim "Spring forward"-Wechsel auf den nächsten gültigen Zeitpunkt.
+        df_h.index = (
+            df_h.index.tz_localize("UTC", ambiguous="infer", nonexistent="shift_forward")
+                       .tz_convert(tz_str)
+        )
+    else:
+        df_h.index = df_h.index.tz_convert(tz_str)
+except Exception:
+    # Tritt bei der Konvertierung ein Fehler (z.B. AmbiguousTimeError) auf, liefern wir keine Wetterdaten zurück.
+    return pd.DataFrame(columns=["Periode", "temp12", "cond", "prcp", "cldc"])
+
     except Exception:
         # Wenn hier eine AmbiguousTimeError o.Ä. auftritt, lassen wir das Wetter weg
         return pd.DataFrame(columns=["Periode","temp12","cond","prcp","cldc"])
