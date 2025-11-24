@@ -755,121 +755,85 @@ def enrich_and_merge(filtered_sell_df: pd.DataFrame, price_df: pd.DataFrame, lat
 # Wetter: Mo 12:00 (Zug/CH) – ohne tz-Argument
 # =========================
 def _classify_condition(coco, prcp, cldc) -> str:
-    """Einfaches Wetterlabel für das Overlay.
+    """Klassifiziert Wetterbedingungen anhand des Meteostat-Codes und Niederschlag/Cloudcover.
 
-    Liefert einen der Werte:
-      - "Sonne"
-      - "Wolke"
-      - "Regen/Schnee"
-      - "Unbekannt"
-
-    Dabei werden Niederschlag, Bewölkung (cldc) und der Meteostat-Code coco
-    robust gegen pd.NA/None ausgewertet, ohne dass float(pd.NA) o. ä. passiert.
-    Das Meteostat-API kann fehlende Werte als pd.NA zurückliefern. Damit float()
-    nicht mit NAType kollidiert, sollte diese Funktion nur mit numerischen oder
-    None-Werten aufgerufen werden – fetch_monday_noon_weather bereitet die
-    Daten entsprechend vor.
+    Das Meteostat-API kann fehlende Werte als pd.NA zurückliefern. Damit float() nicht mit
+    NAType kollidiert, sollte diese Funktion nur mit numerischen oder None-Werten aufgerufen
+    werden. Siehe fetch_monday_noon_weather für die Aufbereitung.
     """
-
-    # Meteostat condition code
     try:
         coco_int = int(coco) if coco is not None and not pd.isna(coco) else None
     except Exception:
         coco_int = None
-
-    # Niederschlag
-    prcp_val = None
-    if prcp is not None and not pd.isna(prcp):
-        try:
-            prcp_val = float(prcp)
-        except Exception:
-            prcp_val = None
-
-    # Bewölkung
-    cldc_val = None
+    # Prüfe auf Niederschlag
+    try:
+        if prcp and prcp > 0.0:
+            return "Regen"
+    except Exception:
+        pass
+    # Prüfe auf Bewölkung
     if cldc is not None and not pd.isna(cldc):
         try:
             cldc_val = float(cldc)
+            if cldc_val >= 0.7: return "Bewölkt"
+            if cldc_val <= 0.3: return "Sonnig"
         except Exception:
-            cldc_val = None
+            pass
+    if coco_int in {0, 1}: return "Sonnig"
+    if coco_int in {2, 3}: return "Bewölkt"
+    if coco_int in {5, 6, 7, 8, 9}: return "Regen"
+    return "—"
 
-    # Regen / Schnee, wenn messbarer Niederschlag
-    if prcp_val is not None and prcp_val > 0.0:
-        return "Regen/Schnee"
-
-    # Bewölkungsauswertung
-    if cldc_val is not None:
-        if cldc_val >= 0.7:
-            return "Wolke"
-        if cldc_val <= 0.3:
-            return "Sonne"
-
-    # Fallback über Meteostat-Code
-    if coco_int in {0, 1}:
-        return "Sonne"
-    if coco_int in {2, 3}:
-        return "Wolke"
-    if coco_int in {5, 6, 7, 8, 9}:
-        return "Regen/Schnee"
-
-    return "Unbekannt"
 
 def fetch_monday_noon_weather(period_starts: List[pd.Timestamp],
                               lat: float = 47.166, lon: float = 8.516) -> pd.DataFrame:
-    """Ermittelt Wetterdaten (Zug, CH) für Montag 12:00 jeder Woche.
+    """Ermittelt Wetterdaten für Montag 12:00 (lokal, Zug/CH) je Woche.
 
-    - Meteostat wird bewusst mit tz='UTC' abgefragt, um DST-Konflikte zu vermeiden.
-    - Index wird nach Europe/Zurich konvertiert und anschließend tz-frei gemacht.
-    - Numerische Spalten werden als float64 mit np.nan (kein pd.NA) zurückgegeben.
+    WICHTIG: Wir verwenden hier bewusst *keine* Zeitzonenlogik mehr, um
+    DST-Probleme (Sommer-/Winterzeit, z.B. 2025-10-26 02:00) zu vermeiden.
+    Alle Zeiten werden als naive Datetimes behandelt. Das kann im Winter
+    eine Stunde Verschiebung verursachen, ist aber für den Wochenvergleich
+    der Verkäufe unkritisch.
     """
     if not period_starts:
         return pd.DataFrame(columns=["Periode","temp12","cond","prcp","cldc"])
     if not METEOSTAT_OK:
         return pd.DataFrame(columns=["Periode","temp12","cond","prcp","cldc"])
 
-    tz_str = "Europe/Zurich"
-
     def _to_monday_noon(p):
-        ts = pd.Timestamp(p).to_period("W").start_time  # Wochenstart (Mo)
-        return ts + pd.Timedelta(hours=12)              # Montag 12:00
+        # Wochenstart (Montag) + 12 Stunden, alles ohne Zeitzone
+        ts = pd.Timestamp(p).to_period("W").start_time
+        return ts + pd.Timedelta(hours=12)
 
     mondays_local = [_to_monday_noon(p) for p in period_starts]
     start = min(mondays_local) - pd.Timedelta(hours=2)
     end   = max(mondays_local) + pd.Timedelta(hours=2)
 
-    # Daten abrufen. Wir arbeiten intern konsequent mit **naiven** Datetimes,
-    # um DST‑Ambiguitäten (Sommerzeitumstellung) zu vermeiden. Meteostat kann
-    # einen tz‑bewussten Index (z.B. UTC) liefern – in diesem Fall entfernen
-    # wir die Zeitzone einfach.
     zug = Point(lat, lon, 425)
-    df_h = Hourly(zug, start, end, tz="UTC").fetch()
+    # Meteostat ohne tz-Argument – Index kann tz-aware oder naive sein.
+    df_h = Hourly(zug, start, end).fetch()
     if df_h is None or df_h.empty:
         return pd.DataFrame(columns=["Periode","temp12","cond","prcp","cldc"])
 
+    # Index in naive Datetimes konvertieren (Zeitzoneninformationen komplett entfernen)
     idx = pd.to_datetime(df_h.index)
-    # Wenn der Index eine Zeitzone hat, entfernen wir sie ohne erneutes
-    # Lokalisieren – so kann keine "ambiguous"‑Fehlermeldung mehr auftreten.
     try:
-        if getattr(idx, "tz", None) is not None:
-            try:
-                idx = idx.tz_convert("UTC")
-            except Exception:
-                # falls bereits UTC oder Konvertierung nicht nötig ist
-                pass
-            idx = idx.tz_localize(None)
-    except Exception:
-        # Fallback: komplett naive Datumswerte verwenden
-        idx = pd.to_datetime(df_h.index)
-    df_h.index = idx
+        # Wenn der Index tz-aware ist, entfernt tz_localize(None) nur die Zeitzone
+        df_h.index = idx.tz_localize(None)
+    except TypeError:
+        # Bereits naive
+        df_h.index = idx
 
     rows = []
     for m in mondays_local:
-        target = pd.Timestamp(m)  # naive lokale Zeit
+        target = pd.Timestamp(m)  # naive Zielzeit (Montag 12:00)
 
         exact = df_h.loc[df_h.index.floor("H") == target.floor("H")]
         if exact.empty:
-            win = df_h.loc[(df_h.index >= target - pd.Timedelta(hours=2)) &
-                           (df_h.index <= target + pd.Timedelta(hours=2))]
+            win = df_h.loc[
+                (df_h.index >= target - pd.Timedelta(hours=2)) &
+                (df_h.index <= target + pd.Timedelta(hours=2))
+            ]
             if win.empty:
                 continue
             idx_min = (win.index - target).abs().argmin()
@@ -919,13 +883,11 @@ def fetch_monday_noon_weather(period_starts: List[pd.Timestamp],
         })
 
     df_out = pd.DataFrame(rows, columns=["Periode","temp12","cond","prcp","cldc"])
-    # Numerische Spalten explizit zu float casten, damit kein pd.NA übrig bleibt
-    for col in ["temp12", "prcp", "cldc"]:
+    # numerische Spalten explizit in float64 wandeln, pd.NA -> NaN
+    for col in ["temp12","prcp","cldc"]:
         if col in df_out.columns:
             df_out[col] = pd.to_numeric(df_out[col], errors="coerce").astype(float)
-
     return df_out
-
 # =========================
 # Datenquellen / Persistieren
 # =========================
@@ -1146,42 +1108,28 @@ if (raw_sell is not None) and (raw_price is not None):
             chart = (lines + points + popup + end_labels)
 
             if METEOSTAT_OK and ('weather_plot' in locals()) and not weather_plot.empty:
-                # Symbole für Sonne / Wolke / Regen
-                icon_map = {
-                    "Sonne": "☀️",
-                    "Wolke": "☁️",
-                    "Regen/Schnee": "🌧️",
-                }
-                weather_plot = weather_plot.copy()
-                weather_plot["Icon"] = weather_plot["cond"].map(icon_map).fillna("❓")
-
-                wx_shape_scale = alt.Scale(
-                    domain=["Sonne", "Wolke", "Regen/Schnee", "Unbekannt"],
-                    range=["circle", "square", "triangle-down", "diamond"],
-                )
-
+                wx_shape_scale = alt.Scale(domain=["Sonnig","Bewölkt","Regen","—"],
+                                           range=["triangle-up","circle","square","diamond"])
                 wx_points = (
                     alt.Chart(weather_plot)
-                    .mark_point(size=110, filled=True, opacity=0.9)
+                    .mark_point(size=100, filled=True, opacity=0.9)
                     .encode(
                         x=alt.X("Periode:T"),
                         y=alt.Y("ypos:Q"),
                         shape=alt.Shape("cond:N", title="Wetter", scale=wx_shape_scale),
                         tooltip=[
                             alt.Tooltip("Periode:T", title="Woche"),
-                            alt.Tooltip("temp12:Q", title="Temp 12:00 °C", format=".1f"),
-                            alt.Tooltip("cond:N", title="Wetter"),
-                            alt.Tooltip("prcp:Q", title="Niederschlag (mm)", format=".1f"),
+                            alt.Tooltip("temp12:Q", title="Temp 12:00°C", format=".1f"),
+                            alt.Tooltip("cond:N",  title="Wetter"),
+                            alt.Tooltip("prcp:Q",  title="Niederschlag (mm)", format=".1f"),
                         ],
                     )
                 )
-
                 wx_text = (
                     alt.Chart(weather_plot)
-                    .mark_text(dy=-12, fontSize=18, fontWeight="bold")
-                    .encode(x="Periode:T", y="ypos:Q", text="Icon:N")
+                    .mark_text(dy=-12, fontSize=11, fontWeight='bold')
+                    .encode(x="Periode:T", y="ypos:Q", text=alt.Text("temp12:Q", format=".1f"))
                 )
-
                 chart = (chart + wx_points + wx_text).properties(height=420)
             else:
                 chart = chart.properties(height=400)
