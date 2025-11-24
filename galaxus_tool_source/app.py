@@ -801,9 +801,9 @@ def fetch_monday_noon_weather(period_starts: List[pd.Timestamp],
 
     tz_str = "Europe/Zurich"
 
-    def _to_monday_noon(p):
-        ts = pd.Timestamp(p).to_period("W").start_time  # Wochenstart
-        return (ts + pd.Timedelta(days=0, hours=12))    # Montag 12:00 (Period 'W' beginnt montags)
+def _to_monday_noon(p):
+    ts = pd.Timestamp(p).to_period("W").start_time
+    return ts + pd.Timedelta(hours=13)
 
     mondays_local = [_to_monday_noon(p) for p in period_starts]
     start = min(mondays_local) - pd.Timedelta(hours=2)
