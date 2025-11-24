@@ -788,11 +788,10 @@ def fetch_monday_noon_weather(period_starts: List[pd.Timestamp],
                               lat: float = 47.166, lon: float = 8.516) -> pd.DataFrame:
     """Ermittelt Wetterdaten für die angegebenen Wochenperioden.
 
-    Für jede Woche in period_starts wird der nächstgelegene Messpunkt am Montag um 12:00 Uhr
-    im Raum Zug (Schweiz) gesucht. Meteostat liefert gelegentlich pd.NA als fehlenden Wert.
-    Diese Funktion wandelt solche NA-Werte in np.nan oder 0.0 um, bevor sie mit float() oder
-    int() gecastet werden, um "float() argument must be a string or a real number, not
-    'NAType'" zu vermeiden.
+    Wichtig: Wenn es beim Abrufen oder bei der Zeitzonenverarbeitung zu
+    DST-/Sommerzeit-Problemen ("ambiguous" etc.) kommt, werden einfach
+    KEINE Wetterdaten zurückgegeben. Damit bricht die Analyse nie ab und
+    der Verkaufsverlauf bleibt immer sichtbar. Wetter ist nur Zusatzinfo.
     """
     if not period_starts:
         return pd.DataFrame(columns=["Periode","temp12","cond","prcp","cldc"])
@@ -802,26 +801,38 @@ def fetch_monday_noon_weather(period_starts: List[pd.Timestamp],
     tz_str = "Europe/Zurich"
 
     def _to_monday_noon(p):
-        ts = pd.Timestamp(p).to_period("W").start_time  # Wochenstart
-        return (ts + pd.Timedelta(days=0, hours=12))    # Montag 12:00 (Period 'W' beginnt montags)
+        ts = pd.Timestamp(p).to_period("W").start_time  # Wochenstart (Montag 00:00)
+        return ts + pd.Timedelta(hours=12)             # Montag 12:00
 
     mondays_local = [_to_monday_noon(p) for p in period_starts]
     start = min(mondays_local) - pd.Timedelta(hours=2)
     end   = max(mondays_local) + pd.Timedelta(hours=2)
 
     zug = Point(lat, lon, 425)
-    # >>> KEIN tz-Argument!
-    df_h = Hourly(zug, start, end).fetch()
+
+    # Meteostat-Abfrage robust kapseln: bei jeglichem Fehler -> kein Wetter
+    try:
+        # Ohne tz-Argument, wie ursprünglich gewünscht
+        df_h = Hourly(zug, start, end).fetch()
+    except Exception:
+        # Z.B. DST-Ambiguität innerhalb von Meteostat -> einfach kein Wetter verwenden
+        return pd.DataFrame(columns=["Periode","temp12","cond","prcp","cldc"])
+
     if df_h is None or df_h.empty:
         return pd.DataFrame(columns=["Periode","temp12","cond","prcp","cldc"])
 
-    # Zeitzone nachträglich setzen/konvertieren
-    if df_h.index.tz is None:
-        df_h.index = df_h.index.tz_localize("UTC").tz_convert(tz_str)
-    else:
-        df_h.index = df_h.index.tz_convert(tz_str)
+    # Zeitzonenverarbeitung ebenfalls defensiv behandeln
+    try:
+        if df_h.index.tz is None:
+            # Meteostat liefert in vielen Fällen UTC ohne TZ; das ist nie mehrdeutig
+            df_h.index = df_h.index.tz_localize("UTC").tz_convert(tz_str)
+        else:
+            df_h.index = df_h.index.tz_convert(tz_str)
+    except Exception:
+        # Wenn hier eine AmbiguousTimeError o.Ä. auftritt, lassen wir das Wetter weg
+        return pd.DataFrame(columns=["Periode","temp12","cond","prcp","cldc"])
 
-    rows = []
+    rows: list[dict] = []
     for m in mondays_local:
         m_zrh = pd.Timestamp(m, tz=tz_str)
         exact = df_h.loc[df_h.index.floor("H") == m_zrh.floor("H")]
@@ -845,6 +856,7 @@ def fetch_monday_noon_weather(period_starts: List[pd.Timestamp],
                 temp = np.nan
         else:
             temp = np.nan
+
         # Niederschlag: fehlende Werte gelten als 0.0
         prcp_val = r.get("prcp")
         if prcp_val is not None and not pd.isna(prcp_val):
@@ -854,6 +866,7 @@ def fetch_monday_noon_weather(period_starts: List[pd.Timestamp],
                 prcp = 0.0
         else:
             prcp = 0.0
+
         # Bewölkung: fehlende Werte bleiben np.nan
         cldc_val = r.get("cldc")
         if cldc_val is not None and not pd.isna(cldc_val):
@@ -863,23 +876,27 @@ def fetch_monday_noon_weather(period_starts: List[pd.Timestamp],
                 cldc = np.nan
         else:
             cldc = np.nan
+
         coco = r.get("coco")
-        # Klassifiziere Bedingungen (funktion übernimmt None/np.nan korrekt)
         cond = _classify_condition(coco, prcp, cldc)
+
         rows.append({
             "Periode": pd.Timestamp(m).to_pydatetime(),  # naive -> passt zu ts_agg['Periode']
             "temp12": temp,
             "prcp": prcp,
             "cldc": cldc,
-            "cond": cond
+            "cond": cond,
         })
+
     df_out = pd.DataFrame(rows, columns=["Periode","temp12","cond","prcp","cldc"])
-    # Konvertiere numerische Spalten explizit zu float, um pd.NA zu vermeiden
+
+    # Numerische Spalten explizit zu float casten, damit kein pd.NA übrig bleibt
     for col in ["temp12", "prcp", "cldc"]:
         if col in df_out.columns:
-            # pd.to_numeric wandelt pd.NA zu NaN, anschließend dtype cast auf float64
             df_out[col] = pd.to_numeric(df_out[col], errors="coerce").astype(float)
+
     return df_out
+
 
 # =========================
 # Datenquellen / Persistieren
