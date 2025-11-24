@@ -788,10 +788,11 @@ def fetch_monday_noon_weather(period_starts: List[pd.Timestamp],
                               lat: float = 47.166, lon: float = 8.516) -> pd.DataFrame:
     """Ermittelt Wetterdaten für die angegebenen Wochenperioden.
 
-    Wichtig: Wenn es beim Abrufen oder bei der Zeitzonenverarbeitung zu
-    DST-/Sommerzeit-Problemen ("ambiguous" etc.) kommt, werden einfach
-    KEINE Wetterdaten zurückgegeben. Damit bricht die Analyse nie ab und
-    der Verkaufsverlauf bleibt immer sichtbar. Wetter ist nur Zusatzinfo.
+    Für jede Woche in period_starts wird der nächstgelegene Messpunkt am Montag um 12:00 Uhr
+    im Raum Zug (Schweiz) gesucht. Meteostat liefert gelegentlich pd.NA als fehlenden Wert.
+    Diese Funktion wandelt solche NA-Werte in np.nan oder 0.0 um, bevor sie mit float() oder
+    int() gecastet werden, um "float() argument must be a string or a real number, not
+    'NAType'" zu vermeiden.
     """
     if not period_starts:
         return pd.DataFrame(columns=["Periode","temp12","cond","prcp","cldc"])
@@ -801,53 +802,39 @@ def fetch_monday_noon_weather(period_starts: List[pd.Timestamp],
     tz_str = "Europe/Zurich"
 
     def _to_monday_noon(p):
-        ts = pd.Timestamp(p).to_period("W").start_time  # Wochenstart (Montag 00:00)
-        return ts + pd.Timedelta(hours=12)             # Montag 12:00
+        ts = pd.Timestamp(p).to_period("W").start_time  # Wochenstart
+        return (ts + pd.Timedelta(days=0, hours=12))    # Montag 12:00 (Period 'W' beginnt montags)
 
     mondays_local = [_to_monday_noon(p) for p in period_starts]
     start = min(mondays_local) - pd.Timedelta(hours=2)
     end   = max(mondays_local) + pd.Timedelta(hours=2)
 
+    # Meteostat-Daten in UTC abrufen und Zeitzone komplett entfernen.
+    # Durch die Angabe von tz="UTC" in Hourly() erhalten wir stets einen tz-aware Index.
+    # Anschließend machen wir den Index tz-naiv, damit keine AmbiguousTimeError mehr auftreten können.
     zug = Point(lat, lon, 425)
-
-    # Meteostat-Abfrage robust kapseln: bei jeglichem Fehler -> kein Wetter
     try:
-        # Ohne tz-Argument, wie ursprünglich gewünscht
-        df_h = Hourly(zug, start, end).fetch()
+        df_h = Hourly(zug, start, end, tz="UTC").fetch()
     except Exception:
-        # Z.B. DST-Ambiguität innerhalb von Meteostat -> einfach kein Wetter verwenden
-        return pd.DataFrame(columns=["Periode","temp12","cond","prcp","cldc"])
-
+        df_h = None
     if df_h is None or df_h.empty:
         return pd.DataFrame(columns=["Periode","temp12","cond","prcp","cldc"])
-
-    # Zeitzonenverarbeitung ebenfalls defensiv behandeln
+    # Den Zeitzonen-Offset komplett entfernen, sodass ein nackter Timestamp bleibt.
+    # Damit umgehen wir DST-Probleme komplett.
     try:
-        # Zeitzone nachträglich setzen/konvertieren
-# Diese Operation kann bei der Zeitumstellung (z.B. 2025-10-26 02:00) zu einer AmbiguousTimeError führen.
-# Um zu verhindern, dass der gesamte Chart abstürzt, kapseln wir sie in einen try/except.
-try:
-    if df_h.index.tz is None:
-        # Lokalisieren als UTC und anschließende Konvertierung in die lokale Zeitzone.
-        # ambiguous="infer" ordnet doppelte Uhrzeiten automatisch zu; nonexistent="shift_forward" verschiebt nicht existente
-        # Uhrzeiten beim "Spring forward"-Wechsel auf den nächsten gültigen Zeitpunkt.
-        df_h.index = (
-            df_h.index.tz_localize("UTC", ambiguous="infer", nonexistent="shift_forward")
-                       .tz_convert(tz_str)
-        )
-    else:
-        df_h.index = df_h.index.tz_convert(tz_str)
-except Exception:
-    # Tritt bei der Konvertierung ein Fehler (z.B. AmbiguousTimeError) auf, liefern wir keine Wetterdaten zurück.
-    return pd.DataFrame(columns=["Periode", "temp12", "cond", "prcp", "cldc"])
-
+        if df_h.index.tz is not None:
+            df_h.index = df_h.index.tz_convert("UTC").tz_localize(None)
+        else:
+            df_h.index = df_h.index.tz_localize(None)
     except Exception:
-        # Wenn hier eine AmbiguousTimeError o.Ä. auftritt, lassen wir das Wetter weg
+        # Falls hier doch etwas schiefgeht, liefern wir keine Wetterdaten.
         return pd.DataFrame(columns=["Periode","temp12","cond","prcp","cldc"])
 
-    rows: list[dict] = []
+    rows = []
     for m in mondays_local:
-        m_zrh = pd.Timestamp(m, tz=tz_str)
+        # Da df_h.index tz-naiv ist (siehe oben), muss auch der Vergleichstimestamp tz-naiv sein.
+        # Wir verwenden den naiven Timestamp direkt, ohne Zeitzonenzuweisung.
+        m_zrh = pd.Timestamp(m)
         exact = df_h.loc[df_h.index.floor("H") == m_zrh.floor("H")]
         if exact.empty:
             win = df_h.loc[(df_h.index >= m_zrh - pd.Timedelta(hours=2)) &
@@ -869,7 +856,6 @@ except Exception:
                 temp = np.nan
         else:
             temp = np.nan
-
         # Niederschlag: fehlende Werte gelten als 0.0
         prcp_val = r.get("prcp")
         if prcp_val is not None and not pd.isna(prcp_val):
@@ -879,7 +865,6 @@ except Exception:
                 prcp = 0.0
         else:
             prcp = 0.0
-
         # Bewölkung: fehlende Werte bleiben np.nan
         cldc_val = r.get("cldc")
         if cldc_val is not None and not pd.isna(cldc_val):
@@ -889,27 +874,23 @@ except Exception:
                 cldc = np.nan
         else:
             cldc = np.nan
-
         coco = r.get("coco")
+        # Klassifiziere Bedingungen (funktion übernimmt None/np.nan korrekt)
         cond = _classify_condition(coco, prcp, cldc)
-
         rows.append({
             "Periode": pd.Timestamp(m).to_pydatetime(),  # naive -> passt zu ts_agg['Periode']
             "temp12": temp,
             "prcp": prcp,
             "cldc": cldc,
-            "cond": cond,
+            "cond": cond
         })
-
     df_out = pd.DataFrame(rows, columns=["Periode","temp12","cond","prcp","cldc"])
-
-    # Numerische Spalten explizit zu float casten, damit kein pd.NA übrig bleibt
+    # Konvertiere numerische Spalten explizit zu float, um pd.NA zu vermeiden
     for col in ["temp12", "prcp", "cldc"]:
         if col in df_out.columns:
+            # pd.to_numeric wandelt pd.NA zu NaN, anschließend dtype cast auf float64
             df_out[col] = pd.to_numeric(df_out[col], errors="coerce").astype(float)
-
     return df_out
-
 
 # =========================
 # Datenquellen / Persistieren
