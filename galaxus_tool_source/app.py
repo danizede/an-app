@@ -784,110 +784,103 @@ def _classify_condition(coco, prcp, cldc) -> str:
     if coco_int in {5, 6, 7, 8, 9}: return "Regen"
     return "—"
 
-
 def fetch_monday_noon_weather(period_starts: List[pd.Timestamp],
                               lat: float = 47.166, lon: float = 8.516) -> pd.DataFrame:
-    """Ermittelt Wetterdaten für Montag 12:00 (lokal, Zug/CH) je Woche.
+    """Ermittelt Wetterdaten für die angegebenen Wochenperioden.
 
-    WICHTIG: Wir verwenden hier bewusst *keine* Zeitzonenlogik mehr, um
-    DST-Probleme (Sommer-/Winterzeit, z.B. 2025-10-26 02:00) zu vermeiden.
-    Alle Zeiten werden als naive Datetimes behandelt. Das kann im Winter
-    eine Stunde Verschiebung verursachen, ist aber für den Wochenvergleich
-    der Verkäufe unkritisch.
+    Für jede Woche in period_starts wird der nächstgelegene Messpunkt am Montag um 12:00 Uhr
+    im Raum Zug (Schweiz) gesucht. Meteostat liefert gelegentlich pd.NA als fehlenden Wert.
+    Diese Funktion wandelt solche NA-Werte in np.nan oder 0.0 um, bevor sie mit float() oder
+    int() gecastet werden, um "float() argument must be a string or a real number, not
+    'NAType'" zu vermeiden.
     """
     if not period_starts:
         return pd.DataFrame(columns=["Periode","temp12","cond","prcp","cldc"])
     if not METEOSTAT_OK:
         return pd.DataFrame(columns=["Periode","temp12","cond","prcp","cldc"])
 
+    tz_str = "Europe/Zurich"
+
     def _to_monday_noon(p):
-        # Wochenstart (Montag) + 12 Stunden, alles ohne Zeitzone
-        ts = pd.Timestamp(p).to_period("W").start_time
-        return ts + pd.Timedelta(hours=12)
+        ts = pd.Timestamp(p).to_period("W").start_time  # Wochenstart
+        return (ts + pd.Timedelta(days=0, hours=12))    # Montag 12:00 (Period 'W' beginnt montags)
 
     mondays_local = [_to_monday_noon(p) for p in period_starts]
     start = min(mondays_local) - pd.Timedelta(hours=2)
     end   = max(mondays_local) + pd.Timedelta(hours=2)
 
     zug = Point(lat, lon, 425)
-    # Meteostat ohne tz-Argument – Index kann tz-aware oder naive sein.
+    # >>> KEIN tz-Argument!
     df_h = Hourly(zug, start, end).fetch()
     if df_h is None or df_h.empty:
         return pd.DataFrame(columns=["Periode","temp12","cond","prcp","cldc"])
 
-    # Index in naive Datetimes konvertieren (Zeitzoneninformationen komplett entfernen)
-    idx = pd.to_datetime(df_h.index)
-    try:
-        # Wenn der Index tz-aware ist, entfernt tz_localize(None) nur die Zeitzone
-        df_h.index = idx.tz_localize(None)
-    except TypeError:
-        # Bereits naive
-        df_h.index = idx
+    # Zeitzone nachträglich setzen/konvertieren
+    if df_h.index.tz is None:
+        df_h.index = df_h.index.tz_localize("UTC").tz_convert(tz_str)
+    else:
+        df_h.index = df_h.index.tz_convert(tz_str)
 
     rows = []
     for m in mondays_local:
-        target = pd.Timestamp(m)  # naive Zielzeit (Montag 12:00)
-
-        exact = df_h.loc[df_h.index.floor("H") == target.floor("H")]
+        m_zrh = pd.Timestamp(m, tz=tz_str)
+        exact = df_h.loc[df_h.index.floor("H") == m_zrh.floor("H")]
         if exact.empty:
-            win = df_h.loc[
-                (df_h.index >= target - pd.Timedelta(hours=2)) &
-                (df_h.index <= target + pd.Timedelta(hours=2))
-            ]
+            win = df_h.loc[(df_h.index >= m_zrh - pd.Timedelta(hours=2)) &
+                           (df_h.index <= m_zrh + pd.Timedelta(hours=2))]
             if win.empty:
                 continue
-            idx_min = (win.index - target).abs().argmin()
-            r = win.loc[idx_min]
+            # Index des Datums mit minimalem Abstand zu m_zrh ermitteln
+            idx = (win.index - m_zrh).abs().argmin()
+            r = win.loc[idx]
         else:
             r = exact.iloc[0]
 
-        # Temperatur
-        temp_raw = r.get("temp")
-        if temp_raw is not None and not pd.isna(temp_raw):
+        # Temperatur: fehlende Werte (pd.NA) in np.nan umwandeln
+        temp_val = r.get("temp")
+        if temp_val is not None and not pd.isna(temp_val):
             try:
-                temp = float(temp_raw)
+                temp = float(temp_val)
             except Exception:
                 temp = np.nan
         else:
             temp = np.nan
-
-        # Niederschlag (mm)
-        prcp_raw = r.get("prcp")
-        if prcp_raw is not None and not pd.isna(prcp_raw):
+        # Niederschlag: fehlende Werte gelten als 0.0
+        prcp_val = r.get("prcp")
+        if prcp_val is not None and not pd.isna(prcp_val):
             try:
-                prcp = float(prcp_raw)
+                prcp = float(prcp_val)
             except Exception:
                 prcp = 0.0
         else:
             prcp = 0.0
-
-        # Bewölkung
-        cldc_raw = r.get("cldc")
-        if cldc_raw is not None and not pd.isna(cldc_raw):
+        # Bewölkung: fehlende Werte bleiben np.nan
+        cldc_val = r.get("cldc")
+        if cldc_val is not None and not pd.isna(cldc_val):
             try:
-                cldc = float(cldc_raw)
+                cldc = float(cldc_val)
             except Exception:
                 cldc = np.nan
         else:
             cldc = np.nan
-
         coco = r.get("coco")
+        # Klassifiziere Bedingungen (funktion übernimmt None/np.nan korrekt)
         cond = _classify_condition(coco, prcp, cldc)
-
         rows.append({
-            "Periode": target.to_pydatetime(),  # passt zu ts_agg['Periode']
+            "Periode": pd.Timestamp(m).to_pydatetime(),  # naive -> passt zu ts_agg['Periode']
             "temp12": temp,
             "prcp": prcp,
             "cldc": cldc,
-            "cond": cond,
+            "cond": cond
         })
-
     df_out = pd.DataFrame(rows, columns=["Periode","temp12","cond","prcp","cldc"])
-    # numerische Spalten explizit in float64 wandeln, pd.NA -> NaN
-    for col in ["temp12","prcp","cldc"]:
+    # Konvertiere numerische Spalten explizit zu float, um pd.NA zu vermeiden
+    for col in ["temp12", "prcp", "cldc"]:
         if col in df_out.columns:
+            # pd.to_numeric wandelt pd.NA zu NaN, anschließend dtype cast auf float64
             df_out[col] = pd.to_numeric(df_out[col], errors="coerce").astype(float)
     return df_out
+
 # =========================
 # Datenquellen / Persistieren
 # =========================
@@ -1059,10 +1052,28 @@ if (raw_sell is not None) and (raw_price is not None):
             # ---------- Wetterdaten (Montag 12:00) ----------
             unique_weeks = sorted(ts_agg["Periode"].dropna().unique().tolist())
             weather_df = fetch_monday_noon_weather([pd.Timestamp(x) for x in unique_weeks])
-            y_max = float(ts_agg["Wert (CHF)"].max() or 0.0)
+            # Berechnung des maximalen Y-Wertes robust gegenüber pd.NA/NaN und leeren Serien
+            y_max_series = ts_agg["Wert (CHF)"]
+            if y_max_series.empty or y_max_series.dropna().empty:
+                y_max = 0.0
+            else:
+                try:
+                    _tmp_max = y_max_series.max()
+                    # pd.NA oder NaN abfangen
+                    if _tmp_max is not None and not pd.isna(_tmp_max):
+                        y_max = float(_tmp_max)
+                    else:
+                        y_max = 0.0
+                except Exception:
+                    y_max = 0.0
+
             if not weather_df.empty:
                 weather_plot = weather_df.copy()
-                weather_plot["ypos"] = y_max * 1.05 if y_max > 0 else 1.0
+                # Oberhalb des höchsten Balkens platzieren; falls kein Y-Wert (>0) vorhanden, fixe 1.0
+                if y_max and not pd.isna(y_max) and y_max > 0:
+                    weather_plot["ypos"] = y_max * 1.05
+                else:
+                    weather_plot["ypos"] = 1.0
 
             hover_cat = alt.selection_single(fields=["Kategorie"], on="mouseover", nearest=True, empty="none")
             hover_pt  = alt.selection_single(fields=["Periode","Kategorie"], on="mouseover", nearest=True, empty="none")
