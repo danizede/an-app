@@ -1,4 +1,3 @@
-# app.py
 # Updated Streamlit Analyse-Tool – robuste Persistenz & _rowdate-Fix
 # - Persistenz: Zuletzt hochgeladene sellout.xlsx / preisliste.xlsx werden gespeichert
 #   und bei Neustart/Laden automatisch verwendet. Überschreiben nur bei echtem Upload.
@@ -274,7 +273,8 @@ def parse_number_series(s: pd.Series) -> pd.Series:
 def parse_date_series_us(s: pd.Series) -> pd.Series:
     if np.issubdtype(s.dtype, np.datetime64):
         return s
-    dt1 = pd.to_datetime(s, errors="coerce", dayfirst=False, infer_datetime_format=True)
+    # Pandas >=2.1 entfernt infer_datetime_format, also ohne diesen Parameter parsen
+    dt1 = pd.to_datetime(s, errors="coerce", dayfirst=False)
     nums = pd.to_numeric(s, errors="coerce")
     dt2 = pd.to_datetime(nums, origin="1899-12-30", unit="d", errors="coerce")
     return dt1.combine_first(dt2)
@@ -998,8 +998,7 @@ if (raw_sell is not None) and (raw_price is not None):
                     row_number='row_number()',
                     sort=[alt.SortField(field='Periode', order='descending')],
                     groupby=['Kategorie']
-                )
-                .transform_filter(alt.datum.row_number == 0)
+                ).transform_filter(alt.datum.row_number == 0)
                 .mark_text(align='left', dx=6, dy=-6, fontSize=11)
                 .encode(x='Periode:T', y='Wert (CHF):Q', text='Kategorie:N', color='Kategorie:N',
                         opacity=alt.condition(hover_cat, alt.value(1.0), alt.value(0.6)))
