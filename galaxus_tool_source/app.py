@@ -23,12 +23,35 @@ import pandas as pd
 _original_to_datetime = pd.to_datetime
 
 def _to_datetime_safe(*args, **kwargs):
+    """
+    Wrapper around pandas.to_datetime that removes the
+    unsupported keyword argument ``infer_datetime_format``.
+
+    In pandas>=2.1 this argument was removed and passing it will
+    cause a TypeError. This wrapper pops it from the kwargs before
+    delegating to the original function. It also patches the
+    equivalent function in pandas.core.tools.datetimes so that
+    any library calling that lower-level API will also be safe.
+    """
     # Remove deprecated argument if present
     if 'infer_datetime_format' in kwargs:
         kwargs.pop('infer_datetime_format', None)
     return _original_to_datetime(*args, **kwargs)
 
+# Patch both pandas.to_datetime and the internal core function
 pd.to_datetime = _to_datetime_safe
+try:
+    import pandas.core.tools.datetimes as _pandas_dt_core  # type: ignore[attr-defined]
+    if hasattr(_pandas_dt_core, 'to_datetime'):
+        _original_core_to_datetime = _pandas_dt_core.to_datetime  # type: ignore[attr-defined]
+        def _core_to_datetime_safe(*args, **kwargs):
+            if 'infer_datetime_format' in kwargs:
+                kwargs.pop('infer_datetime_format', None)
+            return _original_core_to_datetime(*args, **kwargs)  # type: ignore[func-returns-value]
+        _pandas_dt_core.to_datetime = _core_to_datetime_safe  # type: ignore[attr-defined]
+except Exception:
+    # If the internal module structure changes, ignore and continue.
+    pass
 
 import streamlit as st
 # Altair removed due to compatibility issues with pandas 3.0
