@@ -18,6 +18,20 @@ from datetime import datetime
 from collections.abc import Mapping
 import warnings
 
+# --- Pandas fallback for deprecated infer_datetime_format ------------------
+# In newer pandas versions (>=2.1), the keyword argument `infer_datetime_format`
+# was removed from pd.to_datetime. To avoid unexpected errors from
+# third-party calls passing this argument, we monkey-patch pd.to_datetime
+# to simply ignore it. This wrapper pops the unsupported key before
+# delegating to the original function. If running on older pandas
+# versions where the argument is still accepted, this has no effect.
+_original_to_datetime = pd.to_datetime
+def _to_datetime_safe(*args, **kwargs):
+    if 'infer_datetime_format' in kwargs:
+        kwargs.pop('infer_datetime_format', None)
+    return _original_to_datetime(*args, **kwargs)
+pd.to_datetime = _to_datetime_safe
+
 # ================
 # Globale Settings
 # ================
