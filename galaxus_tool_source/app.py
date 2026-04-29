@@ -31,7 +31,9 @@ def _to_datetime_safe(*args, **kwargs):
 pd.to_datetime = _to_datetime_safe
 
 import streamlit as st
-import altair as alt
+# Altair removed due to compatibility issues with pandas 3.0
+# Instead we use matplotlib for plotting
+import matplotlib.pyplot as plt
 from pathlib import Path
 from datetime import datetime
 from collections.abc import Mapping
@@ -48,7 +50,9 @@ np.seterr(all="ignore")
 
 st.set_page_config(page_title="Analyse", layout="wide")
 try:
-    alt.data_transformers.disable_max_rows()
+    # Disable max rows on Altair if present. This will no longer be needed
+    # since we removed Altair, but we keep the try/except to avoid import errors.
+    pass
 except Exception:
     pass
 
@@ -983,48 +987,18 @@ if (raw_sell is not None) and (raw_price is not None):
             ts_agg["Kategorie"]  = ts_agg["Kategorie"].astype(str)
             ts_agg["Wert (CHF)"] = pd.to_numeric(ts_agg["Wert (CHF)"], errors="coerce").fillna(0.0).astype(float)
 
-            hover_cat = alt.selection_single(fields=["Kategorie"], on="mouseover", nearest=True, empty="none")
-            hover_pt  = alt.selection_single(fields=["Periode","Kategorie"], on="mouseover", nearest=True, empty="none")
-
-            base = alt.Chart(ts_agg)
-            lines = (
-                base.mark_line(point=alt.OverlayMarkDef(size=30), interpolate="linear")
-                .encode(
-                    x=alt.X("Periode:T", title="Woche"),
-                    y=alt.Y("Wert (CHF):Q", title="Verkaufswert (CHF) pro Woche", stack=None),
-                    color=alt.Color("Kategorie:N", title="Kategorie"),
-                    opacity=alt.condition(hover_cat, alt.value(1.0), alt.value(0.25)),
-                    strokeWidth=alt.condition(hover_cat, alt.value(3), alt.value(1.5)),
-                    tooltip=[
-                        alt.Tooltip("Periode:T", title="Woche"),
-                        alt.Tooltip("Kategorie:N", title="Kategorie"),
-                        alt.Tooltip("Wert (CHF):Q", title="Verkaufswert (CHF)", format=",.0f"),
-                    ],
-                )
-                .add_selection(hover_cat)
-            )
-            points = (
-                base.mark_point(size=70, opacity=0)
-                .encode(x="Periode:T", y="Wert (CHF):Q", color="Kategorie:N")
-                .add_selection(hover_pt)
-            )
-            popup = (
-                base.transform_filter(hover_pt)
-                .mark_text(align='left', dx=6, dy=-8, fontSize=12, fontWeight='bold')
-                .encode(x="Periode:T", y="Wert (CHF):Q", text="Kategorie:N", color="Kategorie:N")
-            )
-            end_labels = (
-                base.transform_window(
-                    row_number='row_number()',
-                    sort=[alt.SortField(field='Periode', order='descending')],
-                    groupby=['Kategorie']
-                ).transform_filter(alt.datum.row_number == 0)
-                .mark_text(align='left', dx=6, dy=-6, fontSize=11)
-                .encode(x='Periode:T', y='Wert (CHF):Q', text='Kategorie:N', color='Kategorie:N',
-                        opacity=alt.condition(hover_cat, alt.value(1.0), alt.value(0.6)))
-            )
-            chart = (lines + points + popup + end_labels).properties(height=400)
-            st.altair_chart(chart, use_container_width=True)
+            # Pivot the aggregated data to wide format for plotting
+            pivot_df = ts_agg.pivot(index="Periode", columns="Kategorie", values="Wert (CHF)").fillna(0.0)
+            # Plot using matplotlib
+            fig, ax = plt.subplots(figsize=(10, 5))
+            for cat in pivot_df.columns:
+                ax.plot(pivot_df.index, pivot_df[cat], marker='o', label=str(cat))
+            ax.set_xlabel("Woche")
+            ax.set_ylabel("Verkaufswert (CHF) pro Woche")
+            ax.set_title("Verkaufsverlauf nach Kategorie (Woche)")
+            ax.legend(title="Kategorie", bbox_to_anchor=(1.02, 1), loc='upper left')
+            fig.autofmt_xdate()
+            st.pyplot(fig)
         else:
             st.info("Für den Verlauf werden gültige Startdaten benötigt.")
 
